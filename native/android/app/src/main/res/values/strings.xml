@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">一起看</string>
+    <string name="title_activity_main">一起看</string>
+    <string name="package_name">com.yiqikan.room</string>
+    <string name="custom_url_scheme">com.yiqikan.room</string>
+</resources>

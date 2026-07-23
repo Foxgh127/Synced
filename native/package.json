@@ -1,0 +1,63 @@
+{
+  "name": "yiqikan-native",
+  "version": "0.2.0",
+  "private": true,
+  "author": "一起看",
+  "description": "一起看：Windows 原生窗口与系统声分享，Android 低延迟观看",
+  "main": "electron/main.cjs",
+  "type": "module",
+  "scripts": {
+    "dev:web": "vite",
+    "dev:signal": "node server/index.mjs",
+    "build:renderer": "vite build",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/*.test.mjs",
+    "start:electron": "npm run build:renderer && electron .",
+    "dist:win": "npm run check && electron-builder --win portable --x64",
+    "cap:sync": "npm run build:renderer && cap sync android",
+    "apk:debug": "npm run cap:sync && cd android && gradlew.bat assembleDebug",
+    "check": "npm run typecheck && npm test && npm run build:renderer"
+  },
+  "dependencies": {
+    "@capacitor/app": "^7.0.0",
+    "@capacitor/core": "^7.0.0",
+    "qrcode": "^1.5.4",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@capacitor/android": "^7.0.0",
+    "@capacitor/cli": "^7.0.0",
+    "@types/node": "^24.0.0",
+    "@types/qrcode": "^1.5.5",
+    "electron": "^43.2.0",
+    "electron-builder": "^26.0.12",
+    "typescript": "^5.8.3",
+    "vite": "^7.0.0"
+  },
+  "build": {
+    "appId": "com.yiqikan.room.desktop",
+    "productName": "一起看",
+    "asar": true,
+    "electronDist": "node_modules/electron/dist",
+    "directories": {
+      "output": "release/windows-dist"
+    },
+    "files": [
+      "dist-renderer/**/*",
+      "electron/**/*",
+      "server/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "YiQiKan-${version}-portable.${ext}"
+    }
+  }
+}

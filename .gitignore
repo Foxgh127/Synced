@@ -31,6 +31,7 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
+!/native/deployment/.env.example
 
 # vercel
 .vercel
@@ -41,3 +42,13 @@ next-env.d.ts
 /.wrangler/
 /outputs/
 /work/
+
+# native application build outputs
+/native/node_modules/
+/native/dist-renderer/
+/native/release/
+/native/.toolchains/
+/native/android/.gradle/
+/native/android/build/
+/native/android/app/build/
+/native/android/local.properties
