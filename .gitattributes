@@ -1,0 +1,6 @@
+# Keep generated assets and source files byte-stable across Windows and Linux.
+* text=auto eol=lf
+
+# Native Windows command scripts conventionally use CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf

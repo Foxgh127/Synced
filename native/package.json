@@ -45,7 +45,7 @@
     "apk:debug": "npm run cap:sync && cd android && gradlew.bat assembleDebug",
     "apk:release": "node scripts/build-android-release.mjs",
     "release:all": "node scripts/build-release.mjs",
-    "check": "npm run check:version && npm run brand:check && npm run lint && npm test && npm run check:ffmpeg && npm run build:renderer"
+    "check": "npm run check:version && npm run brand:check && npm run lint && npm run check:ffmpeg && npm test && npm run build:renderer"
   },
   "dependencies": {
     "@capacitor/app": "^7.0.0",

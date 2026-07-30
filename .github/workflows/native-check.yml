@@ -24,14 +24,14 @@ jobs:
       run:
         working-directory: native
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-node@v7.0.0
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: native/package-lock.json
       - name: Cache pinned FFmpeg runtime
-        uses: actions/cache@v4
+        uses: actions/cache@v6.1.0
         with:
           path: native/vendor/ffmpeg/ffmpeg.exe
           key: ffmpeg-win64-n8.1.2-31-g8c9502e9b0
