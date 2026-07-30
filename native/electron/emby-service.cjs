@@ -1897,7 +1897,6 @@ async function waitForChildExit(child, timeoutMs = 3_000) {
     };
     const onExit = () => finish(true);
     timer = setTimeout(() => finish(false), timeoutMs);
-    timer.unref?.();
     child.once("exit", onExit);
     child.once("close", onExit);
     child.once("error", onExit);
