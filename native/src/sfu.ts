@@ -3,12 +3,21 @@ import {
   RemoteDataTrack,
   RemoteParticipant,
   RemoteTrack,
+  VideoPreset,
+  VideoQuality,
   Room,
   RoomEvent,
   Track,
   type LocalDataTrack,
   type LocalTrackPublication,
+  type RemoteTrackPublication,
 } from "livekit-client";
+import {
+  resolveSfuScreenSubscription,
+  type SfuScreenSubscriptionPreference,
+} from "./sfu-screen-policy";
+
+export type { SfuScreenSubscriptionPreference } from "./sfu-screen-policy";
 
 export const SFU_EMBY_MEDIA_TRACK = "synced-emby-media";
 export const SFU_EMBY_CONTROL_TRACK = "synced-emby-control";
@@ -18,6 +27,10 @@ const DATA_KIND_BINARY = 1;
 const SFU_DATA_SEND_TIMEOUT_MS = 5_000;
 const SFU_PUBLISH_TIMEOUT_MS = 10_000;
 const SFU_TEARDOWN_TIMEOUT_MS = 2_000;
+const SFU_DATA_OUTSTANDING_BYTES = 8 * 1024 * 1024;
+const SCREEN_VIDEO_TRACK = "synced-screen-video";
+const SCREEN_VIDEO_EMERGENCY_TRACK = "synced-screen-video-emergency";
+const SCREEN_AUDIO_TRACK = "synced-screen-audio";
 
 export interface SfuAccess {
   url: string;
@@ -29,6 +42,20 @@ export interface SfuAccess {
 export interface SfuPublishPreset {
   maxBitrate: number;
   frameRate: number;
+  contentMode?: "detail" | "motion" | "balanced";
+}
+
+export interface SfuScreenReceiverStats {
+  timestamp: number;
+  bytesReceived: number;
+  packetsReceived: number;
+  packetsLost: number;
+  framesDecoded: number;
+  framesDropped: number;
+  framesPerSecond?: number;
+  jitter?: number;
+  currentRoundTripTime?: number;
+  availableIncomingBitrate?: number;
 }
 
 export interface SfuSessionOptions {
@@ -112,15 +139,20 @@ class SfuRtcDataChannel extends EventTarget {
   bufferedAmount = 0;
   bufferedAmountLowThreshold = 0;
   readyState: RTCDataChannelState = "connecting";
-  private sendTail: Promise<void> = Promise.resolve();
-  private failureCount = 0;
+  private readonly queue: Uint8Array<ArrayBuffer>[] = [];
+  private queueHead = 0;
+  private writing = false;
+  private readonly epochController = new AbortController();
+  private readonly drainWaiters = new Set<() => void>();
 
   constructor(
     label: string,
     private readonly outbound?: (
       payload: Uint8Array<ArrayBuffer>,
+      signal: AbortSignal,
     ) => Promise<void>,
     private readonly onFatal?: (error: unknown) => void,
+    private readonly onAbort?: () => void,
   ) {
     super();
     this.label = label;
@@ -139,40 +171,19 @@ class SfuRtcDataChannel extends EventTarget {
       throw new DOMException("SFU data channel is not open", "InvalidStateError");
     }
     const payload = framedPayload(data);
-    const previousBufferedAmount = this.bufferedAmount;
+    if (
+      payload.byteLength > SFU_DATA_OUTSTANDING_BYTES ||
+      this.bufferedAmount + payload.byteLength >
+        SFU_DATA_OUTSTANDING_BYTES
+    ) {
+      throw new DOMException(
+        `SFU ${this.label} writer exceeded its outstanding-byte budget`,
+        "QuotaExceededError",
+      );
+    }
     this.bufferedAmount += payload.byteLength;
-    this.sendTail = this.sendTail
-      .then(() =>
-        withTimeout(
-          this.outbound!(payload),
-          SFU_DATA_SEND_TIMEOUT_MS,
-          `SFU ${this.label} send timed out`,
-        ),
-      )
-      .then(() => {
-        this.failureCount = 0;
-      })
-      .catch((error) => {
-        if (this.readyState !== "open") return;
-        this.failureCount += 1;
-        this.dispatchEvent(new Event("error"));
-        if (this.failureCount >= 3) {
-          this.onFatal?.(error);
-          this.close();
-        }
-      })
-      .finally(() => {
-        this.bufferedAmount = Math.max(
-          0,
-          this.bufferedAmount - payload.byteLength,
-        );
-        if (
-          previousBufferedAmount > this.bufferedAmountLowThreshold &&
-          this.bufferedAmount <= this.bufferedAmountLowThreshold
-        ) {
-          this.dispatchEvent(new Event("bufferedamountlow"));
-        }
-      });
+    this.queue.push(payload);
+    void this.pump();
   }
 
   receive(payload: Uint8Array): void {
@@ -211,10 +222,130 @@ class SfuRtcDataChannel extends EventTarget {
   close(): void {
     if (this.readyState === "closed" || this.readyState === "closing") return;
     this.readyState = "closing";
+    this.epochController.abort();
+    this.onAbort?.();
+    this.dropQueuedPayloads();
     queueMicrotask(() => {
       this.readyState = "closed";
       this.dispatchEvent(new Event("close"));
     });
+  }
+
+  async closeGracefully(timeoutMs = SFU_TEARDOWN_TIMEOUT_MS): Promise<void> {
+    if (this.readyState === "closed") return;
+    if (this.readyState === "connecting") {
+      this.close();
+      return;
+    }
+    this.readyState = "closing";
+    await withTimeout(
+      this.drain(),
+      timeoutMs,
+      `SFU ${this.label} writer drain timed out`,
+    ).catch(() => {
+      this.epochController.abort();
+      this.onAbort?.();
+      this.dropQueuedPayloads();
+    });
+    this.epochController.abort();
+    this.readyState = "closed";
+    this.dispatchEvent(new Event("close"));
+  }
+
+  private async pump(): Promise<void> {
+    if (this.writing || !this.outbound) return;
+    this.writing = true;
+    try {
+      while (
+        this.queueHead < this.queue.length &&
+        !this.epochController.signal.aborted
+      ) {
+        const payload = this.queue[this.queueHead]!;
+        try {
+          await withTimeout(
+            this.outbound(payload, this.epochController.signal),
+            SFU_DATA_SEND_TIMEOUT_MS,
+            `SFU ${this.label} send timed out`,
+            this.epochController.signal,
+          );
+        } catch (error) {
+          if (!this.epochController.signal.aborted) {
+            this.dispatchEvent(new Event("error"));
+            this.onFatal?.(error);
+          }
+          this.epochController.abort();
+          this.onAbort?.();
+          this.dropQueuedPayloads();
+          if (
+            this.readyState !== "closing" &&
+            this.readyState !== "closed"
+          ) {
+            this.readyState = "closing";
+            queueMicrotask(() => {
+              if (this.readyState !== "closing") return;
+              this.readyState = "closed";
+              this.dispatchEvent(new Event("close"));
+            });
+          }
+          break;
+        }
+        this.queueHead += 1;
+        this.releaseBufferedBytes(payload.byteLength);
+        if (
+          this.queueHead >= 256 &&
+          this.queueHead * 2 >= this.queue.length
+        ) {
+          this.queue.splice(0, this.queueHead);
+          this.queueHead = 0;
+        }
+      }
+    } finally {
+      this.writing = false;
+      if (this.queueHead >= this.queue.length) {
+        this.queue.length = 0;
+        this.queueHead = 0;
+        this.resolveDrainWaiters();
+      }
+    }
+  }
+
+  private drain(): Promise<void> {
+    if (!this.writing && this.queueHead >= this.queue.length) {
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve) => {
+      this.drainWaiters.add(resolve);
+    });
+  }
+
+  private dropQueuedPayloads(): void {
+    let dropped = 0;
+    for (let index = this.queueHead; index < this.queue.length; index += 1) {
+      dropped += this.queue[index]?.byteLength || 0;
+    }
+    this.queue.length = 0;
+    this.queueHead = 0;
+    this.releaseBufferedBytes(dropped);
+    // A timed-out LocalDataTrack write may never settle even after unpublish.
+    // Closing this epoch makes the queued bytes terminal, so release graceful
+    // close waiters instead of retaining a native-writer drain forever.
+    this.resolveDrainWaiters();
+  }
+
+  private releaseBufferedBytes(byteLength: number): void {
+    const previous = this.bufferedAmount;
+    this.bufferedAmount = Math.max(0, this.bufferedAmount - byteLength);
+    if (
+      previous > this.bufferedAmountLowThreshold &&
+      this.bufferedAmount <= this.bufferedAmountLowThreshold
+    ) {
+      this.dispatchEvent(new Event("bufferedamountlow"));
+    }
+  }
+
+  private resolveDrainWaiters(): void {
+    for (const resolve of this.drainWaiters) resolve();
+    this.drainWaiters.clear();
   }
 }
 
@@ -274,6 +405,7 @@ export class SfuSession {
   private pendingAccess?: SfuAccess;
   private publishedScreenTracks: MediaStreamTrack[] = [];
   private publishedScreenPublications: LocalTrackPublication[] = [];
+  private publishedScreenRoles: Array<"primary" | "emergency" | "audio"> = [];
   private localMediaTrack?: LocalDataTrack;
   private localControlTrack?: LocalDataTrack;
   private hostMediaChannel?: SfuRtcDataChannel;
@@ -282,6 +414,8 @@ export class SfuSession {
   private viewerControlChannel?: SfuRtcDataChannel;
   private readers: ActiveReader[] = [];
   private watchingBroadcasterId = "";
+  private screenWatchStream?: MediaStream;
+  private screenPreference: SfuScreenSubscriptionPreference = {};
   private watchAbortController?: AbortController;
   private intentionalDisconnect = false;
   private publicationGeneration = 0;
@@ -469,29 +603,127 @@ export class SfuSession {
       throw new DOMException("SFU publication was replaced", "AbortError");
     }
     const streamName = "synced-screen";
+    const publicationSpecs: Array<{
+      sourceTrack: MediaStreamTrack;
+      role: "primary" | "emergency" | "audio";
+      name: string;
+    }> = [];
     for (const sourceTrack of stream.getTracks()) {
+      if (sourceTrack.kind === "video") {
+        publicationSpecs.push(
+          {
+            sourceTrack,
+            role: "primary",
+            name: SCREEN_VIDEO_TRACK,
+          },
+          {
+            sourceTrack,
+            role: "emergency",
+            name: SCREEN_VIDEO_EMERGENCY_TRACK,
+          },
+        );
+      } else {
+        publicationSpecs.push({
+          sourceTrack,
+          role: "audio",
+          name: SCREEN_AUDIO_TRACK,
+        });
+      }
+    }
+    for (const spec of publicationSpecs) {
+      const { sourceTrack, role } = spec;
       const track = sourceTrack.clone();
+      if (role === "primary") {
+        track.contentHint =
+          preset.contentMode === "motion" ? "motion" : "detail";
+        const settings = sourceTrack.getSettings();
+        const sourceWidth = Math.max(1, settings.width || 2_560);
+        const sourceHeight = Math.max(1, settings.height || 1_440);
+        const sourceScale = Math.min(
+          1,
+          2_560 / sourceWidth,
+          1_440 / sourceHeight,
+        );
+        const cappedWidth = Math.max(1, Math.round(sourceWidth * sourceScale));
+        const cappedHeight = Math.max(
+          1,
+          Math.round(sourceHeight * sourceScale),
+        );
+        await track
+          .applyConstraints({
+            width: { ideal: cappedWidth, max: 2_560 },
+            height: { ideal: cappedHeight, max: 1_440 },
+            frameRate: {
+              ideal: Math.min(30, preset.frameRate),
+              max: Math.min(30, preset.frameRate),
+            },
+          })
+          .catch(() => undefined);
+      } else if (role === "emergency") {
+        track.contentHint =
+          preset.contentMode === "motion" ? "motion" : "detail";
+        await track
+          .applyConstraints({
+            width: { ideal: 854, max: 854 },
+            height: { ideal: 480, max: 480 },
+            frameRate: {
+              ideal: Math.min(24, preset.frameRate),
+              max: Math.min(24, preset.frameRate),
+            },
+          })
+          .catch(() => undefined);
+      }
+      const sourceHeight =
+        sourceTrack.getSettings().height ||
+        stream.getVideoTracks()[0]?.getSettings().height ||
+        1_440;
+      const explicitLayers =
+        sourceHeight > 1_080
+          ? [
+              new VideoPreset(1_280, 720, 5_000_000, 30),
+              new VideoPreset(1_920, 1_080, 10_000_000, 30),
+            ]
+          : sourceHeight > 720
+            ? [
+                new VideoPreset(854, 480, 2_200_000, 24),
+                new VideoPreset(1_280, 720, 5_000_000, 30),
+              ]
+            : [new VideoPreset(854, 480, 2_200_000, 24)];
       const publishing = room.localParticipant.publishTrack(track, {
-        name:
-          sourceTrack.kind === "video"
-            ? "synced-screen-video"
-            : "synced-screen-audio",
+        name: spec.name,
         source:
           sourceTrack.kind === "video"
             ? Track.Source.ScreenShare
             : Track.Source.ScreenShareAudio,
         stream: streamName,
-        ...(sourceTrack.kind === "video"
+        ...(role === "primary"
           ? {
               videoCodec: "h264" as const,
               simulcast: true,
+              screenShareSimulcastLayers: explicitLayers,
               screenShareEncoding: {
                 maxBitrate: Math.max(500_000, preset.maxBitrate),
-                maxFramerate: Math.max(1, preset.frameRate),
+                maxFramerate: Math.max(1, Math.min(30, preset.frameRate)),
               },
-              degradationPreference: "maintain-resolution" as const,
+              degradationPreference:
+                preset.contentMode === "motion"
+                  ? ("maintain-framerate" as const)
+                  : preset.contentMode === "detail"
+                    ? ("maintain-resolution" as const)
+                    : ("balanced" as const),
             }
-          : {
+          : role === "emergency"
+            ? {
+                videoCodec: "h264" as const,
+                simulcast: false,
+                screenShareSimulcastLayers: [],
+                screenShareEncoding: {
+                  maxBitrate: 2_200_000,
+                  maxFramerate: Math.min(24, preset.frameRate),
+                },
+                degradationPreference: "maintain-framerate" as const,
+              }
+            : {
               forceStereo: true,
               dtx: false,
               red: true,
@@ -529,6 +761,7 @@ export class SfuSession {
       }
       this.publishedScreenTracks.push(track);
       this.publishedScreenPublications.push(publication);
+      this.publishedScreenRoles.push(role);
     }
     if (!this.publishedScreenTracks.some((track) => track.kind === "video")) {
       await this.invalidatePublication(publicationGeneration);
@@ -537,11 +770,15 @@ export class SfuSession {
     this.options.onDiagnostic?.("sfu-screen-published", {
       tracks: this.publishedScreenTracks.length,
       maxBitrate: preset.maxBitrate,
-      frameRate: preset.frameRate,
+      frameRate: Math.min(30, preset.frameRate),
+      simulcastLayers: ["1440p", "1080p", "720p", "480p-emergency"],
+      contentMode: preset.contentMode || "balanced",
     });
   }
 
-  async publishEmby(): Promise<{
+  async publishEmby(
+    options: { controlOnly?: boolean } = {},
+  ): Promise<{
     mediaChannel: RTCDataChannel;
     controlChannel: RTCDataChannel;
   }> {
@@ -551,36 +788,38 @@ export class SfuSession {
     if (!this.isCurrentPublication(room, publicationGeneration)) {
       throw new DOMException("SFU publication was replaced", "AbortError");
     }
-    const publishingMedia = room.localParticipant.publishDataTrack({
-      name: SFU_EMBY_MEDIA_TRACK,
-    });
-    let mediaTrack: LocalDataTrack;
-    try {
-      mediaTrack = await withTimeout(
-        publishingMedia,
-        SFU_PUBLISH_TIMEOUT_MS,
-        "SFU Emby media publication timed out",
-      );
-    } catch (error) {
-      void publishingMedia
-        .then((lateTrack) =>
-          this.discardDataTrack(
-            lateTrack,
-            "late SFU Emby media cleanup timed out",
-          ),
-        )
-        .catch(() => undefined);
-      await this.invalidatePublication(publicationGeneration);
-      throw error;
+    let mediaTrack: LocalDataTrack | undefined;
+    if (!options.controlOnly) {
+      const publishingMedia = room.localParticipant.publishDataTrack({
+        name: SFU_EMBY_MEDIA_TRACK,
+      });
+      try {
+        mediaTrack = await withTimeout(
+          publishingMedia,
+          SFU_PUBLISH_TIMEOUT_MS,
+          "SFU Emby media publication timed out",
+        );
+      } catch (error) {
+        void publishingMedia
+          .then((lateTrack) =>
+            this.discardDataTrack(
+              lateTrack,
+              "late SFU Emby media cleanup timed out",
+            ),
+          )
+          .catch(() => undefined);
+        await this.invalidatePublication(publicationGeneration);
+        throw error;
+      }
+      if (!this.isCurrentPublication(room, publicationGeneration)) {
+        await this.discardDataTrack(
+          mediaTrack,
+          "stale SFU Emby media cleanup timed out",
+        );
+        throw new DOMException("SFU publication was replaced", "AbortError");
+      }
+      this.localMediaTrack = mediaTrack;
     }
-    if (!this.isCurrentPublication(room, publicationGeneration)) {
-      await this.discardDataTrack(
-        mediaTrack,
-        "stale SFU Emby media cleanup timed out",
-      );
-      throw new DOMException("SFU publication was replaced", "AbortError");
-    }
-    this.localMediaTrack = mediaTrack;
     const publishingControl = room.localParticipant.publishDataTrack({
       name: SFU_EMBY_CONTROL_TRACK,
     });
@@ -619,27 +858,58 @@ export class SfuSession {
     };
     const mediaChannel = new SfuRtcDataChannel(
       SFU_EMBY_MEDIA_TRACK,
-      async (payload) => {
-        await mediaTrack.tryPush({ payload });
-        await mediaTrack.flush();
-      },
+      mediaTrack
+        ? async (payload, signal) => {
+            if (signal.aborted) {
+              throw new DOMException(
+                "SFU media writer was cancelled",
+                "AbortError",
+              );
+            }
+            await mediaTrack!.tryPush({ payload });
+            if (signal.aborted) {
+              throw new DOMException(
+                "SFU media writer was cancelled",
+                "AbortError",
+              );
+            }
+          }
+        : undefined,
       fatal,
+      () => {
+        void mediaTrack?.unpublish().catch(() => undefined);
+      },
     );
     const controlChannel = new SfuRtcDataChannel(
       SFU_EMBY_CONTROL_TRACK,
-      async (payload) => {
+      async (payload, signal) => {
+        if (signal.aborted) {
+          throw new DOMException(
+            "SFU control writer was cancelled",
+            "AbortError",
+          );
+        }
         await controlTrack.tryPush({ payload });
-        await controlTrack.flush();
+        if (signal.aborted) {
+          throw new DOMException(
+            "SFU control writer was cancelled",
+            "AbortError",
+          );
+        }
       },
       fatal,
+      () => {
+        void controlTrack.unpublish().catch(() => undefined);
+      },
     );
     this.hostMediaChannel = mediaChannel;
     this.hostControlChannel = controlChannel;
     mediaChannel.open();
     controlChannel.open();
     this.options.onDiagnostic?.("sfu-emby-published", {
-      mediaTrack: mediaTrack.info?.sid,
+      mediaTrack: mediaTrack?.info?.sid,
       controlTrack: controlTrack.info?.sid,
+      controlOnly: options.controlOnly === true,
     });
     return {
       mediaChannel: asRtcDataChannel(mediaChannel),
@@ -649,20 +919,29 @@ export class SfuSession {
 
   async watchScreen(
     broadcasterId: string,
+    preferenceOrTimeout: SfuScreenSubscriptionPreference | number = {},
     timeoutMs = 10_000,
   ): Promise<MediaStream> {
     const room = this.requireConnectedRoom();
+    const preference =
+      typeof preferenceOrTimeout === "number" ? {} : preferenceOrTimeout;
+    if (typeof preferenceOrTimeout === "number") {
+      timeoutMs = preferenceOrTimeout;
+    }
     await this.stopWatching();
     const watchController = new AbortController();
     this.watchAbortController = watchController;
     this.watchingBroadcasterId = broadcasterId;
+    this.screenPreference = { ...preference };
     const stream = new MediaStream();
+    this.screenWatchStream = stream;
     let resolveVideoTrack: (() => void) | undefined;
     const videoTrackReady = new Promise<void>((resolve) => {
       resolveVideoTrack = resolve;
     });
     const addTrack = (
       track: RemoteTrack,
+      publication: RemoteTrackPublication,
       participant: RemoteParticipant,
     ): void => {
       if (
@@ -673,6 +952,10 @@ export class SfuSession {
         ![Track.Source.ScreenShare, Track.Source.ScreenShareAudio].includes(
           track.source,
         ) ||
+        !this.screenPublicationDesired(
+          publication,
+          this.screenPreference,
+        ) ||
         stream.getTracks().some(
           (candidate) => candidate.id === track.mediaStreamTrack.id,
         )
@@ -680,15 +963,60 @@ export class SfuSession {
         return;
       }
       stream.addTrack(track.mediaStreamTrack);
-      if (track.kind === Track.Kind.Video) resolveVideoTrack?.();
+      if (track.kind === Track.Kind.Video) {
+        resolveVideoTrack?.();
+        this.pruneUndesiredScreenTracks(
+          participant,
+          publication,
+          stream,
+        );
+      }
     };
     const subscribed = (
       track: RemoteTrack,
-      _publication: unknown,
+      publication: RemoteTrackPublication,
       participant: RemoteParticipant,
-    ) => addTrack(track, participant);
+    ) => addTrack(track, publication, participant);
+    const unsubscribed = (
+      track: RemoteTrack,
+      _publication: RemoteTrackPublication,
+      participant: RemoteParticipant,
+    ) => {
+      if (participant.identity !== broadcasterId) return;
+      const mediaTrack = stream
+        .getTracks()
+        .find((candidate) => candidate.id === track.mediaStreamTrack.id);
+      if (mediaTrack) stream.removeTrack(mediaTrack);
+    };
+    const published = (
+      publication: RemoteTrackPublication,
+      participant: RemoteParticipant,
+    ) => {
+      if (
+        participant.identity !== broadcasterId ||
+        ![
+          Track.Source.ScreenShare,
+          Track.Source.ScreenShareAudio,
+        ].includes(publication.source)
+      ) {
+        return;
+      }
+      this.applyScreenPublicationPreference(
+        publication,
+        this.screenPreference,
+      );
+      if (publication.track) {
+        addTrack(publication.track, publication, participant);
+      }
+    };
     room.on(RoomEvent.TrackSubscribed, subscribed);
-    const cleanupListener = () => room.off(RoomEvent.TrackSubscribed, subscribed);
+    room.on(RoomEvent.TrackUnsubscribed, unsubscribed);
+    room.on(RoomEvent.TrackPublished, published);
+    const cleanupListener = () => {
+      room.off(RoomEvent.TrackSubscribed, subscribed);
+      room.off(RoomEvent.TrackUnsubscribed, unsubscribed);
+      room.off(RoomEvent.TrackPublished, published);
+    };
     this.readers.push({
       cancel: async () => {
         cleanupListener();
@@ -696,8 +1024,13 @@ export class SfuSession {
     });
     const existing = room.remoteParticipants.get(broadcasterId);
     existing?.trackPublications.forEach((publication) => {
-      publication.setSubscribed(true);
-      if (publication.track) addTrack(publication.track, existing);
+      this.applyScreenPublicationPreference(
+        publication,
+        this.screenPreference,
+      );
+      if (publication.track) {
+        addTrack(publication.track, publication, existing);
+      }
     });
     try {
       if (!stream.getVideoTracks().length) {
@@ -720,9 +1053,206 @@ export class SfuSession {
     }
   }
 
+  setScreenSubscriptionPreference(
+    preference: SfuScreenSubscriptionPreference,
+  ): boolean {
+    const room = this.room;
+    const participant = room?.remoteParticipants.get(
+      this.watchingBroadcasterId,
+    );
+    if (!room || !participant || !this.screenWatchStream) return false;
+    this.screenPreference = {
+      ...this.screenPreference,
+      ...preference,
+    };
+    const publications = [...participant.trackPublications.values()].filter(
+      (publication) =>
+        [
+          Track.Source.ScreenShare,
+          Track.Source.ScreenShareAudio,
+        ].includes(publication.source),
+    );
+    for (const publication of publications) {
+      this.applyScreenPublicationPreference(
+        publication,
+        this.screenPreference,
+      );
+    }
+    const desiredVideo = publications.find(
+      (publication) =>
+        publication.kind === Track.Kind.Video &&
+        this.screenPublicationDesired(
+          publication,
+          this.screenPreference,
+        ),
+    );
+    if (desiredVideo?.track) {
+      const mediaTrack = desiredVideo.track.mediaStreamTrack;
+      if (
+        !this.screenWatchStream
+          .getTracks()
+          .some((candidate) => candidate.id === mediaTrack.id)
+      ) {
+        this.screenWatchStream.addTrack(mediaTrack);
+      }
+      this.pruneUndesiredScreenTracks(
+        participant,
+        desiredVideo,
+        this.screenWatchStream,
+      );
+    }
+    this.options.onDiagnostic?.("sfu-screen-subscription-updated", {
+      broadcasterId: participant.identity,
+      width: this.screenPreference.width,
+      height: this.screenPreference.height,
+      frameRate: this.screenPreference.frameRate,
+      quality: this.screenVideoQuality(this.screenPreference),
+      emergency: this.screenWantsEmergency(this.screenPreference),
+    });
+    return true;
+  }
+
+  async readScreenReceiverStats(): Promise<
+    SfuScreenReceiverStats | undefined
+  > {
+    const participant = this.room?.remoteParticipants.get(
+      this.watchingBroadcasterId,
+    );
+    const publication = participant
+      ? [...participant.trackPublications.values()].find(
+          (candidate) =>
+            candidate.kind === Track.Kind.Video &&
+            candidate.track &&
+            this.screenPublicationDesired(
+              candidate,
+              this.screenPreference,
+            ),
+        )
+      : undefined;
+    const report = await publication?.track?.getRTCStatsReport();
+    if (!report) return undefined;
+    let inbound: RTCInboundRtpStreamStats | undefined;
+    let candidatePair: RTCIceCandidatePairStats | undefined;
+    report.forEach((item) => {
+      if (
+        item.type === "inbound-rtp" &&
+        item.kind === "video" &&
+        (!inbound ||
+          Number(item.bytesReceived) > Number(inbound.bytesReceived || 0))
+      ) {
+        inbound = item as RTCInboundRtpStreamStats;
+      } else if (
+        item.type === "candidate-pair" &&
+        item.state === "succeeded" &&
+        (item.nominated || !candidatePair)
+      ) {
+        candidatePair = item as RTCIceCandidatePairStats;
+      }
+    });
+    if (!inbound) return undefined;
+    return {
+      timestamp: Number(inbound.timestamp) || performance.now(),
+      bytesReceived: Math.max(0, Number(inbound.bytesReceived) || 0),
+      packetsReceived: Math.max(0, Number(inbound.packetsReceived) || 0),
+      packetsLost: Math.max(0, Number(inbound.packetsLost) || 0),
+      framesDecoded: Math.max(0, Number(inbound.framesDecoded) || 0),
+      framesDropped: Math.max(0, Number(inbound.framesDropped) || 0),
+      framesPerSecond:
+        Number(inbound.framesPerSecond) > 0
+          ? Number(inbound.framesPerSecond)
+          : undefined,
+      jitter:
+        Number(inbound.jitter) >= 0 ? Number(inbound.jitter) : undefined,
+      currentRoundTripTime:
+        candidatePair && Number(candidatePair.currentRoundTripTime) >= 0
+          ? Number(candidatePair.currentRoundTripTime)
+          : undefined,
+      availableIncomingBitrate:
+        candidatePair && Number(candidatePair.availableIncomingBitrate) > 0
+          ? Number(candidatePair.availableIncomingBitrate)
+          : undefined,
+    };
+  }
+
+  private applyScreenPublicationPreference(
+    publication: RemoteTrackPublication,
+    preference: SfuScreenSubscriptionPreference,
+  ): void {
+    const desired = this.screenPublicationDesired(publication, preference);
+    if (publication.kind === Track.Kind.Video && desired) {
+      const target = resolveSfuScreenSubscription(preference);
+      publication.setVideoQuality(
+        target.quality === "low"
+          ? VideoQuality.LOW
+          : target.quality === "medium"
+            ? VideoQuality.MEDIUM
+            : VideoQuality.HIGH,
+      );
+      publication.setVideoDimensions({
+        width: target.width,
+        height: target.height,
+      });
+      publication.setVideoFPS(target.frameRate);
+    }
+    publication.setSubscribed(desired);
+  }
+
+  private screenPublicationDesired(
+    publication: RemoteTrackPublication,
+    preference: SfuScreenSubscriptionPreference,
+  ): boolean {
+    if (publication.source === Track.Source.ScreenShareAudio) return true;
+    if (publication.source !== Track.Source.ScreenShare) return false;
+    const emergency =
+      publication.trackName === SCREEN_VIDEO_EMERGENCY_TRACK;
+    return emergency === this.screenWantsEmergency(preference);
+  }
+
+  private screenWantsEmergency(
+    preference: SfuScreenSubscriptionPreference,
+  ): boolean {
+    return resolveSfuScreenSubscription(preference).emergency;
+  }
+
+  private screenVideoQuality(
+    preference: SfuScreenSubscriptionPreference,
+  ): VideoQuality {
+    const quality = resolveSfuScreenSubscription(preference).quality;
+    return quality === "low"
+      ? VideoQuality.LOW
+      : quality === "medium"
+        ? VideoQuality.MEDIUM
+        : VideoQuality.HIGH;
+  }
+
+  private pruneUndesiredScreenTracks(
+    participant: RemoteParticipant,
+    desiredPublication: RemoteTrackPublication,
+    stream: MediaStream,
+  ): void {
+    for (const publication of participant.trackPublications.values()) {
+      if (
+        publication === desiredPublication ||
+        publication.kind !== Track.Kind.Video ||
+        publication.source !== Track.Source.ScreenShare
+      ) {
+        continue;
+      }
+      const track = publication.track?.mediaStreamTrack;
+      if (track) {
+        const attached = stream
+          .getTracks()
+          .find((candidate) => candidate.id === track.id);
+        if (attached) stream.removeTrack(attached);
+      }
+      publication.setSubscribed(false);
+    }
+  }
+
   async watchEmby(
     broadcasterId: string,
     timeoutMs = 10_000,
+    controlOnly = false,
   ): Promise<{
     mediaChannel: RTCDataChannel;
     controlChannel: RTCDataChannel;
@@ -739,12 +1269,14 @@ export class SfuSession {
         watchController.signal,
       );
       const [mediaTrack, controlTrack] = await Promise.all([
-        withTimeout(
-          participant.dataTracks.getDeferred(SFU_EMBY_MEDIA_TRACK),
-          timeoutMs,
-          "SFU broadcaster did not publish the Emby media track",
-          watchController.signal,
-        ),
+        controlOnly
+          ? Promise.resolve(undefined)
+          : withTimeout(
+              participant.dataTracks.getDeferred(SFU_EMBY_MEDIA_TRACK),
+              timeoutMs,
+              "SFU broadcaster did not publish the Emby media track",
+              watchController.signal,
+            ),
         withTimeout(
           participant.dataTracks.getDeferred(SFU_EMBY_CONTROL_TRACK),
           timeoutMs,
@@ -788,12 +1320,13 @@ export class SfuSession {
       this.viewerControlChannel = controlChannel;
       mediaChannel.open();
       controlChannel.open();
-      this.consumeDataTrack(mediaTrack, mediaChannel);
+      if (mediaTrack) this.consumeDataTrack(mediaTrack, mediaChannel);
       this.consumeDataTrack(controlTrack, controlChannel);
       this.options.onDiagnostic?.("sfu-emby-subscribed", {
         broadcasterId,
-        mediaTrack: mediaTrack.info.sid,
+        mediaTrack: mediaTrack?.info.sid,
         controlTrack: controlTrack.info.sid,
+        controlOnly,
       });
       return {
         mediaChannel: asRtcDataChannel(mediaChannel),
@@ -813,6 +1346,8 @@ export class SfuSession {
     watchController?.abort();
     const watchedIdentity = this.watchingBroadcasterId;
     this.watchingBroadcasterId = "";
+    this.screenWatchStream = undefined;
+    this.screenPreference = {};
     const readers = this.readers.splice(0);
     await Promise.all(
       readers.map((reader) =>
@@ -842,8 +1377,8 @@ export class SfuSession {
   }
 
   private async clearPublishedState(): Promise<void> {
-    this.hostMediaChannel?.close();
-    this.hostControlChannel?.close();
+    const mediaChannel = this.hostMediaChannel;
+    const controlChannel = this.hostControlChannel;
     this.hostMediaChannel = undefined;
     this.hostControlChannel = undefined;
     const mediaTrack = this.localMediaTrack;
@@ -852,24 +1387,45 @@ export class SfuSession {
     this.localControlTrack = undefined;
     const room = this.room;
     const publications = this.publishedScreenPublications.splice(0);
+    this.publishedScreenRoles.splice(0);
     this.publishedScreenTracks.splice(0).forEach((track) => track.stop());
+    await Promise.all([
+      mediaChannel?.closeGracefully(),
+      controlChannel?.closeGracefully(),
+    ]);
     await Promise.all([
       ...(mediaTrack
         ? [
             withTimeout(
-              mediaTrack.unpublish(),
+              mediaTrack.flush(),
               SFU_TEARDOWN_TIMEOUT_MS,
-              "SFU Emby media unpublish timed out",
-            ).catch(() => undefined),
+              "SFU Emby media flush timed out",
+            )
+              .catch(() => undefined)
+              .then(() =>
+                withTimeout(
+                  mediaTrack.unpublish(),
+                  SFU_TEARDOWN_TIMEOUT_MS,
+                  "SFU Emby media unpublish timed out",
+                ).catch(() => undefined),
+              ),
           ]
         : []),
       ...(controlTrack
         ? [
             withTimeout(
-              controlTrack.unpublish(),
+              controlTrack.flush(),
               SFU_TEARDOWN_TIMEOUT_MS,
-              "SFU Emby control unpublish timed out",
-            ).catch(() => undefined),
+              "SFU Emby control flush timed out",
+            )
+              .catch(() => undefined)
+              .then(() =>
+                withTimeout(
+                  controlTrack.unpublish(),
+                  SFU_TEARDOWN_TIMEOUT_MS,
+                  "SFU Emby control unpublish timed out",
+                ).catch(() => undefined),
+              ),
           ]
         : []),
       ...(room
@@ -935,32 +1491,48 @@ export class SfuSession {
   async replacePublishedScreenTrack(
     sourceTrack: MediaStreamTrack,
   ): Promise<boolean> {
-    const index = this.publishedScreenPublications.findIndex(
-      (publication) =>
-        publication.track?.kind === sourceTrack.kind,
+    const indexes = this.publishedScreenPublications
+      .map((publication, index) =>
+        publication.track?.kind === sourceTrack.kind ? index : -1,
+      )
+      .filter((index) => index >= 0);
+    if (!indexes.length) return false;
+    await Promise.all(
+      indexes.map(async (index) => {
+        const publication = this.publishedScreenPublications[index];
+        const localTrack = publication?.track;
+        if (!localTrack) return;
+        const replacement = sourceTrack.clone();
+        if (this.publishedScreenRoles[index] === "emergency") {
+          await replacement
+            .applyConstraints({
+              width: { ideal: 854, max: 854 },
+              height: { ideal: 480, max: 480 },
+              frameRate: { ideal: 24, max: 24 },
+            })
+            .catch(() => undefined);
+        }
+        try {
+          await withTimeout(
+            localTrack.replaceTrack(replacement, {
+              userProvidedTrack: false,
+            }),
+            SFU_PUBLISH_TIMEOUT_MS,
+            `SFU ${sourceTrack.kind} track replacement timed out`,
+          );
+        } catch (error) {
+          replacement.stop();
+          throw error;
+        }
+        const previous = this.publishedScreenTracks[index];
+        this.publishedScreenTracks[index] = replacement;
+        if (previous && previous !== replacement) previous.stop();
+      }),
     );
-    const publication = this.publishedScreenPublications[index];
-    const localTrack = publication?.track;
-    if (!localTrack) return false;
-    const replacement = sourceTrack.clone();
-    try {
-      await withTimeout(
-        localTrack.replaceTrack(replacement, {
-          userProvidedTrack: false,
-        }),
-        SFU_PUBLISH_TIMEOUT_MS,
-        `SFU ${sourceTrack.kind} track replacement timed out`,
-      );
-    } catch (error) {
-      replacement.stop();
-      throw error;
-    }
-    const previous = this.publishedScreenTracks[index];
-    this.publishedScreenTracks[index] = replacement;
-    if (previous && previous !== replacement) previous.stop();
     this.options.onDiagnostic?.("sfu-screen-track-replaced", {
       kind: sourceTrack.kind,
-      trackId: replacement.id,
+      trackId: sourceTrack.id,
+      publications: indexes.length,
     });
     return true;
   }

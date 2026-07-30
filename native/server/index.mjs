@@ -10,6 +10,7 @@ import { isIP } from "node:net";
 import { pathToFileURL } from "node:url";
 import { WebSocket, WebSocketServer } from "ws";
 import protocolPolicy from "./protocol-policy.json" with { type: "json" };
+import { createSegmentRelay } from "./segment-relay.mjs";
 
 const SIGNAL_PROTOCOL_VERSION = 3;
 const SIGNAL_FEATURES = Object.freeze([
@@ -29,6 +30,7 @@ const SIGNAL_FEATURES = Object.freeze([
   "ice-credential-refresh",
   "sfu-primary",
   "p2p-fallback",
+  "emby-segment-relay-v1",
 ]);
 
 function signalCompatibility() {
@@ -250,6 +252,7 @@ function resolveServerEnvironment(input) {
     ["TURN_SECRET", "TURN_SECRET_FILE"],
     ["METRICS_TOKEN", "METRICS_TOKEN_FILE"],
     ["LIVEKIT_API_SECRET", "LIVEKIT_API_SECRET_FILE"],
+    ["SEGMENT_RELAY_SECRET", "SEGMENT_RELAY_SECRET_FILE"],
   ]) {
     if (resolved[valueKey] || !resolved[fileKey]) continue;
     try {
@@ -347,6 +350,12 @@ function cleanBroadcastCapabilities(value) {
     height: Math.round(height),
     frameRate: Math.round(frameRate),
   };
+  if (
+    value.mode !== "emby" &&
+    ["detail", "motion", "balanced"].includes(value.contentMode)
+  ) {
+    capabilities.contentMode = value.contentMode;
+  }
   if (value.mode === "emby") {
     capabilities.mode = "emby";
     const mimeType = cleanText(value.mimeType, 180);
@@ -389,13 +398,35 @@ function cleanEmbyCapabilities(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return undefined;
   }
-  return {
+  const capabilities = {
     mse: value.mse === true,
     h264: value.h264 === true,
     hevc: value.hevc === true,
     aac: value.aac === true,
     desktop: value.desktop === true,
   };
+  const enhancementBackends = Array.isArray(value.videoEnhancementBackends)
+    ? [
+        ...new Set(
+          value.videoEnhancementBackends.filter(
+            (backend) =>
+              backend === "webgl2-spatial" || backend === "rtx-video",
+          ),
+        ),
+      ].slice(0, 2)
+    : [];
+  if (enhancementBackends.length) {
+    capabilities.videoEnhancementBackends = enhancementBackends;
+  }
+  const maxEnhancementPixels = Number(value.maxEnhancementPixels);
+  if (
+    Number.isFinite(maxEnhancementPixels) &&
+    maxEnhancementPixels >= 640 * 360 &&
+    maxEnhancementPixels <= 16_384 * 8_640
+  ) {
+    capabilities.maxEnhancementPixels = Math.round(maxEnhancementPixels);
+  }
+  return capabilities;
 }
 
 function cleanNetworkReport(value, now = Date.now()) {
@@ -1286,6 +1317,37 @@ export function createSignalServer(options = {}) {
   const networkProbeRoundsByIp = new Map();
   const env = resolveServerEnvironment(options.env || process.env);
   const logger = options.logger || console;
+  const segmentRelay = createSegmentRelay({
+    rootDir: env.SEGMENT_RELAY_CACHE_DIR,
+    maxDiskBytes: Number(env.SEGMENT_RELAY_DISK_BYTES) || undefined,
+    maxMemoryBytes: Number(env.SEGMENT_RELAY_MEMORY_BYTES) || undefined,
+    secret: env.SEGMENT_RELAY_SECRET,
+    // Chromium serializes a packaged file:// fetch origin as "null".
+    // Accept it only on the independently bearer-authenticated media route;
+    // the WebSocket origin policy remains stricter.
+    originAllowed: (origin) =>
+      origin === "null" || originAllowed(origin, env),
+    authorizeIdentity: (identity, requiredScope) => {
+      const client = clients.get(identity.clientId);
+      const room = rooms.get(identity.room);
+      if (
+        !client ||
+        !room ||
+        client.state.room !== identity.room ||
+        !room.members.has(identity.clientId) ||
+        client.state.disconnectFinalized
+      ) {
+        return false;
+      }
+      if (identity.scope === "publish" || requiredScope === "publish") {
+        return (
+          room.broadcasterId === identity.clientId &&
+          client.state.broadcasting === true
+        );
+      }
+      return true;
+    },
+  });
   const configuredViewerLimit = Number(env.MAX_VIEWERS_PER_ROOM);
   const maxParticipantsPerRoom =
     Number.isInteger(configuredViewerLimit) && configuredViewerLimit > 0
@@ -1398,6 +1460,12 @@ export function createSignalServer(options = {}) {
         primary: true,
         fallback: "p2p",
       },
+      segmentRelay: {
+        enabled: true,
+        basePath: "/media/v1",
+        protocol: "synced-cmaf-v1",
+        tokenLifetimeSeconds: 15 * 60,
+      },
       relayCapacityBps: null,
       relaySessionCapacityBps: null,
       relayCapacityEnforced: false,
@@ -1442,6 +1510,7 @@ export function createSignalServer(options = {}) {
         rssBytes: memory.rss,
         heapUsedBytes: memory.heapUsed,
       },
+      segmentRelay: segmentRelay.snapshot(),
     };
   }
 
@@ -1538,6 +1607,15 @@ export function createSignalServer(options = {}) {
       iceRefreshToken: state.iceRefreshToken,
       ...(sfu ? { sfu } : {}),
     };
+  }
+
+  function segmentRelayAccess(state, scope = "read") {
+    if (!state?.room || !state.id) return undefined;
+    return segmentRelay.issueToken({
+      room: state.room,
+      clientId: state.id,
+      scope,
+    });
   }
 
   function clearNetworkAdviceTimer(room) {
@@ -1667,6 +1745,7 @@ export function createSignalServer(options = {}) {
     if (room.members.size === 0) {
       clearNetworkAdviceTimer(room);
       rooms.delete(roomCode);
+      segmentRelay.deleteRoom(roomCode);
       return;
     }
     if (room.ownerId === clientId) {
@@ -2041,7 +2120,7 @@ export function createSignalServer(options = {}) {
     return true;
   }
 
-  const httpServer = createServer((request, response) => {
+  const httpServer = createServer(async (request, response) => {
     const method = String(request.method || "GET").toUpperCase();
     let pathname = "/";
     let requestUrl;
@@ -2061,6 +2140,25 @@ export function createSignalServer(options = {}) {
       "content-type": "application/json; charset=utf-8",
       "x-content-type-options": "nosniff",
     };
+    try {
+      if (await segmentRelay.handle(request, response, requestUrl)) return;
+    } catch (error) {
+      logger.error(
+        `segment relay request failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      if (!response.headersSent) {
+        response.writeHead(500, {
+          ...baseHeaders,
+          "content-length": "0",
+        });
+        response.end();
+      } else {
+        response.destroy();
+      }
+      return;
+    }
     if (!["GET", "HEAD"].includes(method)) {
       response.writeHead(405, {
         ...baseHeaders,
@@ -2186,7 +2284,10 @@ export function createSignalServer(options = {}) {
     });
     response.end();
   });
-  httpServer.requestTimeout = 5_000;
+  // Upload/download body liveness is enforced by the segment relay's
+  // per-byte idle watchdog. A total request deadline would incorrectly abort
+  // a healthy 96 MiB Range transfer on a slow mobile link.
+  httpServer.requestTimeout = 0;
   httpServer.headersTimeout = 6_000;
   httpServer.keepAliveTimeout = 5_000;
 
@@ -2589,6 +2690,12 @@ export function createSignalServer(options = {}) {
             broadcasterId: room.broadcasterId,
             broadcastCapabilities: room.broadcastCapabilities,
             participants: getRoomParticipants(room),
+            segmentRelay: segmentRelayAccess(
+              state,
+              room.broadcasterId === clientId && state.broadcasting
+                ? "publish"
+                : "read",
+            ),
             ...clientIceConfiguration(state),
           });
           broadcastRoom(
@@ -2657,6 +2764,12 @@ export function createSignalServer(options = {}) {
           broadcasterId: room.broadcasterId,
           broadcastCapabilities: room.broadcastCapabilities,
           participants: getRoomParticipants(room),
+          segmentRelay: segmentRelayAccess(
+            state,
+            room.broadcasterId === clientId && state.broadcasting
+              ? "publish"
+              : "read",
+          ),
           ...clientIceConfiguration(state),
         });
         broadcastRoom(
@@ -3062,6 +3175,7 @@ export function createSignalServer(options = {}) {
           type: "broadcast:granted",
           broadcasterId: clientId,
           broadcastCapabilities,
+          segmentRelay: segmentRelayAccess(state, "publish"),
           // Channel-protocol viewers explicitly announce when their RTCPeerConnection
           // is ready. Keeping eager offers only for legacy viewers avoids overlapping
           // SDP negotiations during join/start races.
@@ -3082,6 +3196,21 @@ export function createSignalServer(options = {}) {
           clientId,
         );
         broadcastNetworkAdvice(room);
+        return;
+      }
+
+      if (message.type === "segment:token-refresh") {
+        if (!state.room || !state.role) return;
+        const activeRoom = rooms.get(state.room);
+        if (!activeRoom?.members.has(clientId)) return;
+        const scope =
+          activeRoom.broadcasterId === clientId && state.broadcasting
+            ? "publish"
+            : "read";
+        send(socket, {
+          type: "segment:token",
+          segmentRelay: segmentRelayAccess(state, scope),
+        });
         return;
       }
 
@@ -3741,7 +3870,10 @@ export function createSignalServer(options = {}) {
         }
         client.socket.terminate();
       }
-      return new Promise((resolve) => httpServer.close(resolve));
+      return Promise.all([
+        new Promise((resolve) => httpServer.close(resolve)),
+        segmentRelay.close(),
+      ]).then(() => undefined);
     },
   };
 }

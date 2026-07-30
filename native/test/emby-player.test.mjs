@@ -145,6 +145,69 @@ test("appends queued MSE bytes without sharing the caller buffer", async () => {
   );
 });
 
+test("repeated MSE quota failures have a terminal fragment path", async () => {
+  const { EmbyMsePlayer } = await loadModule();
+  globalThis.window ||= globalThis;
+  globalThis.document ||= { getElementById: () => null };
+  const video = Object.assign(new EventTarget(), {
+    currentTime: 12,
+    playbackRate: 1,
+    buffered: { length: 0, start: () => 0, end: () => 0 },
+    querySelectorAll: () => [],
+    removeAttribute() {},
+    load() {},
+    pause() {},
+    play: async () => {},
+  });
+  let aborts = 0;
+  const player = new EmbyMsePlayer({
+    video,
+    host: false,
+    initialBufferSeconds: 8,
+    targetBufferSeconds: 40,
+    maxBufferSeconds: 60,
+  });
+  player.session = {
+    roomId: "ROOM",
+    sessionId: "quota-session",
+    mediaVersion: 1,
+    transportEpoch: 0,
+    mimeType: 'video/mp4; codecs="avc1.64001f,mp4a.40.2"',
+    plan: {},
+    title: "Fixture",
+  };
+  player.externalSegmentTransport = true;
+  player.mediaSourceRecoveryAttempts = 1;
+  player.sourceBuffer = {
+    updating: false,
+    buffered: video.buffered,
+    abort() {
+      aborts += 1;
+    },
+  };
+  const fragment = Uint8Array.of(1, 2, 3, 4);
+  player.appendQueue = [fragment];
+  player.appendTimestampOffsets = [0];
+  player.appendRetryCounts = [0];
+  player.appendQueueBytes = fragment.byteLength;
+  const recovery = new Promise((resolve) =>
+    player.addEventListener("segmentrecoveryneeded", resolve, { once: true }),
+  );
+
+  player.recoverFromQuotaExceeded();
+  player.recoverFromQuotaExceeded();
+  player.recoverFromQuotaExceeded();
+  player.recoverFromQuotaExceeded();
+  await recovery;
+
+  assert.equal(aborts, 1);
+  assert.equal(player.appendQueue.length, 0);
+  assert.equal(player.appendRetryCounts.length, 0);
+  assert.equal(player.queuedAppendBytes, 0);
+  assert.ok(player.targetBufferSeconds < 40);
+  player.destroy();
+});
+
 test("applies repaired fragment time before MSE append", async () => {
   const { EmbyMsePlayer } = await loadModule();
   const video = Object.assign(new EventTarget(), {
@@ -370,12 +433,12 @@ test("absorbs ordinary live drift before using a decoder-flushing seek", async (
   const { planEmbyPlaybackCorrection } = await loadModule();
   assert.deepEqual(planEmbyPlaybackCorrection(0.2, false, 1), {
     action: "rate",
-    playbackRate: 1.04,
+    playbackRate: 1.008,
     restoreAfterMs: 2_000,
   });
   assert.deepEqual(planEmbyPlaybackCorrection(-0.2, false, 1), {
     action: "rate",
-    playbackRate: 0.96,
+    playbackRate: 0.992,
     restoreAfterMs: 2_000,
   });
   assert.equal(
@@ -478,7 +541,7 @@ test("an asynchronous Android startup anchor is not repeated every 500 ms", asyn
     plan: {},
     title: "Fixture",
   };
-  player.lastBufferReportAt = Date.now();
+  player.lastBufferReportAt = performance.now();
 
   player.inspectBuffer();
   player.inspectBuffer();
@@ -486,14 +549,14 @@ test("an asynchronous Android startup anchor is not repeated every 500 ms", asyn
   assert.equal(currentTimeWrites, 1);
 });
 
-test("hard resync starts beyond 1.8 seconds when the target is unavailable", async () => {
+test("playing drift uses a 0.75 second hard-resync ceiling", async () => {
   const {
     EMBY_MAX_SYNC_DRIFT_SECONDS,
     shouldHardResyncEmbyPlayback,
   } = await loadModule();
-  assert.equal(EMBY_MAX_SYNC_DRIFT_SECONDS, 1.8);
-  assert.equal(shouldHardResyncEmbyPlayback(1.8, false), false);
-  assert.equal(shouldHardResyncEmbyPlayback(1.81, false), true);
+  assert.equal(EMBY_MAX_SYNC_DRIFT_SECONDS, 0.75);
+  assert.equal(shouldHardResyncEmbyPlayback(0.75, false), false);
+  assert.equal(shouldHardResyncEmbyPlayback(0.76, false), true);
   assert.equal(shouldHardResyncEmbyPlayback(8, true), false);
   assert.equal(shouldHardResyncEmbyPlayback(-8, false), false);
 });
@@ -597,7 +660,7 @@ test("receiver catch-up requests back off under repeated weak-network stalls and
   assert.equal(player.catchUpCooldownMs, 2_400);
 
   player.lastCatchUpRequestAt =
-    Date.now() - player.catchUpCooldownMs - 1;
+    performance.now() - player.catchUpCooldownMs - 1;
   player.requestCatchUp(20, "later-stall");
   assert.equal(
     sent.filter(({ type }) => type === "catch-up").length,
@@ -639,7 +702,7 @@ test("a silently frozen SFU Emby transport falls back once without waiting for c
     plan: {},
     title: "Fixture",
   };
-  player.lastInboundActivityAt = Date.now() - 16_000;
+  player.lastInboundActivityAt = performance.now() - 16_000;
   const recoveries = [];
   player.addEventListener("recoveryneeded", (event) => {
     recoveries.push(event.detail);

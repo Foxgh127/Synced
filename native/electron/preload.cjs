@@ -1,5 +1,44 @@
 const { contextBridge, ipcRenderer } = require("electron");
 
+const embyStreamListeners = new Set();
+let embyStreamPort;
+
+function deliverEmbyStreamPayload(payload) {
+  const normalized = {
+    ...payload,
+    data:
+      payload?.data instanceof Uint8Array
+        ? payload.data
+        : payload?.data
+          ? new Uint8Array(payload.data)
+          : undefined,
+  };
+  for (const listener of embyStreamListeners) {
+    try {
+      listener(normalized);
+    } catch {
+      // One renderer consumer must not break delivery to another.
+    }
+  }
+}
+
+ipcRenderer.on("emby:stream-port", (event) => {
+  const port = event.ports?.[0];
+  if (!port) return;
+  try {
+    embyStreamPort?.close();
+  } catch {
+    // Replacing a port after reload is best effort.
+  }
+  embyStreamPort = port;
+  port.onmessage = (message) => deliverEmbyStreamPayload(message.data);
+  port.start();
+});
+
+ipcRenderer.on("emby:stream-event", (_event, payload) => {
+  deliverEmbyStreamPayload(payload);
+});
+
 contextBridge.exposeInMainWorld("roomDesktop", {
   listSources: (options) =>
     ipcRenderer.invoke("capture:list-sources", options),
@@ -94,28 +133,24 @@ contextBridge.exposeInMainWorld("roomDesktop", {
       reason,
       expectedPipelineId,
     ),
-  embySetFlowPaused: (paused, expectedPipelineId) =>
+  embySetFlowPaused: (paused, expectedPipelineId, generation) =>
     ipcRenderer.invoke(
       "emby:set-flow-paused",
-      Boolean(paused),
-      expectedPipelineId,
+      {
+        paused: Boolean(paused),
+        pipelineId: expectedPipelineId,
+        generation: Math.max(0, Number(generation) || 0),
+      },
     ),
+  embyGetFlowState: (expectedPipelineId) =>
+    ipcRenderer.invoke("emby:get-flow-state", expectedPipelineId),
+  embyUpdateSegmentRelay: (input) =>
+    ipcRenderer.invoke("emby:update-segment-relay", input),
   embyReportPlayback: (input) =>
     ipcRenderer.invoke("emby:report-playback", input),
   onEmbyStreamEvent: (callback) => {
-    const listener = (_event, payload) => {
-      callback({
-        ...payload,
-        data:
-          payload?.data instanceof Uint8Array
-            ? payload.data
-            : payload?.data
-              ? new Uint8Array(payload.data)
-              : undefined,
-      });
-    };
-    ipcRenderer.on("emby:stream-event", listener);
-    return () => ipcRenderer.removeListener("emby:stream-event", listener);
+    embyStreamListeners.add(callback);
+    return () => embyStreamListeners.delete(callback);
   },
   platform: process.platform,
 });

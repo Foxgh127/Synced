@@ -121,7 +121,24 @@ declare global {
       embySetFlowPaused: (
         paused: boolean,
         expectedPipelineId?: string,
-      ) => Promise<void>;
+        generation?: number,
+      ) => Promise<{
+        pipelineId: string;
+        generation: number;
+        actualPaused: boolean;
+        applied: boolean;
+      }>;
+      embyGetFlowState: (
+        expectedPipelineId?: string,
+      ) => Promise<{
+        pipelineId: string;
+        actualPaused: boolean;
+        active: boolean;
+      }>;
+      embyUpdateSegmentRelay?: (input: {
+        token: string;
+        expiresAt: number;
+      }) => Promise<{ updated: boolean; pipelineId: string }>;
       embyReportPlayback: (input: {
         action: "start" | "progress" | "stop";
         positionTicks: number;
@@ -337,6 +354,20 @@ declare global {
     allowHevc?: boolean;
     /** Internal compatibility recovery; not exposed as a user setting. */
     forceVideoTranscode?: boolean;
+    /** Internal authenticated CMAF relay configuration. */
+    segmentRelay?: {
+      baseUrl: string;
+      token: string;
+      roomId: string;
+      sessionId: string;
+      mediaVersion: number;
+      assetId: string;
+    };
+    /** Internal rendition worker marker. */
+    renditionId?: string;
+    singleRendition?: boolean;
+    title?: string;
+    skipSubtitle?: boolean;
   }
 
   interface EmbyPlaybackInfo {
@@ -380,6 +411,7 @@ declare global {
     bitrate: number;
     runtimeTicks?: number;
     startTimeTicks: number;
+    localVideoEncoder?: "h264_nvenc" | "h264_qsv" | "h264_amf" | "libopenh264";
   }
 
   type EmbyStreamEvent =
@@ -387,6 +419,8 @@ declare global {
         type: "started";
         pipelineId: string;
         plan: EmbyStreamPlan;
+        renditionId?: string;
+        auxiliary?: boolean;
       }
     | {
         type: "init";
@@ -394,6 +428,8 @@ declare global {
         data: Uint8Array;
         mimeType: string;
         plan: EmbyStreamPlan;
+        renditionId?: string;
+        auxiliary?: boolean;
       }
     | {
         type: "fragment";
@@ -411,6 +447,8 @@ declare global {
           timestampOffsetMs: number;
         }>;
         data: Uint8Array;
+        renditionId?: string;
+        auxiliary?: boolean;
       }
     | {
         type: "subtitle";
@@ -423,17 +461,23 @@ declare global {
           text?: string;
           message?: string;
         };
+        renditionId?: string;
+        auxiliary?: boolean;
       }
     | {
         type: "warning";
         pipelineId: string;
         code: string;
         message: string;
+        renditionId?: string;
+        auxiliary?: boolean;
       }
     | {
         type: "ended" | "error" | "stopped";
         pipelineId: string;
         message?: string;
         reason?: string;
+        renditionId?: string;
+        auxiliary?: boolean;
       };
 }

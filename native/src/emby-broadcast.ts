@@ -1,5 +1,9 @@
 import { EmbyMsePlayer } from "./emby-player";
 import {
+  buildEmbySegmentRelayBaseUrl,
+  deriveEmbyAssetId,
+} from "./emby-segment-relay";
+import {
   EMBY_CHUNK_BYTES,
   EMBY_CONTROL_CHANNEL_LABEL,
   EMBY_DATA_CHANNEL_LABEL,
@@ -8,8 +12,10 @@ import {
   EmbyTimelineNormalizer,
   type EmbyControlMessage,
   type EmbySenderStats,
+  type EmbySegmentSessionDescriptor,
   type EmbyTransportFragment,
 } from "./emby-transport";
+import type { SegmentRelayAccess } from "./rtc";
 
 interface EmbyBroadcastControllerOptions {
   roomId: string;
@@ -125,8 +131,8 @@ const EMBY_RECOVERY_DELAYS_MS = [1_500, 5_000] as const;
 const EMBY_START_BARRIER_MS = 2_800;
 const EMBY_LOCAL_READY_TIMEOUT_MS = 14_000;
 const EMBY_LOCAL_READY_GRACE_MS = 8_000;
-const EMBY_FLOW_CONTROL_SETTLE_TIMEOUT_MS = 2_000;
-const EMBY_FLOW_CONTROL_RESET_TIMEOUT_MS = 2_000;
+const EMBY_FLOW_CONTROL_COMMAND_TIMEOUT_MS = 1_500;
+const EMBY_FLOW_CONTROL_STATE_TIMEOUT_MS = 1_000;
 const EMBY_PIPELINE_STOP_TIMEOUT_MS = 8_000;
 const EMBY_LOGOUT_TIMEOUT_MS = 8_000;
 const EMBY_PLAYBACK_REPORT_TIMEOUT_MS = 3_000;
@@ -199,6 +205,11 @@ export class EmbyBroadcastController {
   private lastFragmentAt = 0;
   private lastLocalPlaybackProgressAt = 0;
   private lastLocalPlaybackTime = 0;
+  private segmentRelay?: {
+    signalUrl: string;
+    access: SegmentRelayAccess;
+  };
+  private segmentDescriptor?: EmbySegmentSessionDescriptor;
 
   constructor(private readonly options: EmbyBroadcastControllerOptions) {
     const bridge = window.roomDesktop;
@@ -269,6 +280,32 @@ export class EmbyBroadcastController {
   get currentRequest(): EmbyPlaybackRequest | undefined {
     const request = this.desiredPlaybackRequest();
     return request ? { ...request } : undefined;
+  }
+
+  get segmentRelayActive(): boolean {
+    return Boolean(this.segmentRelay && this.segmentDescriptor);
+  }
+
+  setSegmentRelayAccess(
+    signalUrl: string,
+    access: SegmentRelayAccess | undefined,
+  ): void {
+    if (!access || access.scope !== "publish") {
+      this.segmentRelay = undefined;
+      return;
+    }
+    this.segmentRelay = {
+      signalUrl,
+      access: { ...access },
+    };
+    if (this.pipelineId && this.bridge.embyUpdateSegmentRelay) {
+      void this.bridge
+        .embyUpdateSegmentRelay({
+          token: access.token,
+          expiresAt: access.expiresAt,
+        })
+        .catch(() => undefined);
+    }
   }
 
   get localPlaybackDiagnostics() {
@@ -392,6 +429,44 @@ export class EmbyBroadcastController {
     this.plan = undefined;
     this.mimeType = "";
     this.mediaVersion += 1;
+    this.segmentDescriptor = undefined;
+    let segmentRelayRequest:
+      | NonNullable<EmbyPlaybackRequest["segmentRelay"]>
+      | undefined;
+    if (
+      this.segmentRelay?.access.scope === "publish" &&
+      this.segmentRelay.access.expiresAt > Date.now()
+    ) {
+      const assetId = await deriveEmbyAssetId(
+        request.accountId,
+        request.itemId,
+        request.mediaSourceId,
+      );
+      if (this.destroyed || attempt !== this.startAttempt) {
+        throw new Error("Emby 启动请求已被更新的操作替代");
+      }
+      const baseUrl = buildEmbySegmentRelayBaseUrl(
+        this.segmentRelay.signalUrl,
+        this.segmentRelay.access,
+      ).toString();
+      segmentRelayRequest = {
+        baseUrl,
+        token: this.segmentRelay.access.token,
+        roomId: this.options.roomId,
+        sessionId: this.sessionId,
+        mediaVersion: this.mediaVersion,
+        assetId,
+      };
+      const manifestPath =
+        `${new URL(baseUrl).pathname}rooms/${this.options.roomId}/assets/` +
+        `${assetId}/versions/${this.mediaVersion}/manifest.json`;
+      this.segmentDescriptor = {
+        protocol: "synced-cmaf-v1",
+        assetId,
+        mediaVersion: this.mediaVersion,
+        manifestPath,
+      };
+    }
     this.timelineNormalizer.reset(
       Math.max(0, Number(request.startTimeTicks) || 0) / 10_000,
     );
@@ -448,7 +523,13 @@ export class EmbyBroadcastController {
     void ready.catch(() => undefined);
     try {
       this.inFlightPipelineStarts += 1;
-      const startInvocation = this.bridge.embyStartStream(request);
+      const startInvocation = this.bridge.embyStartStream({
+        ...request,
+        title: this.title,
+        ...(segmentRelayRequest
+          ? { segmentRelay: segmentRelayRequest }
+          : {}),
+      });
       void startInvocation
         .finally(() => {
           this.inFlightPipelineStarts = Math.max(
@@ -488,13 +569,20 @@ export class EmbyBroadcastController {
   }
 
   attachViewer(viewerId: string, pc: RTCPeerConnection): RTCDataChannel {
+    if (this.segmentDescriptor) {
+      const controlChannel = pc.createDataChannel(
+        EMBY_CONTROL_CHANNEL_LABEL,
+        { ordered: true },
+      );
+      this.attachTransport(viewerId, controlChannel, controlChannel);
+      return controlChannel;
+    }
     const channel = pc.createDataChannel(EMBY_DATA_CHANNEL_LABEL, {
-      // Movie fragments cannot be skipped: one wholly lost fMP4 fragment
-      // creates a SourceBuffer time hole and playback stops at its boundary.
-      // Reliable unordered SCTP keeps later chunks independent of ordering
-      // head-of-line blocking, while the bounded sender queue/resync path
-      // remains responsible for dropping obsolete weak-network backlog.
+      // Avoid reliable SCTP retransmission stalls. The receiver's fragment
+      // assembler and bounded application-level NACK path repair the rare
+      // missing chunk without holding unrelated traffic behind it.
       ordered: false,
+      maxRetransmits: 1,
     });
     const controlChannel = pc.createDataChannel(EMBY_CONTROL_CHANNEL_LABEL, {
       ordered: true,
@@ -560,7 +648,7 @@ export class EmbyBroadcastController {
       },
       { once: true },
     );
-    const handleClose = () => {
+    const handleControlClose = () => {
       if (this.peers.get(viewerId) === state) {
         this.peers.delete(viewerId);
         state.sender.close();
@@ -568,12 +656,29 @@ export class EmbyBroadcastController {
         this.publishStatus();
       }
     };
-    channel.addEventListener(
-      "close",
-      handleClose,
-      { once: true },
-    );
-    controlChannel.addEventListener("close", handleClose, { once: true });
+    const handleMediaClose = () => {
+      if (controlChannel === channel) {
+        handleControlClose();
+        return;
+      }
+      if (this.peers.get(viewerId) !== state) return;
+      // Keep the reliable control plane alive while this viewer replaces its
+      // partial-reliability media path. Closing it here used to discard the
+      // very catch-up/session messages needed for isolated recovery.
+      state.ready = false;
+      this.bridge.reportDiagnostic("emby-viewer-media-channel-closed", {
+        viewerId,
+        mediaVersion: this.mediaVersion,
+        transportEpoch: state.transportEpoch,
+      });
+      this.publishStatus();
+    };
+    channel.addEventListener("close", handleMediaClose, { once: true });
+    if (controlChannel !== channel) {
+      controlChannel.addEventListener("close", handleControlClose, {
+        once: true,
+      });
+    }
     if (controlChannel.readyState === "open") this.sendSessionToPeer(state);
     this.publishStatus();
   }
@@ -1229,11 +1334,13 @@ export class EmbyBroadcastController {
       };
       this.cache.add(fragment);
       this.localPlayer.appendFragment(fragment);
-      for (const state of this.peers.values()) {
-        if (state.sessionReady) {
-          state.sender.sendFragment(fragment, {
-            transportEpoch: state.transportEpoch,
-          });
+      if (!this.segmentDescriptor) {
+        for (const state of this.peers.values()) {
+          if (state.sessionReady) {
+            state.sender.sendFragment(fragment, {
+              transportEpoch: state.transportEpoch,
+            });
+          }
         }
       }
       // IPC can have fragments already in flight after stdout is paused. Use
@@ -1262,12 +1369,14 @@ export class EmbyBroadcastController {
       };
       this.cache.add(fragment);
       this.localPlayer.applySubtitle(event.subtitle.text);
-      for (const state of this.peers.values()) {
-        if (state.sessionReady) {
-          state.sender.sendFragment(fragment, {
-            priority: true,
-            transportEpoch: state.transportEpoch,
-          });
+      if (!this.segmentDescriptor) {
+        for (const state of this.peers.values()) {
+          if (state.sessionReady) {
+            state.sender.sendFragment(fragment, {
+              priority: true,
+              transportEpoch: state.transportEpoch,
+            });
+          }
         }
       }
       return;
@@ -1468,6 +1577,9 @@ export class EmbyBroadcastController {
       mimeType: this.mimeType,
       plan: this.plan,
       title: this.title,
+      ...(this.segmentDescriptor
+        ? { segmentRelay: this.segmentDescriptor }
+        : {}),
     });
     this.broadcastPlaybackState(true);
   }
@@ -1478,6 +1590,11 @@ export class EmbyBroadcastController {
     clearQueuedMedia = false,
   ): void {
     if (!state.sessionReady) return;
+    if (this.segmentDescriptor) {
+      this.broadcastPlaybackState(true);
+      if (this.streamHasEnded) this.sendEndedToPeer(state);
+      return;
+    }
     const mediaVersion = this.mediaVersion;
     const sessionId = this.sessionId;
     if (clearQueuedMedia) {
@@ -1577,6 +1694,7 @@ export class EmbyBroadcastController {
       state.sender.sendControl({
         type: "sync-pong",
         clientTimeMs: message.clientTimeMs,
+        clientMonotonicMs: message.clientMonotonicMs,
         hostTimeMs: Date.now(),
       });
       return;
@@ -2125,33 +2243,21 @@ export class EmbyBroadcastController {
     this.pipelineId = "";
     this.expectedPipelineId = "";
     this.suppressHostSeek = false;
-    const pendingFlowControl = this.flowControlOperation;
     this.flowControlGeneration += 1;
     this.flowControlOperation = undefined;
-    if (pendingFlowControl) {
-      await this.settleIpcOperation(
-        pendingFlowControl,
-        EMBY_FLOW_CONTROL_SETTLE_TIMEOUT_MS,
-        "flow-control-settle",
-        pipelineIdentity,
-      );
-    }
-    const flowReset = await this.settleIpcOperation(
-      Promise.resolve().then(() =>
+    // Stop is never coupled to the flow-control actor. The command is
+    // idempotent and intentionally fire-and-forget; stopStream terminates the
+    // pipeline even if this IPC request is delayed by a suspended renderer.
+    void Promise.resolve()
+      .then(() =>
         this.bridge.embySetFlowPaused(
           false,
           pipelineIdentity || undefined,
+          this.flowControlGeneration,
         ),
-      ),
-      EMBY_FLOW_CONTROL_RESET_TIMEOUT_MS,
-      "flow-control-reset",
-      pipelineIdentity,
-    );
-    if (flowReset) {
-      this.appliedFlowPaused = false;
-    } else {
-      this.appliedFlowPaused = undefined;
-    }
+      )
+      .catch(() => undefined);
+    this.appliedFlowPaused = undefined;
     if (hadPipeline) {
       await this.settleIpcOperation(
         Promise.resolve().then(() =>
@@ -2202,6 +2308,7 @@ export class EmbyBroadcastController {
     const paused = this.flowPauseReasons.size > 0;
     if (paused !== this.flowPaused) {
       this.flowPaused = paused;
+      this.flowControlGeneration += 1;
       this.clearFlowControlRetry();
     }
     this.flushFlowControl();
@@ -2225,22 +2332,65 @@ export class EmbyBroadcastController {
     }
     const requested = this.flowPaused;
     const generation = this.flowControlGeneration;
+    const pipelineId = this.pipelineId || this.expectedPipelineId || "";
     let applied = false;
     const operation = Promise.resolve()
       .then(() =>
-        this.bridge.embySetFlowPaused(
-          requested,
-          this.pipelineId || this.expectedPipelineId || undefined,
+        withEmbyIpcTimeout(
+          this.bridge.embySetFlowPaused(
+            requested,
+            pipelineId || undefined,
+            generation,
+          ),
+          EMBY_FLOW_CONTROL_COMMAND_TIMEOUT_MS,
+          "flow-control-command",
         ),
       )
-      .then(() => {
+      .then((ack) => {
         if (generation !== this.flowControlGeneration) return;
-        applied = true;
-        this.appliedFlowPaused = requested;
+        const actualPaused =
+          ack && typeof ack.actualPaused === "boolean"
+            ? ack.actualPaused
+            : requested;
+        const matchingAck =
+          !ack ||
+          ((ack.generation === generation || ack.generation === undefined) &&
+            (!pipelineId || !ack.pipelineId || ack.pipelineId === pipelineId));
+        applied = matchingAck && actualPaused === requested;
+        this.appliedFlowPaused = matchingAck
+          ? actualPaused
+          : undefined;
       })
-      .catch(() => {
+      .catch(async (error) => {
         if (generation !== this.flowControlGeneration) return;
         this.appliedFlowPaused = undefined;
+        const getFlowState = this.bridge.embyGetFlowState;
+        if (typeof getFlowState === "function") {
+          try {
+            const state = await withEmbyIpcTimeout(
+              getFlowState(pipelineId || undefined),
+              EMBY_FLOW_CONTROL_STATE_TIMEOUT_MS,
+              "flow-control-state",
+            );
+            if (generation !== this.flowControlGeneration) return;
+            if (
+              (!pipelineId || !state.pipelineId || state.pipelineId === pipelineId) &&
+              state.active
+            ) {
+              this.appliedFlowPaused = state.actualPaused;
+              applied = state.actualPaused === requested;
+            }
+          } catch {
+            // A bounded retry below remains the final recovery path.
+          }
+        }
+        this.bridge.reportDiagnostic("emby-flow-control-retry", {
+          pipelineId: pipelineId || undefined,
+          generation,
+          requested,
+          actual: this.appliedFlowPaused,
+          timedOut: error instanceof EmbyIpcTimeoutError,
+        });
         if (this.destroyed || this.flowControlRetryTimer !== undefined) return;
         this.flowControlRetryTimer = window.setTimeout(() => {
           this.flowControlRetryTimer = undefined;
@@ -2251,8 +2401,12 @@ export class EmbyBroadcastController {
         if (this.flowControlOperation === operation) {
           this.flowControlOperation = undefined;
         }
-        if (generation !== this.flowControlGeneration) return;
-        if (applied && this.appliedFlowPaused !== this.flowPaused) {
+        if (this.destroyed) return;
+        if (
+          generation !== this.flowControlGeneration ||
+          !applied ||
+          this.appliedFlowPaused !== this.flowPaused
+        ) {
           this.flushFlowControl();
         }
       });

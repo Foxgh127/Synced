@@ -25,6 +25,12 @@ services:
       SFU_PUBLIC_URL: "${SFU_PUBLIC_URL}"
       LIVEKIT_API_KEY: "${LIVEKIT_API_KEY}"
       LIVEKIT_API_SECRET_FILE: "/run/secrets/livekit_api_secret"
+      SEGMENT_RELAY_SECRET_FILE: "/run/secrets/segment_relay_secret"
+      SEGMENT_RELAY_CACHE_DIR: "/var/lib/synced/segment-relay"
+      SEGMENT_RELAY_MEMORY_BYTES: "${SEGMENT_RELAY_MEMORY_BYTES:-100663296}"
+      # Leave empty for the server's quota-aware default: 4% of available
+      # filesystem space, capped at 5 GiB.
+      SEGMENT_RELAY_DISK_BYTES: "${SEGMENT_RELAY_DISK_BYTES:-}"
       SIGNAL_NODE_ID: "${SIGNAL_NODE_ID:-hk-edge-primary}"
       SIGNAL_REGION: "${SIGNAL_REGION:-ap-hongkong}"
       MAX_CLIENTS: "${MAX_CLIENTS:-128}"
@@ -40,6 +46,9 @@ services:
     secrets:
       - turn_secret
       - livekit_api_secret
+      - segment_relay_secret
+    volumes:
+      - segment_relay_cache:/var/lib/synced/segment-relay
     healthcheck:
       test:
         - CMD
@@ -159,3 +168,8 @@ secrets:
     file: "${TURN_SECRET_FILE:-./secrets/turn_secret}"
   livekit_api_secret:
     file: "${LIVEKIT_API_SECRET_FILE:-./secrets/livekit_api_secret}"
+  segment_relay_secret:
+    file: "${SEGMENT_RELAY_SECRET_FILE:-./secrets/segment_relay_secret}"
+
+volumes:
+  segment_relay_cache:

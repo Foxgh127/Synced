@@ -12,8 +12,8 @@ const script = readFileSync(
   "utf8",
 );
 
-test("real portable Emby field test is pinned to 2.8.1 and observes playback", () => {
-  assert.match(script, /EXPECTED_VERSION = "2\.8\.1"/u);
+test("real portable Emby field test is pinned to 2.9.0 and observes playback", () => {
+  assert.match(script, /EXPECTED_VERSION = "2\.9\.0"/u);
   assert.match(script, /Math\.max\(\s*30_000/u);
   assert.match(script, /getVideoPlaybackQuality/u);
   assert.match(script, /readyStateMin/u);

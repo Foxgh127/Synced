@@ -42,7 +42,7 @@ const EMBY_CATCH_UP_HEALTHY_RESET_SAMPLES = 12;
 // Keep a generous margin below the three-second product ceiling. Once the
 // desired timestamp is 1.8 s ahead of available media, pause stale playback
 // and request a fresh keyframe window instead of letting drift keep growing.
-export const EMBY_MAX_SYNC_DRIFT_SECONDS = 1.8;
+export const EMBY_MAX_SYNC_DRIFT_SECONDS = 0.75;
 
 export interface EmbyAdaptiveBufferProfile {
   initialSeconds: number;
@@ -149,14 +149,15 @@ export function planEmbyPlaybackCorrection(
   // live playback drift and reserve decoder-flushing seeks for a real gap.
   if (
     Math.abs(error) >
-    (paused ? 0.35 : EMBY_MAX_SYNC_DRIFT_SECONDS)
+    (paused ? 0.2 : EMBY_MAX_SYNC_DRIFT_SECONDS)
   ) {
     return { action: "seek", playbackRate: baseRate };
   }
   if (Math.abs(error) >= 0.1 && !paused) {
+    const rateAdjustment = Math.max(-0.02, Math.min(0.02, error * 0.04));
     return {
       action: "rate",
-      playbackRate: baseRate * (error > 0 ? 1.04 : 0.96),
+      playbackRate: baseRate * (1 + rateAdjustment),
       restoreAfterMs: Math.min(
         8_000,
         Math.max(1_500, Math.abs(error) * 10_000),
@@ -613,15 +614,20 @@ export class EmbyMsePlayer extends EventTarget {
   private subtitleUrl?: string;
   private appendQueue: Uint8Array[] = [];
   private appendTimestampOffsets: Array<number | undefined> = [];
+  private appendRetryCounts: number[] = [];
+  private appendQueueBytes = 0;
+  private lastInitData?: Uint8Array;
   private appendBusy = false;
   private pendingQuotaRecovery = false;
   private quotaRecoveryTimer?: number;
   private quotaRecoveryAttempts = 0;
+  private mediaSourceRecoveryAttempts = 0;
   private started = false;
   private mediaReadySent = false;
   private lastStateVersion = 0;
   private clockOffsetMs = 0;
   private clockSamples = 0;
+  private clockSyncSamples: Array<{ rttMs: number; offsetMs: number }> = [];
   private speedRestoreTimer?: number;
   private progressTimer?: number;
   private bufferTimer?: number;
@@ -640,16 +646,19 @@ export class EmbyMsePlayer extends EventTarget {
   private lastTimelineTimeMs = 0;
   private readonly missingFragmentRepairAttempts = new Map<number, number>();
   private mediaReorderTimer?: number;
+  private invalidPacketTokens = 8;
+  private invalidPacketUpdatedAt = performance.now();
   private invalidPacketCount = 0;
   private lastBufferReportAt = 0;
   private lastCatchUpRequestAt = 0;
   private catchUpCooldownMs = EMBY_CATCH_UP_MIN_INTERVAL_MS;
   private healthyCatchUpSamples = 0;
-  private lastTransportFallbackRequestAt = 0;
-  private lastInboundActivityAt = 0;
+  private lastTransportFallbackRequestAt?: number;
+  private lastInboundActivityAt?: number;
   private transportFallbackRequested = false;
+  private externalSegmentTransport = false;
   private lastHardSeekAt = 0;
-  private lastStartupAnchorAt = 0;
+  private lastStartupAnchorAt?: number;
   private latestHostTarget = 0;
   private hostWantsPaused = true;
   private pendingCatchUpTarget?: number;
@@ -760,15 +769,38 @@ export class EmbyMsePlayer extends EventTarget {
     return true;
   }
 
+  enableExternalSegmentTransport(): void {
+    this.externalSegmentTransport = true;
+    this.detachChannel();
+    this.assembler?.reset();
+    this.assembler = undefined;
+    this.resetPendingMediaReception(true);
+  }
+
   private requestCatchUp(targetTime: number, reason: string): void {
     const session = this.session;
     if (!session || this.destroyed) return;
-    const now = Date.now();
+    const now = performance.now();
+    if (this.externalSegmentTransport) {
+      this.dispatchEvent(
+        new CustomEvent("segmentrecoveryneeded", {
+          detail: {
+            reason,
+            targetTime: Math.max(0, finite(targetTime)),
+            sessionId: session.sessionId,
+            mediaVersion: session.mediaVersion,
+            transportEpoch: session.transportEpoch ?? 0,
+          },
+        }),
+      );
+      return;
+    }
     if (this.recoveryStrategy === "transport-fallback") {
       if (
         this.transportFallbackRequested ||
-        now - this.lastTransportFallbackRequestAt <
-          EMBY_CATCH_UP_MIN_INTERVAL_MS
+        (this.lastTransportFallbackRequestAt !== undefined &&
+          now - this.lastTransportFallbackRequestAt <
+            EMBY_CATCH_UP_MIN_INTERVAL_MS)
       ) {
         return;
       }
@@ -828,7 +860,7 @@ export class EmbyMsePlayer extends EventTarget {
     }
     if (
       this.lastCatchUpRequestAt > 0 &&
-      Date.now() - this.lastCatchUpRequestAt < this.catchUpCooldownMs
+      performance.now() - this.lastCatchUpRequestAt < this.catchUpCooldownMs
     ) {
       return;
     }
@@ -843,7 +875,7 @@ export class EmbyMsePlayer extends EventTarget {
   }
 
   get queuedAppendBytes(): number {
-    return this.appendQueue.reduce((total, data) => total + data.byteLength, 0);
+    return this.appendQueue.length ? this.appendQueueBytes : 0;
   }
 
   get bufferProfile(): EmbyAdaptiveBufferProfile {
@@ -932,10 +964,11 @@ export class EmbyMsePlayer extends EventTarget {
     this.lastCatchUpRequestAt = 0;
     this.catchUpCooldownMs = EMBY_CATCH_UP_MIN_INTERVAL_MS;
     this.healthyCatchUpSamples = 0;
-    this.lastInboundActivityAt = Date.now();
+    this.lastInboundActivityAt = performance.now();
     this.transportFallbackRequested = false;
+    this.lastTransportFallbackRequestAt = undefined;
     this.lastHardSeekAt = 0;
-    this.lastStartupAnchorAt = 0;
+    this.lastStartupAnchorAt = undefined;
     this.latestHostTarget = Math.max(
       0,
       finite(normalizedSession.plan.startTimeTicks) / 10_000_000,
@@ -951,6 +984,8 @@ export class EmbyMsePlayer extends EventTarget {
       this.receivedInitKey = "";
     }
     if (!changed) return;
+    this.mediaSourceRecoveryAttempts = 0;
+    this.lastInitData = undefined;
     this.receivedInitKey = "";
     this.resetMediaSource();
     const mimeType = compatibleMimeType(normalizedSession.mimeType);
@@ -1067,14 +1102,15 @@ export class EmbyMsePlayer extends EventTarget {
     this.channel = channel;
     this.clockOffsetMs = 0;
     this.clockSamples = 0;
-    this.lastInboundActivityAt = Date.now();
+    this.clockSyncSamples = [];
+    this.lastInboundActivityAt = performance.now();
     this.transportFallbackRequested = false;
     channel.binaryType = "arraybuffer";
     const handleMessage = (event: MessageEvent) => {
       try {
         if (typeof event.data === "string") {
           if (event.data.length <= 16 * 1024) {
-            this.lastInboundActivityAt = Date.now();
+            this.lastInboundActivityAt = performance.now();
             this.handleControlText(event.data);
           }
           return;
@@ -1082,16 +1118,16 @@ export class EmbyMsePlayer extends EventTarget {
         if (!this.assembler) return;
         if (event.data instanceof ArrayBuffer) {
           this.assembler.accept(event.data);
-          this.lastInboundActivityAt = Date.now();
-          this.invalidPacketCount = 0;
+          this.lastInboundActivityAt = performance.now();
+          this.noteValidPacket();
         } else if (event.data instanceof Blob) {
           void event.data
             .arrayBuffer()
             .then((data) => {
               try {
                 this.assembler?.accept(data);
-                this.lastInboundActivityAt = Date.now();
-                this.invalidPacketCount = 0;
+                this.lastInboundActivityAt = performance.now();
+                this.noteValidPacket();
               } catch {
                 this.noteInvalidPacket();
               }
@@ -1105,8 +1141,8 @@ export class EmbyMsePlayer extends EventTarget {
               event.data.byteLength,
             ),
           );
-          this.lastInboundActivityAt = Date.now();
-          this.invalidPacketCount = 0;
+          this.lastInboundActivityAt = performance.now();
+          this.noteValidPacket();
         }
       } catch {
         this.noteInvalidPacket();
@@ -1114,7 +1150,20 @@ export class EmbyMsePlayer extends EventTarget {
     };
     const handleClose = () => {
       if (this.channel !== channel) return;
-      if (!this.streamComplete) this.dispatchEvent(new Event("disconnected"));
+      if (this.streamComplete) return;
+      if (this.controlChannel?.readyState === "open") {
+        this.dispatchEvent(new Event("mediatransportclosed"));
+        this.requestCatchUp(
+          Math.max(
+            0,
+            finite(this.video.currentTime),
+            finite(this.latestHostTarget),
+          ),
+          "media-channel-closed",
+        );
+      } else {
+        this.dispatchEvent(new Event("disconnected"));
+      }
     };
     (channel as RTCDataChannel & {
       __syncedEmbyMessage?: (event: MessageEvent) => void;
@@ -1142,18 +1191,24 @@ export class EmbyMsePlayer extends EventTarget {
     this.controlChannel = channel;
     this.clockOffsetMs = 0;
     this.clockSamples = 0;
-    this.lastInboundActivityAt = Date.now();
+    this.clockSyncSamples = [];
+    this.lastInboundActivityAt = performance.now();
     this.transportFallbackRequested = false;
     const handleMessage = (event: MessageEvent) => {
       if (typeof event.data !== "string" || event.data.length > 16 * 1024) {
         return;
       }
-      this.lastInboundActivityAt = Date.now();
+      this.lastInboundActivityAt = performance.now();
       this.handleControlText(event.data);
     };
     const handleClose = () => {
       if (this.controlChannel !== channel) return;
-      if (!this.streamComplete) this.dispatchEvent(new Event("disconnected"));
+      if (
+        !this.streamComplete &&
+        this.channel?.readyState !== "open"
+      ) {
+        this.dispatchEvent(new Event("disconnected"));
+      }
     };
     const handleOpen = () => this.sendClockPing();
     (
@@ -1192,8 +1247,12 @@ export class EmbyMsePlayer extends EventTarget {
         session.transportEpoch ?? 0,
       );
     }
+    if (!this.appendQueue.length) this.appendQueueBytes = 0;
     this.appendQueue.unshift(data.slice());
     this.appendTimestampOffsets.unshift(undefined);
+    this.appendRetryCounts.unshift(0);
+    this.appendQueueBytes += data.byteLength;
+    this.lastInitData = data.slice();
     this.emitAppendQueueChange();
     this.pumpAppendQueue();
     this.flushPendingMedia(false);
@@ -1340,10 +1399,13 @@ export class EmbyMsePlayer extends EventTarget {
         0,
         this.pendingMediaBytes - fragment.data.byteLength,
       );
+      if (!this.appendQueue.length) this.appendQueueBytes = 0;
       this.appendQueue.push(fragment.data);
       this.appendTimestampOffsets.push(
         this.timestampOffsetForFragment(fragment),
       );
+      this.appendRetryCounts.push(0);
+      this.appendQueueBytes += fragment.data.byteLength;
       this.nextMediaSequence = fragment.sequence + 1;
       this.lastDeliveredMediaSequence = Math.max(
         this.lastDeliveredMediaSequence ?? fragment.sequence,
@@ -1368,6 +1430,7 @@ export class EmbyMsePlayer extends EventTarget {
     const session = this.session;
     if (
       !session ||
+      this.externalSegmentTransport ||
       !Number.isSafeInteger(fragmentSequence) ||
       fragmentSequence < 1
     ) {
@@ -1375,7 +1438,7 @@ export class EmbyMsePlayer extends EventTarget {
     }
     const attempts =
       this.missingFragmentRepairAttempts.get(fragmentSequence) || 0;
-    if (attempts >= 3) return false;
+    if (attempts >= 1) return false;
     this.missingFragmentRepairAttempts.set(fragmentSequence, attempts + 1);
     // A completely lost fragment never reaches the chunk assembler, so it
     // cannot know which chunks to request. Asking for the first 64 chunks is
@@ -1416,6 +1479,8 @@ export class EmbyMsePlayer extends EventTarget {
       const hadQueuedData = this.appendQueue.length > 0;
       this.appendQueue = [];
       this.appendTimestampOffsets = [];
+      this.appendRetryCounts = [];
+      this.appendQueueBytes = 0;
       if (hadQueuedData) this.emitAppendQueueChange();
     }
   }
@@ -1519,7 +1584,7 @@ export class EmbyMsePlayer extends EventTarget {
         target <= this.video.currentTime ||
         targetBuffered
       ) {
-        const now = Date.now();
+        const now = performance.now();
         if (
           Math.abs(target - finite(this.video.currentTime)) <= 0.08 ||
           now - this.lastHardSeekAt >= 1_500
@@ -1530,7 +1595,7 @@ export class EmbyMsePlayer extends EventTarget {
           this.syncHeld = false;
         }
       } else {
-        const now = Date.now();
+        const now = performance.now();
         if (shouldHardResyncEmbyPlayback(error, targetBuffered)) {
           this.holdForCatchUp(target);
         }
@@ -1621,6 +1686,16 @@ export class EmbyMsePlayer extends EventTarget {
         message.transportEpoch === undefined
           ? 0
           : Number(message.transportEpoch);
+      const segmentRelay = message.segmentRelay;
+      const segmentRelayValid =
+        segmentRelay === undefined ||
+        (segmentRelay.protocol === "synced-cmaf-v1" &&
+          /^[a-f0-9]{24,64}$/u.test(segmentRelay.assetId) &&
+          Number(segmentRelay.mediaVersion) ===
+            Number(message.mediaVersion) &&
+          typeof segmentRelay.manifestPath === "string" &&
+          segmentRelay.manifestPath.length >= 1 &&
+          segmentRelay.manifestPath.length <= 2_048);
       if (
         this.awaitingMediaVersion !== undefined &&
         Number(message.mediaVersion) < this.awaitingMediaVersion
@@ -1657,7 +1732,8 @@ export class EmbyMsePlayer extends EventTarget {
         plan.bitrate < 1 ||
         plan.bitrate > 100_000_000 ||
         typeof message.title !== "string" ||
-        message.title.length > 300
+        message.title.length > 300 ||
+        !segmentRelayValid
       ) {
         this.noteInvalidPacket();
         return;
@@ -1678,6 +1754,16 @@ export class EmbyMsePlayer extends EventTarget {
           mediaVersion: message.mediaVersion,
           transportEpoch,
         });
+        if (segmentRelay) {
+          this.dispatchEvent(
+            new CustomEvent("segmentrelay", {
+              detail: {
+                session: { ...activeSession },
+                descriptor: { ...segmentRelay },
+              },
+            }),
+          );
+        }
         return;
       }
       this.configure({
@@ -1729,6 +1815,16 @@ export class EmbyMsePlayer extends EventTarget {
         mediaVersion: message.mediaVersion,
         transportEpoch,
       });
+      if (segmentRelay && this.session) {
+        this.dispatchEvent(
+          new CustomEvent("segmentrelay", {
+            detail: {
+              session: { ...this.session },
+              descriptor: { ...segmentRelay },
+            },
+          }),
+        );
+      }
       // The broadcaster sends the init segment immediately before cached
       // media. Request it only if that proactive copy did not arrive, which
       // avoids duplicate MP4 initialization segments under normal latency.
@@ -1842,16 +1938,21 @@ export class EmbyMsePlayer extends EventTarget {
         this.noteInvalidPacket();
         return;
       }
-      const now = Date.now();
-      const roundTrip = now - message.clientTimeMs;
+      const wallNow = Date.now();
+      const monotonicNow = performance.now();
+      const roundTrip = Number.isFinite(message.clientMonotonicMs)
+        ? monotonicNow - Number(message.clientMonotonicMs)
+        : wallNow - message.clientTimeMs;
       if (roundTrip >= 0 && roundTrip < 5_000) {
         const sample =
           message.hostTimeMs - (message.clientTimeMs + roundTrip / 2);
-        this.clockOffsetMs =
-          this.clockSamples < 3
-            ? (this.clockOffsetMs * this.clockSamples + sample) /
-              (this.clockSamples + 1)
-            : this.clockOffsetMs * 0.7 + sample * 0.3;
+        this.clockSyncSamples.push({ rttMs: roundTrip, offsetMs: sample });
+        if (this.clockSyncSamples.length > 8) {
+          this.clockSyncSamples.shift();
+        }
+        this.clockOffsetMs = [...this.clockSyncSamples].sort(
+          (left, right) => left.rttMs - right.rttMs,
+        )[0].offsetMs;
         this.clockSamples += 1;
       }
       return;
@@ -1981,6 +2082,7 @@ export class EmbyMsePlayer extends EventTarget {
   }
 
   private armInitRequest(): void {
+    if (this.externalSegmentTransport) return;
     if (this.initRequestTimer !== undefined) {
       window.clearTimeout(this.initRequestTimer);
     }
@@ -2127,14 +2229,36 @@ export class EmbyMsePlayer extends EventTarget {
   }
 
   private noteInvalidPacket(): void {
+    this.refillInvalidPacketTokens();
     this.invalidPacketCount += 1;
-    if (this.invalidPacketCount < 8) return;
+    this.invalidPacketTokens -= 1;
+    if (this.invalidPacketTokens > 0) return;
     this.emitError("收到连续损坏或越界的 Emby 媒体数据，已断开此播放通道");
     if (this.channel?.readyState !== "closed") this.channel?.close();
   }
 
+  private noteValidPacket(): void {
+    // A valid packet proves only that packet is valid. Refill slowly so an
+    // attacker cannot alternate one valid frame with malformed bursts.
+    this.refillInvalidPacketTokens();
+  }
+
+  private refillInvalidPacketTokens(): void {
+    const now = performance.now();
+    const elapsed = Math.max(0, now - this.invalidPacketUpdatedAt);
+    this.invalidPacketUpdatedAt = now;
+    this.invalidPacketTokens = Math.min(
+      8,
+      this.invalidPacketTokens + elapsed / 4_000,
+    );
+  }
+
   private sendClockPing(): void {
-    this.sendControl({ type: "sync-ping", clientTimeMs: Date.now() });
+    this.sendControl({
+      type: "sync-ping",
+      clientTimeMs: Date.now(),
+      clientMonotonicMs: performance.now(),
+    });
   }
 
   private isTimeBuffered(seconds: number): boolean {
@@ -2196,6 +2320,11 @@ export class EmbyMsePlayer extends EventTarget {
       this.sourceBuffer.appendBuffer(appendable);
       this.appendQueue.shift();
       this.appendTimestampOffsets.shift();
+      this.appendRetryCounts.shift();
+      this.appendQueueBytes = Math.max(
+        0,
+        this.appendQueueBytes - next.byteLength,
+      );
       this.quotaRecoveryAttempts = 0;
       this.emitAppendQueueChange();
       if (typeof this.sourceBuffer.addEventListener === "function") {
@@ -2209,11 +2338,16 @@ export class EmbyMsePlayer extends EventTarget {
         error.name === "QuotaExceededError"
       ) {
         this.pendingQuotaRecovery = true;
-        this.trimBehind(true);
+        this.recoverFromQuotaExceeded();
         return;
       }
       this.appendQueue.shift();
       this.appendTimestampOffsets.shift();
+      this.appendRetryCounts.shift();
+      this.appendQueueBytes = Math.max(
+        0,
+        this.appendQueueBytes - next.byteLength,
+      );
       this.emitAppendQueueChange();
       this.emitError(
         error instanceof Error
@@ -2237,9 +2371,21 @@ export class EmbyMsePlayer extends EventTarget {
         return;
       }
       this.appendBusy = false;
-      this.emitError(
-        "本地媒体片段解码超时，正在切换兼容 H.264 播放线路",
-      );
+      try {
+        this.sourceBuffer.abort();
+      } catch {
+        // A permanently updating SourceBuffer is replaced below.
+      }
+      if (!this.rebuildMediaSourceLocally("append-watchdog")) {
+        this.requestCatchUp(
+          Math.max(
+            0,
+            finite(this.video.currentTime),
+            finite(this.latestHostTarget),
+          ),
+          "mse-append-watchdog-terminal",
+        );
+      }
     }, 8_000);
   }
 
@@ -2307,11 +2453,14 @@ export class EmbyMsePlayer extends EventTarget {
       (this.video.currentTime < firstStart - 0.1 ||
         this.video.currentTime > this.video.buffered.end(0))
     ) {
-      const now = Date.now();
+      const now = performance.now();
       // Some Android decoders apply the initial seek asynchronously. Repeating
       // it on every 500 ms buffer inspection flushes the same decoder before
       // it can output a frame, so re-anchor only after a bounded grace period.
-      if (now - this.lastStartupAnchorAt >= 2_000) {
+      if (
+        this.lastStartupAnchorAt === undefined ||
+        now - this.lastStartupAnchorAt >= 2_000
+      ) {
         this.lastStartupAnchorAt = now;
         this.video.currentTime = firstStart;
       }
@@ -2367,7 +2516,7 @@ export class EmbyMsePlayer extends EventTarget {
     if (policy.shouldTrim) {
       this.trimBehind(false);
     }
-    const now = Date.now();
+    const now = performance.now();
     if (shouldReportEmbyBuffer(this.lastBufferReportAt, now)) {
       this.lastBufferReportAt = now;
       const detail = {
@@ -2417,6 +2566,201 @@ export class EmbyMsePlayer extends EventTarget {
     } catch {
       this.appendBusy = false;
       if (this.pendingQuotaRecovery) this.scheduleQuotaRecovery();
+    }
+  }
+
+  private recoverFromQuotaExceeded(): void {
+    const sourceBuffer = this.sourceBuffer;
+    const next = this.appendQueue[0];
+    if (!sourceBuffer || !next) {
+      this.pendingQuotaRecovery = false;
+      return;
+    }
+    const retry = (this.appendRetryCounts[0] || 0) + 1;
+    this.appendRetryCounts[0] = retry;
+    this.quotaRecoveryAttempts = retry;
+    if (retry === 1) {
+      this.removeBufferedHistory();
+      return;
+    }
+    if (retry === 2) {
+      this.removeFarFutureBuffer();
+      return;
+    }
+    if (retry === 3) {
+      try {
+        sourceBuffer.abort();
+      } catch {
+        // A closed SourceBuffer still proceeds to the bounded rebuild stage.
+      }
+      this.targetBufferSeconds = Math.max(
+        this.initialBufferSeconds + 2,
+        Math.floor(this.targetBufferSeconds * 0.72),
+      );
+      this.maxBufferSeconds = Math.max(
+        this.targetBufferSeconds + 2,
+        Math.floor(this.maxBufferSeconds * 0.72),
+      );
+      this.scheduleQuotaRecovery();
+      return;
+    }
+    if (retry === 4 && this.rebuildMediaSourceLocally("quota-exceeded")) {
+      return;
+    }
+    this.failQuotaFragment(next, retry);
+  }
+
+  private removeBufferedHistory(): boolean {
+    const sourceBuffer = this.sourceBuffer;
+    if (!sourceBuffer || sourceBuffer.updating || !sourceBuffer.buffered.length) {
+      this.scheduleQuotaRecovery();
+      return false;
+    }
+    const start = sourceBuffer.buffered.start(0);
+    const removeEnd = Math.max(0, this.video.currentTime - 8);
+    if (removeEnd <= start + 0.5) {
+      this.scheduleQuotaRecovery();
+      return false;
+    }
+    try {
+      this.appendBusy = true;
+      sourceBuffer.remove(start, removeEnd);
+      return true;
+    } catch {
+      this.appendBusy = false;
+      this.scheduleQuotaRecovery();
+      return false;
+    }
+  }
+
+  private removeFarFutureBuffer(): boolean {
+    const sourceBuffer = this.sourceBuffer;
+    if (!sourceBuffer || sourceBuffer.updating || !sourceBuffer.buffered.length) {
+      this.scheduleQuotaRecovery();
+      return false;
+    }
+    const keepUntil =
+      this.video.currentTime +
+      Math.max(this.initialBufferSeconds + 4, this.targetBufferSeconds * 0.55);
+    let removeStart: number | undefined;
+    let removeEnd = 0;
+    for (let index = 0; index < sourceBuffer.buffered.length; index += 1) {
+      const end = sourceBuffer.buffered.end(index);
+      if (end <= keepUntil + 0.5) continue;
+      removeStart = Math.max(
+        keepUntil,
+        sourceBuffer.buffered.start(index),
+      );
+      removeEnd = end;
+      break;
+    }
+    if (removeStart === undefined || removeEnd <= removeStart + 0.5) {
+      this.scheduleQuotaRecovery();
+      return false;
+    }
+    try {
+      this.appendBusy = true;
+      sourceBuffer.remove(removeStart, removeEnd);
+      return true;
+    } catch {
+      this.appendBusy = false;
+      this.scheduleQuotaRecovery();
+      return false;
+    }
+  }
+
+  private rebuildMediaSourceLocally(reason: string): boolean {
+    const session = this.session;
+    if (
+      !session ||
+      this.destroyed ||
+      this.mediaSourceRecoveryAttempts >= 1
+    ) {
+      return false;
+    }
+    const assembler = this.assembler;
+    const init = this.lastInitData?.slice();
+    const retainedTargetBufferSeconds = this.targetBufferSeconds;
+    const retainedMaxBufferSeconds = this.maxBufferSeconds;
+    const recoveryAttempt = this.mediaSourceRecoveryAttempts + 1;
+    const targetTime = Math.max(
+      0,
+      finite(this.video.currentTime),
+      finite(this.latestHostTarget),
+    );
+    this.resetMediaSource();
+    this.session = undefined;
+    this.configure(session);
+    this.targetBufferSeconds = Math.min(
+      this.targetBufferSeconds,
+      retainedTargetBufferSeconds,
+    );
+    this.maxBufferSeconds = Math.max(
+      this.targetBufferSeconds + 2,
+      Math.min(this.maxBufferSeconds, retainedMaxBufferSeconds),
+    );
+    this.mediaSourceRecoveryAttempts = recoveryAttempt;
+    this.assembler = assembler;
+    this.lastInitData = init;
+    if (init) this.appendInit(init);
+    this.pendingCatchUpTarget = targetTime;
+    this.syncHeld = true;
+    this.video.pause();
+    if (!this.host) {
+      this.sendControl({
+        type: "catch-up",
+        sessionId: session.sessionId,
+        mediaVersion: session.mediaVersion,
+        transportEpoch: session.transportEpoch ?? 0,
+        targetTime,
+      });
+      this.armInitRequest();
+    }
+    if (this.externalSegmentTransport) {
+      // The local MediaSource was replaced and its buffered ranges no longer
+      // exist. Tell the HTTPS ABR actor exactly which timeline window to
+      // repopulate; polling video.currentTime alone would otherwise restart at
+      // zero while pendingCatchUpTarget waits forever for a distant seek.
+      this.requestCatchUp(targetTime, `mse-local-rebuild-${reason}`);
+    }
+    this.dispatchEvent(
+      new CustomEvent("mserecovery", {
+        detail: {
+          reason,
+          attempt: recoveryAttempt,
+          targetBufferSeconds: this.targetBufferSeconds,
+          maxBufferSeconds: this.maxBufferSeconds,
+        },
+      }),
+    );
+    return true;
+  }
+
+  private failQuotaFragment(fragment: Uint8Array, retry: number): void {
+    if (this.appendQueue[0] === fragment) {
+      this.appendQueue.shift();
+      this.appendTimestampOffsets.shift();
+      this.appendRetryCounts.shift();
+      this.appendQueueBytes = Math.max(
+        0,
+        this.appendQueueBytes - fragment.byteLength,
+      );
+      this.emitAppendQueueChange();
+    }
+    this.pendingQuotaRecovery = false;
+    this.appendBusy = false;
+    this.requestCatchUp(
+      Math.max(
+        0,
+        finite(this.video.currentTime),
+        finite(this.latestHostTarget),
+      ),
+      `mse-quota-terminal-${retry}`,
+    );
+    if (this.host) {
+      this.emitError(
+        "浏览器媒体配额在本地重建后仍不足，已停止重试当前片段并请求管线重新同步",
+      );
     }
   }
 
@@ -2471,11 +2815,11 @@ export class EmbyMsePlayer extends EventTarget {
     ) {
       // Chromium may suspend both rendering and timers in the background.
       // Give the transport a fresh observation window after visibility resumes.
-      this.lastInboundActivityAt = Date.now();
+      this.lastInboundActivityAt = performance.now();
       return;
     }
-    const now = Date.now();
-    if (!this.lastInboundActivityAt) {
+    const now = performance.now();
+    if (this.lastInboundActivityAt === undefined) {
       this.lastInboundActivityAt = now;
       return;
     }
@@ -2632,9 +2976,11 @@ export class EmbyMsePlayer extends EventTarget {
     this.endRequested = false;
     this.streamComplete = false;
     this.clearEndBoundary();
+    this.invalidPacketTokens = 8;
+    this.invalidPacketUpdatedAt = performance.now();
     this.invalidPacketCount = 0;
     this.lastHardSeekAt = 0;
-    this.lastStartupAnchorAt = 0;
+    this.lastStartupAnchorAt = undefined;
     this.pendingCatchUpTarget = undefined;
     this.syncHeld = false;
     this.awaitingResyncEpoch = undefined;

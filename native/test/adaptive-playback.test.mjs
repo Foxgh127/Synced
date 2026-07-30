@@ -22,76 +22,129 @@ async function loadModule() {
   return modulePromise;
 }
 
-test("degrades resolution after sustained packet loss and recovers stepwise", async () => {
+test("degrades within three bad samples and recovers only after sustained headroom", async () => {
   const { AdaptivePlaybackController } = await loadModule();
   const controller = new AdaptivePlaybackController();
   controller.configure(1600);
 
   assert.equal(controller.requestedHeight, undefined);
-  let down;
-  for (let index = 0; index < 5; index += 1) {
-    down = controller.observe(
-      { connectionState: "connected", packetLossRatio: 0.06, jitter: 0.09 },
+  let decision;
+  for (let index = 0; index < 3; index += 1) {
+    decision = controller.observe(
+      {
+        connectionState: "connected",
+        packetLossRatio: 0.06,
+        jitter: 0.09,
+      },
       1_000 + index * 1_000,
     );
   }
-  assert.equal(down.direction, "down");
-  assert.equal(down.requestedHeight, 1440);
+  assert.equal(decision.direction, "down");
+  assert.equal(decision.requestedHeight, 1080);
+  assert.equal(decision.pressure, "network-limited");
 
-  let up;
-  for (let index = 0; index < 5; index += 1) {
-    up = controller.observe(
-      { connectionState: "connected", packetLossRatio: 0, jitter: 0.01 },
-      10_000 + index * 1_000,
-    );
-  }
-  assert.equal(up.direction, "up");
-  assert.equal(up.requestedHeight, undefined);
+  decision = controller.observe(
+    {
+      connectionState: "connected",
+      packetLossRatio: 0,
+      jitter: 0.01,
+      availableBandwidthBps: 25_000_000,
+      currentRoundTripTime: 0.03,
+    },
+    10_000,
+  );
+  assert.equal(decision.changed, false);
+  decision = controller.observe(
+    {
+      connectionState: "connected",
+      packetLossRatio: 0,
+      jitter: 0.01,
+      availableBandwidthBps: 25_000_000,
+      currentRoundTripTime: 0.03,
+    },
+    30_000,
+  );
+  assert.equal(decision.direction, "up");
+  assert.equal(decision.requestedHeight, undefined);
 });
 
-test("a manual quality ceiling is never exceeded during recovery", async () => {
+test("a manual ceiling is retained and upgrade requires 1.5x bandwidth", async () => {
   const { AdaptivePlaybackController } = await loadModule();
   const controller = new AdaptivePlaybackController();
   controller.configure(2160, 720);
   assert.equal(controller.requestedHeight, 720);
 
-  controller.observe(
+  const down = controller.observe(
     { connectionState: "connected", packetLossRatio: 0.2 },
     2_000,
   );
-  controller.observe(
-    { connectionState: "connected", packetLossRatio: 0.2 },
-    3_000,
-  );
-  const down = controller.observe(
-    { connectionState: "connected", packetLossRatio: 0.2 },
-    4_000,
-  );
+  assert.equal(down.direction, "down");
   assert.equal(down.requestedHeight, 480);
 
-  let up;
-  for (let index = 0; index < 5; index += 1) {
-    up = controller.observe(
-      { connectionState: "connected", packetLossRatio: 0, jitter: 0 },
-      10_000 + index * 1_000,
-    );
-  }
-  assert.equal(up.requestedHeight, 720);
+  controller.observe(
+    {
+      connectionState: "connected",
+      packetLossRatio: 0,
+      jitter: 0,
+      availableBandwidthBps: 4_700_000,
+    },
+    10_000,
+  );
+  let held = controller.observe(
+    {
+      connectionState: "connected",
+      packetLossRatio: 0,
+      jitter: 0,
+      availableBandwidthBps: 4_700_000,
+    },
+    35_000,
+  );
+  assert.equal(held.changed, false);
+  assert.equal(held.requestedHeight, 480);
+
+  held = controller.observe(
+    {
+      connectionState: "connected",
+      packetLossRatio: 0,
+      jitter: 0,
+      availableBandwidthBps: 5_000_000,
+    },
+    36_000,
+  );
+  assert.equal(held.direction, "up");
+  assert.equal(held.requestedHeight, 720);
 });
 
-test("missing startup frames force mobile quality down through 480p and 360p", async () => {
+test("detail mode sacrifices frame rate before pixels and has a terminal 480p rung", async () => {
   const { AdaptivePlaybackController } = await loadModule();
   const controller = new AdaptivePlaybackController();
-  controller.configure(2160, 720);
+  controller.configure(2160, 720, false, {
+    contentMode: "detail",
+    sourceFrameRate: 30,
+  });
 
+  assert.deepEqual(
+    [controller.requestedHeight, controller.requestedFrameRate],
+    [720, 30],
+  );
   const first = controller.forceDegrade();
   const second = controller.forceDegrade();
+  const third = controller.forceDegrade();
   const exhausted = controller.forceDegrade();
 
-  assert.equal(first.requestedHeight, 480);
-  assert.equal(second.requestedHeight, 360);
+  assert.deepEqual(
+    [first.requestedHeight, first.requestedFrameRate],
+    [720, 20],
+  );
+  assert.deepEqual(
+    [second.requestedHeight, second.requestedFrameRate],
+    [720, 15],
+  );
+  assert.deepEqual(
+    [third.requestedHeight, third.requestedFrameRate],
+    [480, 20],
+  );
   assert.equal(exhausted.changed, false);
-  assert.equal(exhausted.requestedHeight, 360);
 });
 
 test("a short isolated jitter spike does not change quality", async () => {
@@ -112,65 +165,75 @@ test("a short isolated jitter spike does not change quality", async () => {
   assert.equal(controller.requestedHeight, undefined);
 });
 
-test("neutral 1-2% Wi-Fi loss does not erase accumulated recovery samples", async () => {
+test("an ambiguous Wi-Fi sample restarts the continuous upgrade window", async () => {
   const { AdaptivePlaybackController } = await loadModule();
   const controller = new AdaptivePlaybackController();
   controller.configure(1600);
 
-  let decision;
-  for (let index = 0; index < 5; index += 1) {
-    decision = controller.observe(
-      { connectionState: "connected", packetLossRatio: 0.06, jitter: 0.09 },
-      1_000 + index * 1_000,
-    );
-  }
-  assert.equal(decision.direction, "down");
-  assert.equal(controller.requestedHeight, 1440);
+  controller.observe(
+    { connectionState: "connected", packetLossRatio: 0.15 },
+    1_000,
+  );
+  assert.equal(controller.requestedHeight, 1080);
 
-  for (let index = 0; index < 3; index += 1) {
-    decision = controller.observe(
-      { connectionState: "connected", packetLossRatio: 0, jitter: 0.01 },
-      10_000 + index * 1_000,
-    );
-  }
-  decision = controller.observe(
-    { connectionState: "connected", packetLossRatio: 0.018, jitter: 0.02 },
-    13_000,
+  controller.observe(
+    {
+      connectionState: "connected",
+      packetLossRatio: 0,
+      availableBandwidthBps: 25_000_000,
+    },
+    5_000,
+  );
+  controller.observe(
+    {
+      connectionState: "connected",
+      packetLossRatio: 0.018,
+      jitter: 0.02,
+      availableBandwidthBps: 25_000_000,
+    },
+    24_000,
+  );
+  let decision = controller.observe(
+    {
+      connectionState: "connected",
+      packetLossRatio: 0,
+      availableBandwidthBps: 25_000_000,
+    },
+    25_000,
   );
   assert.equal(decision.changed, false);
 
-  for (let index = 0; index < 2; index += 1) {
-    decision = controller.observe(
-      { connectionState: "connected", packetLossRatio: 0, jitter: 0.01 },
-      14_000 + index * 1_000,
-    );
-  }
+  decision = controller.observe(
+    {
+      connectionState: "connected",
+      packetLossRatio: 0,
+      availableBandwidthBps: 25_000_000,
+    },
+    45_000,
+  );
   assert.equal(decision.direction, "up");
-  assert.equal(controller.requestedHeight, undefined);
 });
 
-test("degrades when the receiver cannot decode frames in real time", async () => {
+test("severe receiver decode pressure degrades immediately and is classified", async () => {
   const { AdaptivePlaybackController } = await loadModule();
   const controller = new AdaptivePlaybackController();
   controller.configure(2160);
 
-  let decision;
-  for (let index = 0; index < 3; index += 1) {
-    decision = controller.observe(
-      {
-        connectionState: "connected",
-        packetLossRatio: 0,
-        jitter: 0.005,
-        framesDroppedRatio: 0.22,
-        averageDecodeTime: 0.03,
-        frameRate: 30,
-      },
-      20_000 + index * 1_000,
-    );
-  }
+  const decision = controller.observe(
+    {
+      connectionState: "connected",
+      packetLossRatio: 0,
+      jitter: 0.005,
+      framesDroppedRatio: 0.22,
+      averageDecodeTime: 0.03,
+      frameRate: 30,
+    },
+    20_000,
+  );
 
   assert.equal(decision.changed, true);
   assert.equal(decision.direction, "down");
-  assert.equal(decision.requestedHeight, 1440);
+  assert.equal(decision.requestedHeight, 1080);
+  assert.equal(decision.pressure, "decoder-limited");
   assert.match(decision.reason, /解码压力/);
 });

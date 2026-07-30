@@ -259,7 +259,7 @@ test("public signal diagnostics never print TURN credentials", () => {
   assert.match(concurrencySmoke, /Promise\.all\(/);
 });
 
-test("v3 deployment has an atomic rollback and bounded low-memory service", () => {
+test("v3 deployment has an atomic rollback and a bounded relay-capable service", () => {
   const deploy = source("deployment/deploy-signal-v3.sh");
   const service = source("deployment/synced-signal.service");
   assert.match(deploy, /node --check "\$source_bundle"/);
@@ -276,9 +276,10 @@ test("v3 deployment has an atomic rollback and bounded low-memory service", () =
   assert.doesNotMatch(deploy, /install -d .*"\$install_root"/u);
   assert.match(deploy, /wait_for_health "health"/);
   assert.match(deploy, /rolling back/);
-  assert.match(service, /NODE_OPTIONS=--max-old-space-size=160/);
-  assert.match(service, /^MemoryHigh=192M$/m);
-  assert.match(service, /^MemoryMax=256M$/m);
+  assert.match(service, /NODE_OPTIONS=--max-old-space-size=384/);
+  assert.match(service, /^MemoryHigh=448M$/m);
+  assert.match(service, /^MemoryMax=512M$/m);
+  assert.match(service, /^StateDirectory=synced\/segment-relay$/m);
 });
 
 test("TURN migration removes bandwidth ceilings and rolls back", () => {

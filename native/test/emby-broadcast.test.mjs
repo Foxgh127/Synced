@@ -641,6 +641,7 @@ test("an initial stream error retries once after teardown and preserves playback
     quality: "1080p-12",
     allowHevc: false,
     forceVideoTranscode: true,
+    title: "Initial error",
   });
 
   const fallbackPlan = {
@@ -1062,7 +1063,7 @@ test("stop and seek teardown cannot wait forever on stalled Electron IPC", async
     harness.diagnostics
       .filter(({ event }) => event === "emby-ipc-operation-failed")
       .map(({ detail }) => detail.operation),
-    ["flow-control-settle", "flow-control-reset", "pipeline-stop"],
+    ["pipeline-stop"],
   );
   assert.ok(
     harness.diagnostics
@@ -1221,8 +1222,8 @@ test("viewer handshake separates control traffic and synchronizes initial play",
   assert.ok(control);
   assert.deepEqual(
     media.options,
-    { ordered: false },
-    "movie media is reliable but unordered so packet loss cannot create an MSE time hole",
+    { ordered: false, maxRetransmits: 1 },
+    "legacy movie media is partially reliable and repaired by bounded application NACKs",
   );
   assert.deepEqual(control.options, { ordered: true });
 

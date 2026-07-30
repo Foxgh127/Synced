@@ -1,3 +1,5 @@
+import { detectVideoEnhancementCapabilities } from "./video-enhancement";
+
 export const EMBY_DATA_CHANNEL_LABEL = "synced-emby-v1";
 export const EMBY_CONTROL_CHANNEL_LABEL = "synced-emby-control-v1";
 export const EMBY_PROTOCOL_VERSION = 1;
@@ -8,14 +10,19 @@ export const EMBY_BUFFER_HIGH_WATER = 2 * 1024 * 1024;
 export const EMBY_BUFFER_LOW_WATER = 512 * 1024;
 export const EMBY_INITIAL_MEDIA_BYTES_PER_MS = 2_500_000 / 8 / 1_000;
 
-const MAGIC = new Uint8Array([0x59, 0x4b, 0x4d, 0x31]); // YKM1
-const HEADER_PREFIX_BYTES = 6;
+const LEGACY_MAGIC = new Uint8Array([0x59, 0x4b, 0x4d, 0x31]); // YKM1
+const MAGIC = new Uint8Array([0x59, 0x4b, 0x4d, 0x32]); // YKM2
+const LEGACY_HEADER_PREFIX_BYTES = 6;
+const FIXED_HEADER_BYTES = 64;
+const BINARY_FRAMING_VERSION = 2;
 const MAX_FRAGMENT_BYTES = 96 * 1024 * 1024;
 const MAX_HEADER_BYTES = 8 * 1024;
 const MAX_PENDING_ASSEMBLY_BYTES = 128 * 1024 * 1024;
+const MAX_RELIABLE_REPAIR_REQUESTS = 1;
+const RELIABLE_REPAIR_LIFETIME_MS = 2_500;
 // A reliable unordered SCTP stream can deliver the first chunk of many later
 // fragments while one retransmitted chunk is still in flight. Sixteen
-// assemblies represented only about 12 seconds for our 750 ms fMP4 cadence
+// assemblies represent about 32 seconds for the GOP-aligned 2 s CMAF cadence
 // and caused the receiver itself to evict otherwise reliable media on mobile
 // TURN routes. Keep a much wider, still byte-bounded reorder window.
 const MAX_PENDING_ASSEMBLIES = 96;
@@ -78,6 +85,13 @@ export interface EmbyTimelinePoint {
   timelineTimeMs: number;
   timestampOffsetMs: number;
   discontinuity: boolean;
+}
+
+export interface EmbySegmentSessionDescriptor {
+  protocol: "synced-cmaf-v1";
+  assetId: string;
+  mediaVersion: number;
+  manifestPath: string;
 }
 
 /**
@@ -203,6 +217,7 @@ export type EmbyControlMessage =
       mimeType: string;
       plan: EmbyStreamPlan;
       title: string;
+      segmentRelay?: EmbySegmentSessionDescriptor;
     }
   | {
       type: "playback-state";
@@ -232,11 +247,13 @@ export type EmbyControlMessage =
   | {
       type: "sync-ping";
       clientTimeMs: number;
+      clientMonotonicMs?: number;
     }
   | {
       type: "sync-pong";
       clientTimeMs: number;
       hostTimeMs: number;
+      clientMonotonicMs?: number;
     }
   | {
       type: "buffer-state";
@@ -357,11 +374,13 @@ function validateHeader(value: unknown): EmbyChunkHeader {
     input.protocol !== EMBY_PROTOCOL_VERSION ||
     !Number.isSafeInteger(header.mediaVersion) ||
     header.mediaVersion < 1 ||
+    header.mediaVersion > 0xffffffff ||
     !Number.isSafeInteger(header.transportEpoch) ||
     header.transportEpoch < 0 ||
     header.transportEpoch > 1_000_000_000 ||
     !Number.isSafeInteger(header.fragmentSeq) ||
     header.fragmentSeq < 0 ||
+    header.fragmentSeq > 0xffffffff ||
     !Number.isSafeInteger(header.chunkIndex) ||
     header.chunkIndex < 0 ||
     !Number.isSafeInteger(header.chunkCount) ||
@@ -417,17 +436,52 @@ export function encodeEmbyChunk(
   if (payload.byteLength !== validated.chunkLength) {
     throw new Error("媒体分片块长度不匹配");
   }
-  const headerBytes = new TextEncoder().encode(JSON.stringify(validated));
-  if (headerBytes.length > MAX_HEADER_BYTES) {
+  const encoder = new TextEncoder();
+  const roomBytes = encoder.encode(validated.roomId);
+  const sessionBytes = encoder.encode(validated.sessionId);
+  const headerLength =
+    FIXED_HEADER_BYTES + roomBytes.byteLength + sessionBytes.byteLength;
+  if (
+    roomBytes.byteLength > 255 ||
+    sessionBytes.byteLength > 255 ||
+    headerLength > MAX_HEADER_BYTES
+  ) {
     throw new Error("媒体分片头过大");
   }
-  const result = new Uint8Array(
-    HEADER_PREFIX_BYTES + headerBytes.length + payload.length,
-  );
+  const result = new Uint8Array(headerLength + payload.length);
   result.set(MAGIC, 0);
-  new DataView(result.buffer).setUint16(4, headerBytes.length, false);
-  result.set(headerBytes, HEADER_PREFIX_BYTES);
-  result.set(payload, HEADER_PREFIX_BYTES + headerBytes.length);
+  const view = new DataView(result.buffer);
+  view.setUint8(4, BINARY_FRAMING_VERSION);
+  view.setUint8(
+    5,
+    (validated.keyframe ? 0x01 : 0) |
+      (validated.timelineTimeMs !== undefined ? 0x02 : 0),
+  );
+  view.setUint8(6, validated.trackType === "subtitle" ? 1 : 0);
+  view.setUint8(7, roomBytes.byteLength);
+  view.setUint8(8, sessionBytes.byteLength);
+  view.setUint8(9, 0);
+  view.setUint16(10, headerLength, false);
+  view.setUint32(12, validated.mediaVersion, false);
+  view.setUint32(16, validated.transportEpoch, false);
+  view.setUint32(20, validated.fragmentSeq, false);
+  view.setUint16(24, validated.chunkIndex, false);
+  view.setUint16(26, validated.chunkCount, false);
+  view.setFloat64(28, validated.timestampMs, false);
+  view.setFloat64(36, validated.mediaTimeMs, false);
+  view.setFloat64(
+    44,
+    validated.timelineTimeMs === undefined
+      ? Number.NaN
+      : validated.timelineTimeMs,
+    false,
+  );
+  view.setUint32(52, validated.dataLength, false);
+  view.setUint32(56, validated.chunkLength, false);
+  view.setUint32(60, validated.checksum, false);
+  result.set(roomBytes, FIXED_HEADER_BYTES);
+  result.set(sessionBytes, FIXED_HEADER_BYTES + roomBytes.byteLength);
+  result.set(payload, headerLength);
   return result.buffer;
 }
 
@@ -436,12 +490,69 @@ export function decodeEmbyChunk(input: ArrayBuffer | Uint8Array): DecodedEmbyChu
     input instanceof Uint8Array
       ? input
       : new Uint8Array(input);
-  if (
-    bytes.length < HEADER_PREFIX_BYTES ||
-    !MAGIC.every((value, index) => bytes[index] === value)
-  ) {
+  const binary =
+    bytes.length >= FIXED_HEADER_BYTES &&
+    MAGIC.every((value, index) => bytes[index] === value);
+  const legacy =
+    bytes.length >= LEGACY_HEADER_PREFIX_BYTES &&
+    LEGACY_MAGIC.every((value, index) => bytes[index] === value);
+  if (!binary && !legacy) {
     throw new Error("不是同频 Emby 媒体分片");
   }
+  if (legacy) return decodeLegacyEmbyChunk(bytes);
+  const view = new DataView(
+    bytes.buffer,
+    bytes.byteOffset,
+    bytes.byteLength,
+  );
+  if (view.getUint8(4) !== BINARY_FRAMING_VERSION) {
+    throw new Error("媒体分片二进制头版本不受支持");
+  }
+  const flags = view.getUint8(5);
+  const track = view.getUint8(6);
+  const roomLength = view.getUint8(7);
+  const sessionLength = view.getUint8(8);
+  const headerLength = view.getUint16(10, false);
+  if (
+    track > 1 ||
+    headerLength !== FIXED_HEADER_BYTES + roomLength + sessionLength ||
+    headerLength > MAX_HEADER_BYTES ||
+    headerLength > bytes.byteLength
+  ) {
+    throw new Error("媒体分片二进制头长度无效");
+  }
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  const roomStart = FIXED_HEADER_BYTES;
+  const sessionStart = roomStart + roomLength;
+  const timeline = view.getFloat64(44, false);
+  const header = validateHeader({
+    protocol: EMBY_PROTOCOL_VERSION,
+    roomId: decoder.decode(bytes.subarray(roomStart, sessionStart)),
+    sessionId: decoder.decode(
+      bytes.subarray(sessionStart, sessionStart + sessionLength),
+    ),
+    mediaVersion: view.getUint32(12, false),
+    transportEpoch: view.getUint32(16, false),
+    fragmentSeq: view.getUint32(20, false),
+    chunkIndex: view.getUint16(24, false),
+    chunkCount: view.getUint16(26, false),
+    timestampMs: view.getFloat64(28, false),
+    mediaTimeMs: view.getFloat64(36, false),
+    timelineTimeMs: flags & 0x02 ? timeline : undefined,
+    trackType: track === 1 ? "subtitle" : "muxed",
+    keyframe: Boolean(flags & 0x01),
+    dataLength: view.getUint32(52, false),
+    chunkLength: view.getUint32(56, false),
+    checksum: view.getUint32(60, false),
+  });
+  const data = bytes.subarray(headerLength);
+  if (data.byteLength !== header.chunkLength) {
+    throw new Error("媒体分片负载长度不匹配");
+  }
+  return { header, data };
+}
+
+function decodeLegacyEmbyChunk(bytes: Uint8Array): DecodedEmbyChunk {
   const headerLength = new DataView(
     bytes.buffer,
     bytes.byteOffset,
@@ -450,7 +561,7 @@ export function decodeEmbyChunk(input: ArrayBuffer | Uint8Array): DecodedEmbyChu
   if (
     headerLength < 2 ||
     headerLength > MAX_HEADER_BYTES ||
-    HEADER_PREFIX_BYTES + headerLength > bytes.length
+    LEGACY_HEADER_PREFIX_BYTES + headerLength > bytes.length
   ) {
     throw new Error("媒体分片头长度无效");
   }
@@ -458,13 +569,13 @@ export function decodeEmbyChunk(input: ArrayBuffer | Uint8Array): DecodedEmbyChu
     JSON.parse(
       new TextDecoder().decode(
         bytes.subarray(
-          HEADER_PREFIX_BYTES,
-          HEADER_PREFIX_BYTES + headerLength,
+          LEGACY_HEADER_PREFIX_BYTES,
+          LEGACY_HEADER_PREFIX_BYTES + headerLength,
         ),
       ),
     ),
   );
-  const data = bytes.slice(HEADER_PREFIX_BYTES + headerLength);
+  const data = bytes.subarray(LEGACY_HEADER_PREFIX_BYTES + headerLength);
   if (data.byteLength !== header.chunkLength) {
     throw new Error("媒体分片负载长度不匹配");
   }
@@ -661,15 +772,57 @@ interface QueuedPacket {
   mediaTimeMs?: number;
   trackType?: EmbyTrackType;
   priority: boolean;
+  packetKey?: string;
+  fragmentKey?: string;
+  cancelled?: boolean;
 }
 
+interface QueuedFragment {
+  items: QueuedPacket[];
+  activeItems: number;
+  mediaTimeMs?: number;
+  mediaBytes: number;
+}
+
+const COALESCED_CONTROL_TYPES = new Set<EmbyControlMessage["type"]>([
+  "playback-state",
+  "buffer-state",
+  "sync-ping",
+  "sync-pong",
+  "catch-up",
+  "resync",
+]);
+const MAX_QUEUED_CONTROL_BYTES = 1024 * 1024;
+
 export class EmbyPeerSender {
-  private queue: QueuedPacket[] = [];
-  private controlQueue: string[] = [];
+  private priorityQueue: QueuedPacket[] = [];
+  private priorityHead = 0;
+  private normalQueue: QueuedPacket[] = [];
+  private normalHead = 0;
+  private queuedMessages = 0;
   private queuedBytes = 0;
+  private queuedMediaBytes = 0;
+  private readonly packetKeys = new Set<string>();
+  private readonly queuedFragments = new Map<string, QueuedFragment>();
+  private fragmentOrder: string[] = [];
+  private fragmentOrderHead = 0;
+  private readonly mediaTimeCounts = new Map<number, number>();
+  private minimumMediaTimeMs?: number;
+  private maximumMediaTimeMs?: number;
+  private controlEssentialQueue: string[] = [];
+  private controlEssentialHead = 0;
+  private controlTypeOrder: EmbyControlMessage["type"][] = [];
+  private controlTypeHead = 0;
+  private readonly latestControlByType = new Map<
+    EmbyControlMessage["type"],
+    string
+  >();
+  private queuedControlBytes = 0;
   private droppedFragments = 0;
   private pumping = false;
   private closed = false;
+  private mediaClosed = false;
+  private controlClosed = false;
   private estimatedMediaBytesPerMs = EMBY_INITIAL_MEDIA_BYTES_PER_MS;
   private previousMediaSample?: {
     mediaVersion: number;
@@ -680,12 +833,19 @@ export class EmbyPeerSender {
   private readonly onOpen = () => this.pump();
   private readonly onControlOpen = () => this.pumpControls();
   private readonly onControlClose = () => {
-    if (this.controlChannel === this.channel) return;
-    this.closed = true;
-    this.queue = [];
-    this.controlQueue = [];
-    this.queuedBytes = 0;
-    if (this.channel.readyState !== "closed") this.channel.close();
+    this.controlClosed = true;
+    this.clearControlQueue();
+    if (this.controlChannel === this.channel) {
+      this.markMediaClosed();
+    }
+    this.publishStats();
+  };
+  private readonly onMediaClose = () => {
+    this.markMediaClosed();
+    if (this.controlChannel === this.channel) {
+      this.controlClosed = true;
+      this.clearControlQueue();
+    }
     this.publishStats();
   };
   private readonly onMessage = (event: MessageEvent) => {
@@ -726,25 +886,13 @@ export class EmbyPeerSender {
     controlChannel.addEventListener("open", this.onControlOpen);
     controlChannel.addEventListener("message", this.onMessage);
     controlChannel.addEventListener("close", this.onControlClose);
-    channel.addEventListener("close", () => {
-      this.closed = true;
-      this.queue = [];
-      this.controlQueue = [];
-      this.queuedBytes = 0;
-      if (
-        this.controlChannel !== this.channel &&
-        this.controlChannel.readyState !== "closed"
-      ) {
-        this.controlChannel.close();
-      }
-      this.publishStats();
-    });
+    channel.addEventListener("close", this.onMediaClose);
   }
 
   sendControl(message: EmbyControlMessage, priority = true): void {
     const packet = JSON.stringify(message);
     if (this.controlChannel !== this.channel && priority) {
-      if (this.closed) return;
+      if (this.closed || this.controlClosed) return;
       if (this.controlChannel.readyState === "open") {
         try {
           this.controlChannel.send(packet);
@@ -754,8 +902,7 @@ export class EmbyPeerSender {
           return;
         }
       }
-      if (this.controlQueue.length >= 128) this.controlQueue.shift();
-      this.controlQueue.push(packet);
+      this.enqueueControl(message.type, packet);
       return;
     }
     this.enqueuePacket({
@@ -773,6 +920,7 @@ export class EmbyPeerSender {
       transportEpoch?: number;
     } = {},
   ): void {
+    if (this.closed || this.mediaClosed) return;
     const onlyChunks = options.onlyChunks
       ? new Set(options.onlyChunks)
       : undefined;
@@ -818,39 +966,34 @@ export class EmbyPeerSender {
   }
 
   cancelVersionsExcept(mediaVersion: number): void {
-    this.queue = this.queue.filter(
-      (item) =>
-        item.mediaVersion === undefined || item.mediaVersion === mediaVersion,
-    );
-    this.queuedBytes = this.queue.reduce((sum, item) => sum + item.bytes, 0);
+    this.forEachQueuedPacket((item) => {
+      if (
+        item.mediaVersion !== undefined &&
+        item.mediaVersion !== mediaVersion
+      ) {
+        this.deactivatePacket(item);
+      }
+    });
+    this.compactPacketQueues();
     this.publishStats();
   }
 
   clearMediaQueue(): void {
-    this.queue = this.queue.filter(
-      (item) => item.mediaVersion === undefined,
-    );
-    this.queuedBytes = this.queue.reduce((sum, item) => sum + item.bytes, 0);
+    this.forEachQueuedPacket((item) => {
+      if (item.mediaVersion !== undefined) this.deactivatePacket(item);
+    });
+    this.compactPacketQueues();
     this.publishStats();
   }
 
   get stats(): EmbySenderStats {
-    const mediaItems = this.queue.filter(
-      (item) =>
-        item.trackType === "muxed" &&
-        item.fragmentSeq !== 0 &&
-        Number.isFinite(item.mediaTimeMs),
-    );
-    const mediaTimes = mediaItems.map((item) => item.mediaTimeMs!);
-    const queuedMediaBytes = mediaItems.reduce(
-      (sum, item) => sum + item.bytes,
-      0,
-    );
     const queuedDurationByBytes =
-      queuedMediaBytes / this.estimatedMediaBytesPerMs;
+      this.queuedMediaBytes / this.estimatedMediaBytesPerMs;
     const queuedDurationByTimeline =
-      mediaTimes.length > 1
-        ? Math.max(...mediaTimes) - Math.min(...mediaTimes)
+      this.mediaTimeCounts.size > 1 &&
+      this.minimumMediaTimeMs !== undefined &&
+      this.maximumMediaTimeMs !== undefined
+        ? this.maximumMediaTimeMs - this.minimumMediaTimeMs
         : 0;
     const queuedDurationMs = Math.max(
       queuedDurationByBytes,
@@ -860,8 +1003,8 @@ export class EmbyPeerSender {
       this.channel.bufferedAmount / this.estimatedMediaBytesPerMs;
     return {
       queuedBytes: this.queuedBytes,
-      bufferedBytes: this.channel.bufferedAmount,
-      queuedMessages: this.queue.length,
+      bufferedBytes: this.mediaClosed ? 0 : this.channel.bufferedAmount,
+      queuedMessages: this.queuedMessages,
       droppedFragments: this.droppedFragments,
       queuedDurationMs,
       bufferedDurationMs,
@@ -934,29 +1077,55 @@ export class EmbyPeerSender {
   }
 
   private enqueuePacket(item: QueuedPacket): void {
-    if (this.closed) return;
+    if (this.closed || this.mediaClosed) return;
     if (
       item.fragmentSeq !== undefined &&
       item.chunkIndex !== undefined &&
-      this.queue.some(
-        (queued) =>
-          queued.mediaVersion === item.mediaVersion &&
-          queued.transportEpoch === item.transportEpoch &&
-          queued.fragmentSeq === item.fragmentSeq &&
-          queued.chunkIndex === item.chunkIndex &&
-          queued.trackType === item.trackType,
-      )
+      item.mediaVersion !== undefined
     ) {
-      return;
+      item.packetKey =
+        `${item.mediaVersion}:${item.transportEpoch ?? 0}:` +
+        `${item.trackType ?? "muxed"}:${item.fragmentSeq}:${item.chunkIndex}`;
+      if (this.packetKeys.has(item.packetKey)) return;
+      this.packetKeys.add(item.packetKey);
+      if (item.fragmentSeq > 0) {
+        item.fragmentKey =
+          `${item.mediaVersion}:${item.transportEpoch ?? 0}:` +
+          `${item.trackType ?? "muxed"}:${item.fragmentSeq}`;
+      }
     }
     if (item.priority) {
-      const firstNormal = this.queue.findIndex((entry) => !entry.priority);
-      if (firstNormal < 0) this.queue.push(item);
-      else this.queue.splice(firstNormal, 0, item);
+      this.priorityQueue.push(item);
     } else {
-      this.queue.push(item);
+      this.normalQueue.push(item);
     }
+    this.queuedMessages += 1;
     this.queuedBytes += item.bytes;
+    const isTimedMedia =
+      item.trackType === "muxed" &&
+      item.fragmentSeq !== undefined &&
+      item.fragmentSeq > 0 &&
+      Number.isFinite(item.mediaTimeMs);
+    if (isTimedMedia) this.queuedMediaBytes += item.bytes;
+    if (item.fragmentKey) {
+      let fragment = this.queuedFragments.get(item.fragmentKey);
+      if (!fragment) {
+        fragment = {
+          items: [],
+          activeItems: 0,
+          mediaTimeMs: isTimedMedia ? item.mediaTimeMs : undefined,
+          mediaBytes: 0,
+        };
+        this.queuedFragments.set(item.fragmentKey, fragment);
+        this.fragmentOrder.push(item.fragmentKey);
+        if (fragment.mediaTimeMs !== undefined) {
+          this.addMediaTime(fragment.mediaTimeMs);
+        }
+      }
+      fragment.items.push(item);
+      fragment.activeItems += 1;
+      if (isTimedMedia) fragment.mediaBytes += item.bytes;
+    }
     this.dropSlowBacklog();
     this.publishStats();
     this.pump();
@@ -969,63 +1138,32 @@ export class EmbyPeerSender {
     // for a 4K original, causing its startup/seek burst to be discarded.
     const maxQueued = this.maxQueuedBytes;
     if (this.queuedBytes <= maxQueued) return;
-    const fragmentOrder: string[] = [];
-    for (const item of this.queue) {
-      if (
-        item.fragmentSeq !== undefined &&
-        item.fragmentSeq > 0 &&
-        item.mediaVersion !== undefined
-      ) {
-        const key =
-          `${item.mediaVersion}:${item.transportEpoch ?? 0}:` +
-          `${item.trackType ?? "muxed"}:${item.fragmentSeq}`;
-        if (!fragmentOrder.includes(key)) fragmentOrder.push(key);
-      }
-    }
     const lowWater = Math.max(
       8 * 1024 * 1024,
       Math.floor(maxQueued * 0.65),
     );
-    while (this.queuedBytes > lowWater && fragmentOrder.length) {
-      const fragmentKey = fragmentOrder.shift();
-      const before = this.queue.length;
-      this.queue = this.queue.filter((item) => {
-        if (
-          item.fragmentSeq === undefined ||
-          item.mediaVersion === undefined
-        ) {
-          return true;
-        }
-        const key =
-          `${item.mediaVersion}:${item.transportEpoch ?? 0}:` +
-          `${item.trackType ?? "muxed"}:${item.fragmentSeq}`;
-        return key !== fragmentKey;
-      });
-      if (this.queue.length !== before) this.droppedFragments += 1;
-      this.queuedBytes = this.queue.reduce((sum, item) => sum + item.bytes, 0);
+    while (this.queuedBytes > lowWater) {
+      const fragmentKey = this.nextQueuedFragmentKey();
+      if (!fragmentKey) break;
+      if (this.cancelFragment(fragmentKey)) {
+        this.droppedFragments += 1;
+      }
     }
     if (this.queuedBytes > maxQueued) {
       // Only init/control packets can remain here. A legitimate init segment
       // is tiny; exceeding the hard ceiling indicates a broken or abusive
       // peer repair loop. Drop this peer rather than risking renderer OOM.
-      this.closed = true;
-      this.queue = [];
-      this.controlQueue = [];
-      this.queuedBytes = 0;
+      this.markMediaClosed();
       if (this.channel.readyState !== "closed") this.channel.close();
-      if (
-        this.controlChannel !== this.channel &&
-        this.controlChannel.readyState !== "closed"
-      ) {
-        this.controlChannel.close();
-      }
     }
+    this.compactPacketQueues();
   }
 
   private pump(): void {
     if (
       this.pumping ||
       this.closed ||
+      this.mediaClosed ||
       this.channel.readyState !== "open"
     ) {
       return;
@@ -1033,22 +1171,23 @@ export class EmbyPeerSender {
     this.pumping = true;
     try {
       while (
-        this.queue.length &&
+        this.queuedMessages &&
         this.channel.bufferedAmount < this.bufferHighWaterBytes
       ) {
-        const item = this.queue.shift()!;
-        this.queuedBytes -= item.bytes;
+        const item = this.takeNextPacket();
+        if (!item) break;
         try {
           (
             this.channel.send as (packet: string | ArrayBuffer) => void
           )(item.packet);
         } catch {
-          this.closed = true;
+          this.markMediaClosed();
           break;
         }
       }
     } finally {
       this.pumping = false;
+      this.compactPacketQueues();
       this.publishStats();
     }
   }
@@ -1056,13 +1195,16 @@ export class EmbyPeerSender {
   private pumpControls(): void {
     if (
       this.closed ||
+      this.controlClosed ||
       this.controlChannel.readyState !== "open"
     ) {
       return;
     }
-    while (this.controlQueue.length) {
+    while (this.hasQueuedControls()) {
+      const packet = this.takeNextControl();
+      if (!packet) break;
       try {
-        this.controlChannel.send(this.controlQueue.shift()!);
+        this.controlChannel.send(packet);
       } catch {
         this.onControlClose();
         return;
@@ -1082,9 +1224,10 @@ export class EmbyPeerSender {
     this.controlChannel.removeEventListener("open", this.onControlOpen);
     this.controlChannel.removeEventListener("message", this.onMessage);
     this.controlChannel.removeEventListener("close", this.onControlClose);
-    this.queue = [];
-    this.controlQueue = [];
-    this.queuedBytes = 0;
+    this.channel.removeEventListener("close", this.onMediaClose);
+    this.markMediaClosed();
+    this.controlClosed = true;
+    this.clearControlQueue();
     if (this.channel.readyState !== "closed") this.channel.close();
     if (
       this.controlChannel !== this.channel &&
@@ -1093,11 +1236,285 @@ export class EmbyPeerSender {
       this.controlChannel.close();
     }
   }
+
+  private enqueueControl(
+    type: EmbyControlMessage["type"],
+    packet: string,
+  ): void {
+    const bytes = new TextEncoder().encode(packet).byteLength;
+    if (COALESCED_CONTROL_TYPES.has(type)) {
+      const previous = this.latestControlByType.get(type);
+      if (previous === undefined) this.controlTypeOrder.push(type);
+      else {
+        this.queuedControlBytes -=
+          new TextEncoder().encode(previous).byteLength;
+      }
+      this.latestControlByType.set(type, packet);
+      this.queuedControlBytes += bytes;
+    } else {
+      this.controlEssentialQueue.push(packet);
+      this.queuedControlBytes += bytes;
+    }
+    if (this.queuedControlBytes > MAX_QUEUED_CONTROL_BYTES) {
+      this.controlClosed = true;
+      this.clearControlQueue();
+      if (this.controlChannel.readyState !== "closed") {
+        this.controlChannel.close();
+      }
+    }
+  }
+
+  private hasQueuedControls(): boolean {
+    return (
+      this.controlEssentialHead < this.controlEssentialQueue.length ||
+      this.controlTypeHead < this.controlTypeOrder.length
+    );
+  }
+
+  private takeNextControl(): string | undefined {
+    if (this.controlEssentialHead < this.controlEssentialQueue.length) {
+      const packet =
+        this.controlEssentialQueue[this.controlEssentialHead++];
+      this.queuedControlBytes = Math.max(
+        0,
+        this.queuedControlBytes -
+          new TextEncoder().encode(packet).byteLength,
+      );
+      this.compactControlQueues();
+      return packet;
+    }
+    while (this.controlTypeHead < this.controlTypeOrder.length) {
+      const type = this.controlTypeOrder[this.controlTypeHead++];
+      const packet = this.latestControlByType.get(type);
+      this.latestControlByType.delete(type);
+      if (!packet) continue;
+      this.queuedControlBytes = Math.max(
+        0,
+        this.queuedControlBytes -
+          new TextEncoder().encode(packet).byteLength,
+      );
+      this.compactControlQueues();
+      return packet;
+    }
+    this.compactControlQueues();
+    return undefined;
+  }
+
+  private clearControlQueue(): void {
+    this.controlEssentialQueue = [];
+    this.controlEssentialHead = 0;
+    this.controlTypeOrder = [];
+    this.controlTypeHead = 0;
+    this.latestControlByType.clear();
+    this.queuedControlBytes = 0;
+  }
+
+  private compactControlQueues(): void {
+    if (
+      this.controlEssentialHead > 256 &&
+      this.controlEssentialHead * 2 >= this.controlEssentialQueue.length
+    ) {
+      this.controlEssentialQueue = this.controlEssentialQueue.slice(
+        this.controlEssentialHead,
+      );
+      this.controlEssentialHead = 0;
+    }
+    if (
+      this.controlTypeHead > 64 &&
+      this.controlTypeHead * 2 >= this.controlTypeOrder.length
+    ) {
+      this.controlTypeOrder = this.controlTypeOrder.slice(
+        this.controlTypeHead,
+      );
+      this.controlTypeHead = 0;
+    }
+  }
+
+  private takeNextPacket(): QueuedPacket | undefined {
+    const take = (
+      queue: QueuedPacket[],
+      head: "priorityHead" | "normalHead",
+    ): QueuedPacket | undefined => {
+      while (this[head] < queue.length) {
+        const item = queue[this[head]++];
+        if (item.cancelled) continue;
+        this.deactivatePacket(item);
+        return item;
+      }
+      return undefined;
+    };
+    return (
+      take(this.priorityQueue, "priorityHead") ||
+      take(this.normalQueue, "normalHead")
+    );
+  }
+
+  private forEachQueuedPacket(
+    callback: (item: QueuedPacket) => void,
+  ): void {
+    for (
+      let index = this.priorityHead;
+      index < this.priorityQueue.length;
+      index += 1
+    ) {
+      const item = this.priorityQueue[index];
+      if (!item.cancelled) callback(item);
+    }
+    for (
+      let index = this.normalHead;
+      index < this.normalQueue.length;
+      index += 1
+    ) {
+      const item = this.normalQueue[index];
+      if (!item.cancelled) callback(item);
+    }
+  }
+
+  private deactivatePacket(item: QueuedPacket): void {
+    if (item.cancelled) return;
+    item.cancelled = true;
+    this.queuedMessages = Math.max(0, this.queuedMessages - 1);
+    this.queuedBytes = Math.max(0, this.queuedBytes - item.bytes);
+    if (item.packetKey) this.packetKeys.delete(item.packetKey);
+    const isTimedMedia =
+      item.trackType === "muxed" &&
+      item.fragmentSeq !== undefined &&
+      item.fragmentSeq > 0 &&
+      Number.isFinite(item.mediaTimeMs);
+    if (isTimedMedia) {
+      this.queuedMediaBytes = Math.max(
+        0,
+        this.queuedMediaBytes - item.bytes,
+      );
+    }
+    if (!item.fragmentKey) return;
+    const fragment = this.queuedFragments.get(item.fragmentKey);
+    if (!fragment) return;
+    fragment.activeItems = Math.max(0, fragment.activeItems - 1);
+    if (isTimedMedia) {
+      fragment.mediaBytes = Math.max(0, fragment.mediaBytes - item.bytes);
+    }
+    if (fragment.activeItems > 0) return;
+    this.queuedFragments.delete(item.fragmentKey);
+    if (fragment.mediaTimeMs !== undefined) {
+      this.removeMediaTime(fragment.mediaTimeMs);
+    }
+  }
+
+  private cancelFragment(fragmentKey: string): boolean {
+    const fragment = this.queuedFragments.get(fragmentKey);
+    if (!fragment) return false;
+    let removed = false;
+    for (const item of fragment.items) {
+      if (item.cancelled) continue;
+      removed = true;
+      this.deactivatePacket(item);
+    }
+    return removed;
+  }
+
+  private nextQueuedFragmentKey(): string | undefined {
+    while (this.fragmentOrderHead < this.fragmentOrder.length) {
+      const key = this.fragmentOrder[this.fragmentOrderHead++];
+      if (this.queuedFragments.has(key)) return key;
+    }
+    this.fragmentOrder = [];
+    this.fragmentOrderHead = 0;
+    return undefined;
+  }
+
+  private addMediaTime(mediaTimeMs: number): void {
+    this.mediaTimeCounts.set(
+      mediaTimeMs,
+      (this.mediaTimeCounts.get(mediaTimeMs) || 0) + 1,
+    );
+    this.minimumMediaTimeMs =
+      this.minimumMediaTimeMs === undefined
+        ? mediaTimeMs
+        : Math.min(this.minimumMediaTimeMs, mediaTimeMs);
+    this.maximumMediaTimeMs =
+      this.maximumMediaTimeMs === undefined
+        ? mediaTimeMs
+        : Math.max(this.maximumMediaTimeMs, mediaTimeMs);
+  }
+
+  private removeMediaTime(mediaTimeMs: number): void {
+    const count = this.mediaTimeCounts.get(mediaTimeMs) || 0;
+    if (count > 1) {
+      this.mediaTimeCounts.set(mediaTimeMs, count - 1);
+      return;
+    }
+    this.mediaTimeCounts.delete(mediaTimeMs);
+    if (!this.mediaTimeCounts.size) {
+      this.minimumMediaTimeMs = undefined;
+      this.maximumMediaTimeMs = undefined;
+      return;
+    }
+    if (
+      mediaTimeMs !== this.minimumMediaTimeMs &&
+      mediaTimeMs !== this.maximumMediaTimeMs
+    ) {
+      return;
+    }
+    let minimum = Number.POSITIVE_INFINITY;
+    let maximum = Number.NEGATIVE_INFINITY;
+    for (const time of this.mediaTimeCounts.keys()) {
+      minimum = Math.min(minimum, time);
+      maximum = Math.max(maximum, time);
+    }
+    this.minimumMediaTimeMs = minimum;
+    this.maximumMediaTimeMs = maximum;
+  }
+
+  private compactPacketQueues(): void {
+    if (
+      this.priorityHead > 1_024 &&
+      this.priorityHead * 2 >= this.priorityQueue.length
+    ) {
+      this.priorityQueue = this.priorityQueue.slice(this.priorityHead);
+      this.priorityHead = 0;
+    }
+    if (
+      this.normalHead > 1_024 &&
+      this.normalHead * 2 >= this.normalQueue.length
+    ) {
+      this.normalQueue = this.normalQueue.slice(this.normalHead);
+      this.normalHead = 0;
+    }
+    if (
+      this.fragmentOrderHead > 1_024 &&
+      this.fragmentOrderHead * 2 >= this.fragmentOrder.length
+    ) {
+      this.fragmentOrder = this.fragmentOrder.slice(this.fragmentOrderHead);
+      this.fragmentOrderHead = 0;
+    }
+  }
+
+  private markMediaClosed(): void {
+    if (this.mediaClosed) return;
+    this.mediaClosed = true;
+    this.forEachQueuedPacket((item) => this.deactivatePacket(item));
+    this.priorityQueue = [];
+    this.priorityHead = 0;
+    this.normalQueue = [];
+    this.normalHead = 0;
+    this.packetKeys.clear();
+    this.queuedFragments.clear();
+    this.fragmentOrder = [];
+    this.fragmentOrderHead = 0;
+    this.mediaTimeCounts.clear();
+    this.minimumMediaTimeMs = undefined;
+    this.maximumMediaTimeMs = undefined;
+    this.queuedMessages = 0;
+    this.queuedBytes = 0;
+    this.queuedMediaBytes = 0;
+  }
 }
 
 interface PendingAssembly {
   header: EmbyChunkHeader;
   chunks: Array<Uint8Array | undefined>;
+  receivedChunks: number;
   receivedBytes: number;
   timer?: number;
   lastRequestAt: number;
@@ -1205,9 +1622,10 @@ export class EmbyFragmentAssembler {
         chunks: new Array<Uint8Array | undefined>(
           header.chunkCount,
         ).fill(undefined),
+        receivedChunks: 0,
         receivedBytes: 0,
         lastRequestAt: 0,
-        createdAt: Date.now(),
+        createdAt: performance.now(),
         requests: 0,
       };
       this.pending.set(key, assembly);
@@ -1224,9 +1642,10 @@ export class EmbyFragmentAssembler {
     }
     if (!assembly.chunks[header.chunkIndex]) {
       assembly.chunks[header.chunkIndex] = data;
+      assembly.receivedChunks += 1;
       assembly.receivedBytes += data.byteLength;
     }
-    if (assembly.chunks.every(Boolean)) {
+    if (assembly.receivedChunks === assembly.chunks.length) {
       if (assembly.timer !== undefined) window.clearTimeout(assembly.timer);
       this.pending.delete(key);
       this.pendingDeclaredBytes = Math.max(
@@ -1279,8 +1698,11 @@ export class EmbyFragmentAssembler {
     assembly.timer = window.setTimeout(() => {
       assembly.timer = undefined;
       if (!this.pending.has(key)) return;
-      const now = Date.now();
-      if (now - assembly.createdAt > 10_000 || assembly.requests >= 6) {
+      const now = performance.now();
+      if (
+        now - assembly.createdAt > RELIABLE_REPAIR_LIFETIME_MS ||
+        assembly.requests >= MAX_RELIABLE_REPAIR_REQUESTS
+      ) {
         this.abandonAssembly(key, "repair-exhausted");
         return;
       }
@@ -1289,7 +1711,7 @@ export class EmbyFragmentAssembler {
         // toward the absolute retry budget so repeated re-arming cannot keep
         // a broken assembly alive indefinitely.
         assembly.requests += 1;
-        if (assembly.requests >= 6) {
+        if (assembly.requests >= MAX_RELIABLE_REPAIR_REQUESTS) {
           this.abandonAssembly(key, "repair-exhausted");
           return;
         }
@@ -1350,10 +1772,14 @@ export function detectEmbyMediaCapabilities(): {
   hevc: boolean;
   aac: boolean;
   desktop: boolean;
+  videoEnhancementBackends: Array<"webgl2-spatial">;
+  maxEnhancementPixels: number;
 } {
   const mediaSource = globalThis.MediaSource;
   const supports = (mime: string) =>
     Boolean(mediaSource?.isTypeSupported?.(mime));
+  const enhancement = detectVideoEnhancementCapabilities();
+  const desktop = Boolean(window.roomDesktop);
   return {
     mse: Boolean(mediaSource),
     h264: supports('video/mp4; codecs="avc1.42E01E, mp4a.40.2"'),
@@ -1361,6 +1787,8 @@ export function detectEmbyMediaCapabilities(): {
       supports('video/mp4; codecs="hvc1.1.6.L120.B0, mp4a.40.2"') ||
       supports('video/mp4; codecs="hev1.1.6.L120.B0, mp4a.40.2"'),
     aac: supports('audio/mp4; codecs="mp4a.40.2"'),
-    desktop: Boolean(window.roomDesktop),
+    desktop,
+    videoEnhancementBackends: desktop ? enhancement.backends : [],
+    maxEnhancementPixels: desktop ? enhancement.maxPixels : 0,
   };
 }

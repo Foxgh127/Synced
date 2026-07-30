@@ -477,6 +477,11 @@ test("issues scoped LiveKit access and refreshable TURN credentials", async () =
     assert.ok(hostJoined.sfu.expiresAt > Date.now() + 5 * 60_000);
     assert.ok(hostJoined.iceRefreshToken);
     assert.ok(hostJoined.iceExpiresAt > Date.now());
+    assert.equal(
+      hostJoined.segmentRelay.scope,
+      "read",
+      "broadcast-capable members must not receive upload authority before grant",
+    );
     const [header, payload, signature] = hostJoined.sfu.token.split(".");
     assert.equal(
       signature,
@@ -507,6 +512,7 @@ test("issues scoped LiveKit access and refreshable TURN credentials", async () =
     );
     assert.equal(viewerClaims.video.canPublish, false);
     assert.equal(viewerClaims.video.canPublishData, true);
+    assert.equal(viewerJoined.segmentRelay.scope, "read");
 
     const hostGranted = nextMessage(host, "broadcast:granted");
     const viewerSawBroadcast = nextMessage(viewer, "broadcast:started");
@@ -520,7 +526,8 @@ test("issues scoped LiveKit access and refreshable TURN credentials", async () =
         },
       }),
     );
-    await hostGranted;
+    const granted = await hostGranted;
+    assert.equal(granted.segmentRelay.scope, "publish");
     await viewerSawBroadcast;
     discardQueuedMessages(host, "network:advice");
 
@@ -1632,6 +1639,12 @@ test("lets any desktop member start and stop broadcasting in a channel", async (
         hevc: false,
         aac: true,
         desktop: true,
+        videoEnhancementBackends: [
+          "webgl2-spatial",
+          "invalid-backend",
+          "webgl2-spatial",
+        ],
+        maxEnhancementPixels: 8_294_400,
         password: "must-not-enter-participant-state",
       },
     }),
@@ -1649,6 +1662,8 @@ test("lets any desktop member start and stop broadcasting in a channel", async (
       hevc: false,
       aac: true,
       desktop: true,
+      videoEnhancementBackends: ["webgl2-spatial"],
+      maxEnhancementPixels: 8_294_400,
     },
   );
   assert.doesNotMatch(

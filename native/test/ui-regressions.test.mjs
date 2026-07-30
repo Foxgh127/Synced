@@ -1235,3 +1235,46 @@ test("WebRTC operations and stats polling cannot wedge the signaling queue", () 
   );
   assert.match(session, /desktopNetworkPollRunning/);
 });
+
+test("HTTPS CMAF viewer stats and liveness remain independent from the control peer", () => {
+  const session = fs.readFileSync(
+    new URL("../src/channel-session.ts", import.meta.url),
+    "utf8",
+  );
+  const statsStart = session.indexOf(
+    "async function updateEmbyInboundStats",
+  );
+  const statsEnd = session.indexOf(
+    "function updateSfuScreenLiveness",
+    statsStart,
+  );
+  const stats = session.slice(statsStart, statsEnd);
+  const abrBranch = stats.indexOf("if (abrDiagnostics?.active)");
+  const legacyPeer = stats.indexOf("const peer = watcherPc");
+
+  assert.ok(abrBranch >= 0);
+  assert.ok(
+    legacyPeer > abrBranch,
+    "the HTTPS stats branch must run before the legacy WebRTC peer guard",
+  );
+  assert.match(stats, /"HTTPS 独立 ABR"/);
+  assert.match(stats, /"emby-cmaf-viewer-sample"/);
+  assert.match(stats, /estimatedThroughputBps/);
+  assert.match(stats, /cacheHits/);
+  assert.match(stats, /rangeRetries/);
+
+  const livenessStart = session.indexOf(
+    "function monitorViewerMediaLiveness",
+  );
+  const livenessEnd = session.indexOf(
+    "function updateNativePlaybackActivity",
+    livenessStart,
+  );
+  const liveness = session.slice(livenessStart, livenessEnd);
+  assert.match(
+    liveness,
+    /mode === "emby" && Boolean\(embyAbrViewer\?\.diagnostics\.active\)/,
+  );
+  assert.match(liveness, /mediaTransport: independentHttpsMedia \? "https-cmaf"/);
+  assert.match(liveness, /!independentHttpsMedia &&[\s\S]*?shouldRestartIce/);
+});

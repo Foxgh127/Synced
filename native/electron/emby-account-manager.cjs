@@ -443,14 +443,41 @@ class EmbyAccountManager {
     }
   }
 
-  setFlowPaused(paused, expectedPipelineId) {
+  setFlowPaused(paused, expectedPipelineId, generation) {
     const id = this.streamingAccountId || this.activeAccountId;
     if (id) {
-      this.serviceFor(id).setFlowPaused(
+      return this.serviceFor(id).setFlowPaused(
         paused,
         cleanText(expectedPipelineId, 128) || undefined,
+        generation,
       );
     }
+    return {
+      pipelineId: cleanText(expectedPipelineId, 128),
+      generation: Math.max(0, Number(generation) || 0),
+      actualPaused: false,
+      applied: false,
+    };
+  }
+
+  getFlowState(expectedPipelineId) {
+    const id = this.streamingAccountId || this.activeAccountId;
+    if (!id) {
+      return {
+        pipelineId: cleanText(expectedPipelineId, 128),
+        actualPaused: false,
+        active: false,
+      };
+    }
+    return this.serviceFor(id).getFlowState(
+      cleanText(expectedPipelineId, 128) || undefined,
+    );
+  }
+
+  updateSegmentRelayAccess(input = {}) {
+    const id = this.streamingAccountId || this.activeAccountId;
+    if (!id) return { updated: false, pipelineId: "" };
+    return this.serviceFor(id).updateSegmentRelayAccess(input);
   }
 
   reportPlayback(input) {

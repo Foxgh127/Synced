@@ -1308,10 +1308,58 @@ dialog::backdrop {
 }
 
 .video-stage video {
+  position: relative;
+  z-index: 0;
   width: 100%;
   height: 100%;
   background: #020305;
   object-fit: contain;
+}
+
+.video-enhancement-canvas {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  transform: none;
+  transform-origin: center center;
+  transition: transform 220ms ease;
+}
+
+.video-enhancement-canvas[hidden] {
+  display: none;
+}
+
+.video-stage.video-enhancement-active > video {
+  opacity: 0;
+}
+
+.video-enhancement-canvas.highlight-correction {
+  filter: brightness(0.84) contrast(0.88) saturate(0.95);
+}
+
+.video-enhancement-subtitles {
+  position: absolute;
+  right: max(5%, env(safe-area-inset-right));
+  bottom: calc(var(--dock-h, 60px) + 42px + env(safe-area-inset-bottom));
+  left: max(5%, env(safe-area-inset-left));
+  z-index: 3;
+  pointer-events: none;
+  color: #fff;
+  font-size: clamp(18px, 2.25vw, 42px);
+  font-weight: 700;
+  line-height: 1.32;
+  text-align: center;
+  white-space: pre-line;
+  text-shadow:
+    0 2px 2px rgba(0, 0, 0, 0.96),
+    0 0 5px rgba(0, 0, 0, 0.92);
+}
+
+.video-enhancement-subtitles[hidden] {
+  display: none;
 }
 
 .channel-empty,
@@ -1430,6 +1478,15 @@ body.immersive-player .viewer-stage > video {
 body.immersive-player
   .viewer-stage[data-fullscreen-fit="smart"]
   > video {
+  transform: translateY(var(--smart-shift-y, 0px))
+    scale(var(--smart-scale, 1));
+}
+
+.viewer-stage:fullscreen[data-fullscreen-fit="smart"]
+  > .video-enhancement-canvas,
+body.immersive-player
+  .viewer-stage[data-fullscreen-fit="smart"]
+  > .video-enhancement-canvas {
   transform: translateY(var(--smart-shift-y, 0px))
     scale(var(--smart-scale, 1));
 }
@@ -2449,6 +2506,10 @@ body.immersive-player .viewer-stage .receiver-stream-badge {
   color: var(--muted);
   font-size: 10px;
   line-height: 1.5;
+}
+
+.video-enhancement-setting small[data-tone="active"] {
+  color: var(--ok);
 }
 
 .highlight-correction input {

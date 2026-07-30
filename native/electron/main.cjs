@@ -4,6 +4,7 @@ const {
   clipboard,
   desktopCapturer,
   ipcMain,
+  MessageChannelMain,
   powerSaveBlocker,
   protocol,
   safeStorage,
@@ -46,10 +47,64 @@ let miniWindowEnabled = false;
 let allowMainWindowMinimize = false;
 let preparingMainWindowMinimize = false;
 let embyAccounts;
+let embyStreamPort;
 let shutdownInProgress = false;
 let shutdownComplete = false;
 let gameView;
 let gameViewAttached = false;
+
+function closeEmbyStreamPort() {
+  try {
+    embyStreamPort?.close();
+  } catch {
+    // The renderer may already have closed its end during reload.
+  }
+  embyStreamPort = undefined;
+}
+
+function installEmbyStreamPort() {
+  if (
+    !MessageChannelMain ||
+    !mainWindow ||
+    mainWindow.isDestroyed() ||
+    mainWindow.webContents.isDestroyed()
+  ) {
+    return;
+  }
+  closeEmbyStreamPort();
+  const { port1, port2 } = new MessageChannelMain();
+  embyStreamPort = port1;
+  port1.on("close", () => {
+    if (embyStreamPort === port1) embyStreamPort = undefined;
+  });
+  port1.start();
+  mainWindow.webContents.postMessage("emby:stream-port", null, [port2]);
+}
+
+function sendEmbyStreamEvent(payload) {
+  if (embyStreamPort) {
+    try {
+      const data = payload?.data;
+      if (data && ArrayBuffer.isView(data)) {
+        // Fragment parser buffers may be pooled. Copy only the live view into
+        // an exactly sized payload so the full Node slab is never serialized.
+        const transferable = new Uint8Array(data.byteLength);
+        transferable.set(
+          new Uint8Array(data.buffer, data.byteOffset, data.byteLength),
+        );
+        embyStreamPort.postMessage({ ...payload, data: transferable });
+      } else {
+        embyStreamPort.postMessage(payload);
+      }
+      return;
+    } catch {
+      closeEmbyStreamPort();
+    }
+  }
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send("emby:stream-event", payload);
+  }
+}
 const GAME_URL = "https://bluff.synced.com.cn/";
 const GAME_ORIGIN = new URL(GAME_URL).origin;
 const KNOWN_MUSIC_PROCESS_NAMES = [
@@ -503,6 +558,7 @@ function createWindow() {
       app.exit(1);
     }
   });
+  mainWindow.webContents.on("did-finish-load", installEmbyStreamPort);
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
   mainWindow.on("move", updateOverlayBounds);
   mainWindow.on("focus", updateOverlayBounds);
@@ -581,6 +637,7 @@ function createWindow() {
       revealTimer = undefined;
     }
     destroyGameView();
+    closeEmbyStreamPort();
     mainWindow = undefined;
     miniWindowEnabled = false;
     allowMainWindowMinimize = false;
@@ -1505,10 +1562,9 @@ app.whenReady().then(() => {
     deviceId: persistentEmbyDeviceId(),
     packaged: app.isPackaged,
     resourcesPath: process.resourcesPath,
+    cacheDir: path.join(app.getPath("userData"), "emby-segment-cache"),
     sendEvent: (payload) => {
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send("emby:stream-event", payload);
-      }
+      sendEmbyStreamEvent(payload);
       diagnostic("emby-stream-event", {
         type: payload?.type,
         pipelineId: payload?.pipelineId,
@@ -1919,11 +1975,23 @@ app.whenReady().then(() => {
   });
   ipcMain.handle(
     "emby:set-flow-paused",
-    (event, paused, expectedPipelineId) => {
-    assertMainRenderer(event);
-      embyAccounts.setFlowPaused(paused === true, expectedPipelineId);
+    (event, command) => {
+      assertMainRenderer(event);
+      return embyAccounts.setFlowPaused(
+        command?.paused === true,
+        command?.pipelineId,
+        command?.generation,
+      );
     },
   );
+  ipcMain.handle("emby:get-flow-state", (event, expectedPipelineId) => {
+    assertMainRenderer(event);
+    return embyAccounts.getFlowState(expectedPipelineId);
+  });
+  ipcMain.handle("emby:update-segment-relay", (event, input) => {
+    assertMainRenderer(event);
+    return embyAccounts.updateSegmentRelayAccess(input);
+  });
   ipcMain.handle("emby:report-playback", (event, input) => {
     assertMainRenderer(event);
     return embyAccounts.reportPlayback(input);

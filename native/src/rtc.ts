@@ -27,6 +27,7 @@ export interface BroadcastCapabilities {
   height: number;
   frameRate: number;
   mode?: "screen" | "emby";
+  contentMode?: "detail" | "motion" | "balanced";
   mimeType?: string;
   videoCodec?: string;
   audioCodec?: string;
@@ -41,6 +42,15 @@ export interface EmbyReceiverCapabilities {
   hevc: boolean;
   aac: boolean;
   desktop: boolean;
+  videoEnhancementBackends?: Array<"webgl2-spatial" | "rtx-video">;
+  maxEnhancementPixels?: number;
+}
+
+export interface SegmentRelayAccess {
+  basePath: string;
+  token: string;
+  scope: "read" | "publish";
+  expiresAt: number;
 }
 
 export interface SignalEnvelope {
@@ -82,6 +92,7 @@ export interface SignalEnvelope {
   iceExpiresAt?: number;
   iceRefreshToken?: string;
   sfu?: SfuAccess;
+  segmentRelay?: SegmentRelayAccess;
   message?: string;
   messageId?: string;
   ownerToken?: string;

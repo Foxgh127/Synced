@@ -1,7 +1,10 @@
 import { App } from "@capacitor/app";
 import type { PluginListenerHandle } from "@capacitor/core";
 import QRCode from "qrcode";
-import { AdaptivePlaybackController } from "./adaptive-playback";
+import {
+  AdaptivePlaybackController,
+  type ScreenContentMode,
+} from "./adaptive-playback";
 import {
   captureWindowGeometryChanged,
   normalizeCaptureWindowGeometry,
@@ -36,6 +39,7 @@ import {
   EmbyBroadcastController,
 } from "./emby-broadcast";
 import { EmbyMsePlayer } from "./emby-player";
+import { EmbyAbrSegmentClient } from "./emby-segment-relay";
 import {
   composeEmbyEndpoint,
   endpointDefaultPort,
@@ -44,6 +48,11 @@ import {
   type EmbyEndpointProtocol,
 } from "./emby-endpoint";
 import { detectEmbyMediaCapabilities } from "./emby-transport";
+import {
+  VideoEnhancementController,
+  type VideoEnhancementPreference,
+  type VideoEnhancementState,
+} from "./video-enhancement";
 import {
   bindEmbeddedGameRail,
   embeddedGameRailButtonMarkup,
@@ -100,6 +109,7 @@ import {
   SfuSession,
   sanitizeSfuAccess,
   type SfuAccess,
+  type SfuScreenReceiverStats,
 } from "./sfu";
 import {
   calculateCenteredSmartCrop,
@@ -108,6 +118,7 @@ import {
   stableEmbeddedHorizontalBars,
   type EmbeddedHorizontalBars,
 } from "./video-presentation";
+import { SignalMessageScheduler } from "./signal-message-scheduler";
 import {
   SignalClient,
   applyReceiverPreference,
@@ -138,6 +149,7 @@ import {
   type InboundSnapshot,
   type OutboundSnapshot,
   type RoomParticipant,
+  type SegmentRelayAccess,
   type SignalEnvelope,
 } from "./rtc";
 
@@ -170,6 +182,10 @@ interface OutboundPeer {
   degradationPreference: RTCDegradationPreference;
   cpuLimitedSamples: number;
   cpuStableSamples: number;
+  statsFailureSamples: number;
+  statsConfidence: "high" | "reduced" | "missing";
+  fallbackBitrateCeiling?: number;
+  fallbackHeightCeiling?: number;
   iceRestartInFlight?: boolean;
 }
 
@@ -195,6 +211,11 @@ const RTC_NEGOTIATION_TIMEOUT_MS = 8_000;
 const RTC_CANDIDATE_TIMEOUT_MS = 2_000;
 const RTC_STATS_TIMEOUT_MS = 2_500;
 const RTC_TRACK_REPLACE_TIMEOUT_MS = 5_000;
+const MAX_SCREEN_P2P_FALLBACK_VIEWERS = 2;
+const SCREEN_P2P_FALLBACK_BUDGETS = Object.freeze([
+  { height: 1_080, bitrate: 8_000_000 },
+  { height: 720, bitrate: 4_000_000 },
+] as const);
 
 function queuePendingMediaCandidate(
   candidates: RTCIceCandidateInit[],
@@ -229,6 +250,30 @@ function queuePendingWatcherSignal(
 function normalizeEmbyFrameRate(value: unknown): EmbyFrameRate {
   const frameRate = Number(value);
   return frameRate === 24 || frameRate === 60 ? frameRate : 30;
+}
+
+function sanitizeSegmentRelayAccess(
+  value: SegmentRelayAccess | undefined,
+): SegmentRelayAccess | undefined {
+  if (
+    !value ||
+    typeof value.basePath !== "string" ||
+    !/^\/media\/v\d+(?:\/)?$/u.test(value.basePath) ||
+    typeof value.token !== "string" ||
+    value.token.length < 64 ||
+    value.token.length > 2_048 ||
+    !["read", "publish"].includes(value.scope) ||
+    !Number.isFinite(value.expiresAt) ||
+    value.expiresAt <= Date.now()
+  ) {
+    return undefined;
+  }
+  return {
+    basePath: value.basePath.replace(/\/+$/u, ""),
+    token: value.token,
+    scope: value.scope,
+    expiresAt: value.expiresAt,
+  };
 }
 
 function embyQualityForRequestedHeight(
@@ -340,7 +385,31 @@ export async function openChannelSession(
   let joined = false;
   let awaitingBroadcastGrant = false;
   let preparingBroadcast = false;
-  let signalMessageQueue: Promise<void> = Promise.resolve();
+  const signalMessageScheduler = new SignalMessageScheduler<SignalEnvelope>({
+    handle: (message, operationSignal) =>
+      handleMessage(message, operationSignal),
+    timeoutMs: (message) =>
+      message.type === "channel:joined"
+        ? 30_000
+        : message.type === "signal" ||
+            message.type === "media:ice-restart"
+          ? 12_000
+          : 20_000,
+    onError: (error, message) => {
+      window.roomDesktop?.reportDiagnostic("signal-handler-failed", {
+        type: message.type,
+        attempt: message.attempt,
+        sessionId: message.sessionId,
+        message: error instanceof Error ? error.message : String(error),
+        stack:
+          error instanceof Error
+            ? error.stack?.split("\n").slice(0, 5).join("\n")
+            : undefined,
+      });
+      setStatus("媒体协商失败", "error");
+      notify(error instanceof Error ? error.message : "媒体协商失败", true);
+    },
+  });
   let backButtonHandle: PluginListenerHandle | undefined;
   let networkChangeHandle: PluginListenerHandle | undefined;
   let fullscreenChangeHandler: (() => void) | undefined;
@@ -365,6 +434,9 @@ export async function openChannelSession(
   let signalFeatures = new Set<string>();
   let networkProbeVersions: ReadonlyArray<number> = [1];
   let sfuAccess: SfuAccess | undefined;
+  let segmentRelayAccess: SegmentRelayAccess | undefined;
+  let segmentRelayRefreshTimer: number | undefined;
+  let lastSegmentRelayRefreshRequestAt = 0;
   let sfuViewerActive = false;
   let sfuFailedBroadcastKey = "";
   let sfuWatchPromise: Promise<boolean> | undefined;
@@ -388,6 +460,8 @@ export async function openChannelSession(
     { height?: number; frameRate?: number }
   >();
   let watcherPc: RTCPeerConnection | undefined;
+  let retainedWatcherPc: RTCPeerConnection | undefined;
+  let sfuStabilityTimer: number | undefined;
   let watcherRelayOnly = false;
   let watcherCandidates: RTCIceCandidateInit[] = [];
   let pendingWatcherSignals: PendingWatcherSignal[] = [];
@@ -400,16 +474,26 @@ export async function openChannelSession(
   let videoFrameCallbackId: number | undefined;
   let viewerStatsTimer: number | undefined;
   let viewerStatsPollRunning = false;
+  let viewerStatsEpoch = 0;
+  let viewerStatsOutstanding = 0;
   let inboundSnapshot: InboundSnapshot | undefined;
   let inboundAudioSnapshot: InboundAudioSnapshot | undefined;
+  let p2pScreenFrameSnapshot:
+    | { frames: number; currentTime: number }
+    | undefined;
   let sfuScreenFrameSnapshot:
     | { frames: number; currentTime: number }
     | undefined;
+  let sfuScreenReceiverSnapshot: SfuScreenReceiverStats | undefined;
+  let viewerStatsFailures = 0;
   let viewerAudioStalledSamples = 0;
   let viewerAudioEverReceived = false;
   let embyDataSnapshot: DataChannelSnapshot | undefined;
   let embyFrameSnapshot:
     | { frames: number; dropped: number; timestamp: number }
+    | undefined;
+  let embyLivenessFrameSnapshot:
+    | { frames: number; currentTime: number }
     | undefined;
   let embyBufferedAhead = 0;
   let embyStartupBufferProgressAt = 0;
@@ -419,6 +503,7 @@ export async function openChannelSession(
   let viewerTransportProgressAt = 0;
   let viewerPresentationProgressAt = 0;
   let viewerRecoveryStartedAt = 0;
+  let firstFrameRepairStartedAt = 0;
   let embyLastPlaybackTime = 0;
   let lastPlaybackDiagnosticAt = 0;
   let viewerBandwidthWarningShown = false;
@@ -528,6 +613,7 @@ export async function openChannelSession(
   let embyAdaptiveChangedAt = 0;
   let lastEmbyHostDiagnosticAt = 0;
   let embyViewer: EmbyMsePlayer | undefined;
+  let embyAbrViewer: EmbyAbrSegmentClient | undefined;
   let embyLogin: EmbyAccount | undefined;
   let embyAccounts: EmbyAccount[] = [];
   let embyActiveAccountId = "";
@@ -589,6 +675,15 @@ export async function openChannelSession(
   let frameRate: FrameRateOption = isFrameRateOption(savedFrameRate)
     ? savedFrameRate
     : 30;
+  const savedScreenContentMode = localStorage.getItem(
+    "synced:screen-content-mode",
+  );
+  let screenContentMode: ScreenContentMode =
+    savedScreenContentMode === "detail" ||
+    savedScreenContentMode === "motion" ||
+    savedScreenContentMode === "balanced"
+      ? savedScreenContentMode
+      : "balanced";
   let embyFrameRate = normalizeEmbyFrameRate(
     localStorage.getItem("synced:emby-frame-rate"),
   );
@@ -609,6 +704,10 @@ export async function openChannelSession(
   }
   let highlightCorrection =
     localStorage.getItem("synced:highlight-correction") === "true";
+  let videoEnhancementPreference: VideoEnhancementPreference =
+    localStorage.getItem("synced:video-enhancement") === "off"
+      ? "off"
+      : "auto";
   const resumeTokenKey = `synced:resume-token:${room}`;
   let resumeToken = localStorage.getItem(resumeTokenKey) || "";
   if (!/^[a-z0-9-]{16,128}$/i.test(resumeToken)) {
@@ -720,6 +819,8 @@ export async function openChannelSession(
         </header>
         <section id="player-stage" class="video-stage viewer-stage${nativeAndroid ? " native-android-player" : ""}">
           <video id="channel-video" autoplay playsinline hidden></video>
+          <canvas id="video-enhancement-canvas" class="video-enhancement-canvas" hidden aria-hidden="true"></canvas>
+          <div id="video-enhancement-subtitles" class="video-enhancement-subtitles" hidden aria-hidden="true"></div>
           <audio id="channel-movie-audio" autoplay playsinline hidden></audio>
           <div id="stage-danmaku" class="danmaku-layer" aria-hidden="true"></div>
           <div id="receiver-stream-badge" class="receiver-stream-badge" hidden aria-live="polite"></div>
@@ -919,6 +1020,17 @@ export async function openChannelSession(
         </span>
         <input id="highlight-correction" type="checkbox" ${highlightCorrection ? "checked" : ""} />
       </label>
+      ${
+        desktop
+          ? `<label class="highlight-correction video-enhancement-setting">
+              <span>
+                <strong>GPU 清晰增强</strong>
+                <small id="video-enhancement-status">仅在远端 Emby 低于 1080p、输出接近 2K/4K 且 GPU 有余量时自动开启。</small>
+              </span>
+              <input id="video-enhancement" type="checkbox" ${videoEnhancementPreference === "auto" ? "checked" : ""} />
+            </label>`
+          : ""
+      }
     </dialog>
     <dialog id="emby-settings-dialog" class="picture-dialog emby-settings-dialog">
       <header>
@@ -1026,6 +1138,24 @@ export async function openChannelSession(
                       </button>
                     `,
                   ).join("")}
+                </div>
+              </fieldset>
+              <fieldset class="quality-field content-mode-field">
+                <legend>共享内容类型</legend>
+                <div class="quality-grid">
+                  ${([
+                    ["detail", "文字细节", "代码、网页、PPT，弱网先保分辨率"],
+                    ["motion", "动态画面", "电影、游戏，弱网先保帧率"],
+                    ["balanced", "智能均衡", "兼顾清晰度与运动流畅度"],
+                  ] as const)
+                    .map(
+                      ([value, label, description]) => `
+                        <button type="button" class="quality-option ${screenContentMode === value ? "active" : ""}" data-screen-content-mode="${value}">
+                          <strong>${label}</strong><span>${description}</span>
+                        </button>
+                      `,
+                    )
+                    .join("")}
                 </div>
               </fieldset>
               <p id="session-quality-summary" class="quality-summary">${escapeHtml(buildQualityPreset(resolutionKey, frameRate).detail)}</p>
@@ -1250,6 +1380,14 @@ export async function openChannelSession(
     document.querySelector<HTMLElement>("#mobile-gesture-value");
   const highlightCorrectionInput =
     document.querySelector<HTMLInputElement>("#highlight-correction");
+  const videoEnhancementInput =
+    document.querySelector<HTMLInputElement>("#video-enhancement");
+  const videoEnhancementStatus =
+    document.querySelector<HTMLElement>("#video-enhancement-status");
+  const videoEnhancementCanvas =
+    document.querySelector<HTMLCanvasElement>("#video-enhancement-canvas");
+  const videoEnhancementSubtitles =
+    document.querySelector<HTMLElement>("#video-enhancement-subtitles");
   const broadcastButton =
     document.querySelector<HTMLButtonElement>("#broadcast-action");
   const stageStartButton =
@@ -1261,6 +1399,67 @@ export async function openChannelSession(
   }
   const danmakuSurface = stageDanmakuElement;
   const stageDanmaku = new DanmakuOverlay(danmakuSurface);
+  let videoEnhancement: VideoEnhancementController | undefined;
+  if (
+    desktop &&
+    video &&
+    playerStage &&
+    videoEnhancementCanvas &&
+    videoEnhancementSubtitles
+  ) {
+    videoEnhancement = new VideoEnhancementController({
+      video,
+      canvas: videoEnhancementCanvas,
+      stage: playerStage,
+      subtitleLayer: videoEnhancementSubtitles,
+      getFitMode: () =>
+        isImmersivePlayback() ? fullscreenFit : "contain",
+      onDiagnostic: reportPlaybackDiagnostic,
+    });
+    videoEnhancement.setPreference(videoEnhancementPreference);
+    const capabilities = detectEmbyMediaCapabilities();
+    const supported = capabilities.videoEnhancementBackends.includes(
+      "webgl2-spatial",
+    );
+    if (videoEnhancementInput) {
+      videoEnhancementInput.disabled = !supported;
+      videoEnhancementInput.title = supported
+        ? "自动使用通用 WebGL2 空间增强"
+        : "当前图形驱动不支持 WebGL2 增强后端";
+    }
+    videoEnhancement.addEventListener("statechange", (event) => {
+      const state = (event as CustomEvent<VideoEnhancementState>).detail;
+      if (!videoEnhancementStatus) return;
+      if (state.active) {
+        videoEnhancementStatus.textContent =
+          `WebGL2 空间增强已开启 · ${state.sourceWidth}×${state.sourceHeight}` +
+          ` → ${state.outputWidth}×${state.outputHeight}`;
+        videoEnhancementStatus.dataset.tone = "active";
+        return;
+      }
+      delete videoEnhancementStatus.dataset.tone;
+      if (
+        state.reason === "render-budget" ||
+        state.reason === "dropped-frames" ||
+        state.reason === "resource-pressure" ||
+        state.reason === "cooldown"
+      ) {
+        videoEnhancementStatus.textContent =
+          "检测到 GPU、渲染或解码压力，已自动暂停增强；稳定 30 秒后重试。";
+      } else if (state.reason === "hdr-unsupported") {
+        videoEnhancementStatus.textContent =
+          "HDR 视频保持原生色彩路径，不经过当前 SDR 空间增强后端。";
+      } else if (state.reason === "backend-unavailable") {
+        videoEnhancementStatus.textContent =
+          "当前图形驱动不支持通用 WebGL2 空间增强。";
+      } else if (state.reason === "preference-off") {
+        videoEnhancementStatus.textContent = "GPU 清晰增强已手动关闭。";
+      } else {
+        videoEnhancementStatus.textContent =
+          "仅在远端 Emby 360p–1080p、输出接近 2K/4K 且 GPU 有余量时自动开启。";
+      }
+    });
+  }
 
   function openDialog(dialog: HTMLDialogElement): void {
     if (dialog.open) return;
@@ -1914,6 +2113,14 @@ export async function openChannelSession(
       height: Math.round(value.height),
       frameRate: Math.round(value.frameRate),
       mode: value.mode === "emby" ? "emby" : "screen",
+      contentMode:
+        value.contentMode === "detail" ||
+        value.contentMode === "motion" ||
+        value.contentMode === "balanced"
+          ? value.contentMode
+          : value.mode === "emby"
+            ? "motion"
+            : "balanced",
     };
     if (normalized.mode === "emby") {
       normalized.mimeType = String(value.mimeType || "").slice(0, 180);
@@ -1956,11 +2163,20 @@ export async function openChannelSession(
         broadcastCapabilities.height,
         preferredHeight || (nativeAndroid ? 720 : 0),
         !resetViewerPreference,
+        {
+          contentMode: broadcastCapabilities.contentMode,
+          sourceFrameRate: broadcastCapabilities.frameRate,
+        },
       );
     } else {
       adaptivePlayback.configure(1);
     }
     if (viewerResolutionSelect) {
+      const screenSfuMaximumHeight =
+        broadcastCapabilities?.mode !== "emby" &&
+        signalFeatures.has("sfu-primary")
+          ? Math.min(1_440, broadcastCapabilities?.height || 1_440)
+          : broadcastCapabilities?.height;
       for (const option of viewerResolutionSelect.options) {
         const height = Number(option.value);
         const embyMode = broadcastCapabilities?.mode === "emby";
@@ -1973,12 +2189,16 @@ export async function openChannelSession(
           !embyMode &&
             height &&
             broadcastCapabilities &&
-            height > broadcastCapabilities.height,
+            height > (screenSfuMaximumHeight || broadcastCapabilities.height),
         );
         option.title = embyMode
-          ? "将请求放映端重建全房间共享的 Emby 清晰度"
+          ? signalFeatures.has("emby-segment-relay-v1")
+            ? "仅切换当前设备的 HTTPS ABR 档位，不影响其他观看端"
+            : "兼容模式会请求放映端重建共享清晰度"
           : option.disabled
-            ? `超过放映端最高 ${broadcastCapabilities?.height || 0}p`
+            ? signalFeatures.has("sfu-primary")
+              ? `服务器多人主线最高稳定档为 ${screenSfuMaximumHeight || 1_440}p`
+              : `超过放映端最高 ${broadcastCapabilities?.height || 0}p`
             : "";
       }
       if (
@@ -1990,6 +2210,11 @@ export async function openChannelSession(
       viewerResolutionSelect.value = String(preferredHeight);
     }
     if (viewerFrameRateSelect) {
+      const screenSfuMaximumFrameRate =
+        broadcastCapabilities?.mode !== "emby" &&
+        signalFeatures.has("sfu-primary")
+          ? Math.min(30, broadcastCapabilities?.frameRate || 30)
+          : broadcastCapabilities?.frameRate;
       for (const option of viewerFrameRateSelect.options) {
         const optionFrameRate = Number(option.value);
         const embyMode = broadcastCapabilities?.mode === "emby";
@@ -2003,14 +2228,20 @@ export async function openChannelSession(
             ? optionFrameRate > 60
             : optionFrameRate &&
                 broadcastCapabilities &&
-                optionFrameRate > broadcastCapabilities.frameRate,
+                optionFrameRate >
+                  (screenSfuMaximumFrameRate ||
+                    broadcastCapabilities.frameRate),
         );
         option.title = embyMode
           ? option.disabled
             ? "Emby 共享流最高支持 60 帧"
-            : "将请求放映端重建全房间共享的 Emby 帧率"
+            : signalFeatures.has("emby-segment-relay-v1")
+              ? "当前设备会独立选择可用的 CMAF 档位"
+              : "兼容模式会请求放映端重建共享帧率"
           : option.disabled
-            ? `超过放映端最高 ${broadcastCapabilities?.frameRate || 0} 帧`
+            ? signalFeatures.has("sfu-primary")
+              ? `服务器多人主线最高稳定档为 ${screenSfuMaximumFrameRate || 30} 帧`
+              : `超过放映端最高 ${broadcastCapabilities?.frameRate || 0} 帧`
             : "";
       }
       if (
@@ -2034,7 +2265,9 @@ export async function openChannelSession(
       receiverCapability.hidden = !broadcastCapabilities;
       receiverCapability.textContent = broadcastCapabilities
         ? broadcastCapabilities.mode === "emby"
-          ? `服务器编码流 · ${broadcastCapabilities.videoCodec?.toUpperCase() || "H.264"} / ${broadcastCapabilities.audioCodec?.toUpperCase() || "AAC"}；画质与帧率是全房间共享流，选择后会请求放映端统一重建`
+          ? signalFeatures.has("emby-segment-relay-v1")
+            ? `HTTPS 多档 CMAF · ${broadcastCapabilities.videoCodec?.toUpperCase() || "H.264"} / ${broadcastCapabilities.audioCodec?.toUpperCase() || "AAC"}；当前设备独立 ABR、磁盘缓存与可选 GPU 增强，不影响其他观看端`
+            : `兼容共享流 · ${broadcastCapabilities.videoCodec?.toUpperCase() || "H.264"} / ${broadcastCapabilities.audioCodec?.toUpperCase() || "AAC"}；画质变化需要放映端重建`
           : `可按网络状况手动降低；默认保持 ${sourceLabel}`
         : "";
     }
@@ -2056,6 +2289,7 @@ export async function openChannelSession(
       applyMovieVolume(movieVolume, false);
     }
     syncPlayerAspect();
+    syncVideoEnhancement();
   }
 
   function syncPlayerAspect(): void {
@@ -2069,10 +2303,30 @@ export async function openChannelSession(
   }
 
   function applyHighlightCorrection(): void {
+    const enabled = highlightCorrection && broadcasterId !== selfId;
     video?.classList.toggle(
       "highlight-correction",
-      highlightCorrection && broadcasterId !== selfId,
+      enabled,
     );
+    videoEnhancementCanvas?.classList.toggle(
+      "highlight-correction",
+      enabled,
+    );
+  }
+
+  function syncVideoEnhancement(): void {
+    if (!videoEnhancement) return;
+    const remoteEmbyVisible = Boolean(
+      broadcastCapabilities?.mode === "emby" &&
+        broadcasterId &&
+        broadcasterId !== selfId &&
+        video &&
+        !video.hidden,
+    );
+    videoEnhancement.setPlaybackMode(
+      remoteEmbyVisible ? "emby-viewer" : "off",
+    );
+    videoEnhancement.refresh();
   }
 
   function sampleEmbeddedBars():
@@ -2321,6 +2575,7 @@ export async function openChannelSession(
 
   function handleFullscreenViewportChange(): void {
     window.requestAnimationFrame(syncStageDanmakuBounds);
+    videoEnhancement?.refresh();
     syncAppMode();
     if (
       !isImmersivePlayback() &&
@@ -2586,6 +2841,7 @@ export async function openChannelSession(
     setMobileControlsAvailable(false);
     hideReceiverStreamBadge();
     applyHighlightCorrection();
+    syncVideoEnhancement();
     setMediaStatus("当前无人放映");
     updatePictureInPictureButton();
     setAppMode("lobby");
@@ -2628,6 +2884,7 @@ export async function openChannelSession(
     if (pictureSettingsButton) pictureSettingsButton.hidden = false;
     setMobileControlsAvailable(false);
     hideReceiverStreamBadge();
+    syncVideoEnhancement();
     setMediaStatus(`${broadcasterNickname || "朋友"}正在放映 · 连接中`);
     updatePictureInPictureButton();
     syncAppMode();
@@ -2653,6 +2910,7 @@ export async function openChannelSession(
     hideReceiverStreamBadge();
     syncPlayerAspect();
     applyHighlightCorrection();
+    syncVideoEnhancement();
     setMediaStatus(
       broadcastCapabilities
         ? `${exactSourceLabel(
@@ -2685,6 +2943,7 @@ export async function openChannelSession(
     hideReceiverStreamBadge();
     syncPlayerAspect();
     applyHighlightCorrection();
+    syncVideoEnhancement();
     const plan = embyBroadcast.streamPlan;
     setMediaStatus(
       `Emby ${plan.width}×${plan.height} · ${plan.videoCodec.toUpperCase()} / ${plan.audioCodec.toUpperCase()} · ${plan.method}`,
@@ -2712,12 +2971,16 @@ export async function openChannelSession(
     setMobileControlsAvailable(true);
     syncPlayerAspect();
     applyHighlightCorrection();
+    syncVideoEnhancement();
     void resolveFullscreenFit();
+    const embyRoute = signalFeatures.has("emby-segment-relay-v1")
+      ? "HTTPS 独立 ABR"
+      : sfuViewerActive
+        ? "服务器 SFU"
+        : "P2P 备用链路";
     setMediaStatus(
       broadcastCapabilities?.mode === "emby"
-        ? `${broadcasterNickname || "朋友"}正在 Emby 高清放映 · ${
-            sfuViewerActive ? "服务器 SFU" : "P2P 备用链路"
-          }`
+        ? `${broadcasterNickname || "朋友"}正在 Emby 高清放映 · ${embyRoute}`
         : `${broadcasterNickname || "朋友"}正在放映 · ${
             sfuViewerActive ? "服务器 SFU" : "P2P 备用链路"
           }`,
@@ -2726,27 +2989,83 @@ export async function openChannelSession(
     syncAppMode();
   }
 
+  function recordViewerStatsFailure(
+    reason: "timeout" | "error" | "capacity",
+    error?: unknown,
+  ): void {
+    viewerStatsFailures = Math.min(5, viewerStatsFailures + 1);
+    if (viewerStatsFailures !== 3 && viewerStatsFailures !== 5) return;
+    reportPlaybackDiagnostic("viewer-stats-confidence-reduced", {
+      consecutiveFailures: viewerStatsFailures,
+      confidence: viewerStatsFailures >= 5 ? "missing" : "reduced",
+      reason,
+      transport: sfuViewerActive ? "sfu" : "p2p",
+      mediaStillProgressing:
+        Date.now() - viewerPresentationProgressAt <
+        SFU_SCREEN_SILENCE_TIMEOUT_MS,
+      outstandingOperations: viewerStatsOutstanding,
+      message: error instanceof Error ? error.message : undefined,
+    });
+  }
+
   function ensureViewerStatsTimer(): void {
     if (viewerStatsTimer) return;
     viewerStatsTimer = window.setInterval(() => {
+      const recoveryAction =
+        broadcastCapabilities?.mode === "emby"
+          ? updateEmbyElementLiveness()
+          : sfuViewerActive
+            ? (updateSfuScreenLiveness(), "none" as const)
+            : updateP2pScreenLiveness();
+      if (recoveryAction === "replace") return;
       if (viewerStatsPollRunning) return;
+      // Chromium does not expose an AbortSignal for getStats(). Never pile up
+      // an unbounded number of native stats requests when a suspended WebView
+      // leaves one unresolved. Capacity misses reduce telemetry confidence but
+      // remain completely separate from media recovery decisions.
+      if (viewerStatsOutstanding >= 2) {
+        recordViewerStatsFailure("capacity");
+        return;
+      }
       viewerStatsPollRunning = true;
+      const statsEpoch = viewerStatsEpoch;
+      viewerStatsOutstanding += 1;
       const statsOperation =
         broadcastCapabilities?.mode === "emby"
           ? updateEmbyInboundStats()
           : updateInboundStats();
+      void statsOperation
+        .finally(() => {
+          if (statsEpoch === viewerStatsEpoch) {
+            viewerStatsOutstanding = Math.max(
+              0,
+              viewerStatsOutstanding - 1,
+            );
+          }
+        })
+        .catch(() => undefined);
       void boundedRtcOperation(
         statsOperation,
         "观看端 WebRTC 统计长时间无响应",
         RTC_STATS_TIMEOUT_MS,
+      ).then(
+        () => {
+          if (statsEpoch === viewerStatsEpoch) viewerStatsFailures = 0;
+        },
+        (error) => {
+          if (statsEpoch !== viewerStatsEpoch) return;
+          recordViewerStatsFailure(
+            error instanceof Error && /超时|timeout/i.test(error.message)
+              ? "timeout"
+              : "error",
+            error,
+          );
+        },
       )
-        .catch(() => {
-          if (!leaving && watcherPc && !sfuViewerActive) {
-            retryWatching("媒体统计接口无响应，正在重建 P2P 备用链路", true);
-          }
-        })
         .finally(() => {
-          viewerStatsPollRunning = false;
+          if (statsEpoch === viewerStatsEpoch) {
+            viewerStatsPollRunning = false;
+          }
         });
     }, 1_000);
   }
@@ -2758,11 +3077,45 @@ export async function openChannelSession(
     embyLastPlaybackTime = Math.max(0, Number(video?.currentTime) || 0);
   }
 
+  function updateEmbyElementLiveness(): "none" | "repair" | "replace" {
+    if (
+      broadcastCapabilities?.mode !== "emby" ||
+      !remoteFirstFrame ||
+      !video
+    ) {
+      return "none";
+    }
+    if (document.visibilityState === "hidden") {
+      embyLivenessFrameSnapshot = undefined;
+      resetViewerMediaLiveness();
+      return "none";
+    }
+    let frames = 0;
+    try {
+      frames = Number(video.getVideoPlaybackQuality?.().totalVideoFrames) || 0;
+    } catch {
+      // currentTime remains a monotonic presentation fallback.
+    }
+    const currentTime = Math.max(0, Number(video.currentTime) || 0);
+    const previous = embyLivenessFrameSnapshot;
+    embyLivenessFrameSnapshot = { frames, currentTime };
+    if (
+      !previous ||
+      frames > previous.frames ||
+      currentTime > previous.currentTime + 0.01
+    ) {
+      viewerPresentationProgressAt = Date.now();
+    }
+    return monitorViewerMediaLiveness("emby");
+  }
+
   function monitorViewerMediaLiveness(
     mode: "screen" | "emby",
   ): "none" | "repair" | "replace" {
     const peer = watcherPc;
-    if (!peer || !remoteFirstFrame) return "none";
+    const independentHttpsMedia =
+      mode === "emby" && Boolean(embyAbrViewer?.diagnostics.active);
+    if ((!peer && !independentHttpsMedia) || !remoteFirstFrame) return "none";
     if (document.visibilityState === "hidden") {
       // Renderer/video clocks are intentionally suspended in the background.
       // Start a fresh observation window when the app becomes visible again.
@@ -2773,7 +3126,11 @@ export async function openChannelSession(
     const liveness = {
       mode,
       now,
-      peerState: peer.connectionState,
+      // The CMAF media path is HTTPS and remains independently observable even
+      // when its SFU/P2P control connection is being replaced.
+      peerState: independentHttpsMedia
+        ? "connected"
+        : peer?.connectionState,
       hostPaused: mode === "emby" && embyHostPaused,
       transportProgressAt: viewerTransportProgressAt || now,
       presentationProgressAt: viewerPresentationProgressAt || now,
@@ -2800,7 +3157,9 @@ export async function openChannelSession(
     if (action === "repair") {
       viewerRecoveryStartedAt = now;
       if (mode === "emby") embyViewer?.requestRecovery();
-      const restartIce = shouldRestartIceForPlaybackRepair(liveness);
+      const restartIce =
+        !independentHttpsMedia &&
+        shouldRestartIceForPlaybackRepair(liveness);
       setStatus(
         mode === "emby"
           ? restartIce
@@ -2822,7 +3181,10 @@ export async function openChannelSession(
       }
       reportPlaybackDiagnostic("viewer-media-stalled", {
         mode,
-        connectionState: peer.connectionState,
+        connectionState: independentHttpsMedia
+          ? "https-independent"
+          : peer?.connectionState,
+        mediaTransport: independentHttpsMedia ? "https-cmaf" : "webrtc",
         transportIdleMs: now - viewerTransportProgressAt,
         presentationIdleMs: now - viewerPresentationProgressAt,
         bufferedAhead: embyBufferedAhead,
@@ -2832,7 +3194,10 @@ export async function openChannelSession(
     }
     reportPlaybackDiagnostic("viewer-media-replacing", {
       mode,
-      connectionState: peer.connectionState,
+      connectionState: independentHttpsMedia
+        ? "https-independent"
+        : peer?.connectionState,
+      mediaTransport: independentHttpsMedia ? "https-cmaf" : "webrtc",
       recoveryMs: now - viewerRecoveryStartedAt,
       transportIdleMs: now - viewerTransportProgressAt,
       presentationIdleMs: now - viewerPresentationProgressAt,
@@ -2842,7 +3207,9 @@ export async function openChannelSession(
     viewerRecoveryStartedAt = now;
     retryWatching(
       mode === "emby"
-        ? "补发与 ICE 重启后仍无数据，正在重建 Emby 媒体连接"
+        ? independentHttpsMedia
+          ? "HTTPS 分片补发后仍无画面，正在重建 Emby 播放会话"
+          : "补发与 ICE 重启后仍无数据，正在重建 Emby 媒体连接"
         : "ICE 重启后媒体仍停滞，正在重建放映连接",
       true,
     );
@@ -2937,9 +3304,14 @@ export async function openChannelSession(
   function confirmRemoteFirstFrame(): void {
     if (remoteFirstFrame) return;
     remoteFirstFrame = true;
+    firstFrameRepairStartedAt = 0;
     resetViewerMediaLiveness();
-    retainedRemoteStream?.getTracks().forEach((track) => track.stop());
-    retainedRemoteStream = undefined;
+    if (sfuViewerActive && retainedWatcherPc) {
+      scheduleStableSfuCommit();
+    } else {
+      retainedRemoteStream?.getTracks().forEach((track) => track.stop());
+      retainedRemoteStream = undefined;
+    }
     playerStage?.classList.remove("playback-recovering");
     clearWatchRetry();
     watchAttempts = 0;
@@ -3057,16 +3429,8 @@ export async function openChannelSession(
   }
 
   async function updateEmbyInboundStats(): Promise<void> {
-    const peer = watcherPc;
     const player = embyViewer;
-    if (
-      !peer ||
-      !player ||
-      peer.connectionState === "closed" ||
-      !remoteFirstFrame
-    ) {
-      return;
-    }
+    if (!player || !remoteFirstFrame) return;
     const sampleNow = Date.now();
     const playbackTime = Math.max(0, Number(video?.currentTime) || 0);
     const previousPlaybackTime = embyLastPlaybackTime;
@@ -3117,6 +3481,116 @@ export async function openChannelSession(
       );
     }
     embyFrameSnapshot = frameSnapshot;
+    const recoveryAction = monitorViewerMediaLiveness("emby");
+    if (recoveryAction === "replace") return;
+    const abrDiagnostics = embyAbrViewer?.diagnostics;
+    if (abrDiagnostics?.active) {
+      const diagnosticNow = Date.now();
+      const mseDiagnostics = player.diagnostics;
+      const plan = player.activeSession?.plan;
+      const width =
+        video?.videoWidth ||
+        abrDiagnostics.renditionWidth ||
+        plan?.width ||
+        0;
+      const height =
+        video?.videoHeight ||
+        abrDiagnostics.renditionHeight ||
+        plan?.height ||
+        0;
+      const renditionFrameRate =
+        abrDiagnostics.renditionFrameRate || frameRate;
+      const bufferedAhead = Math.max(
+        0,
+        embyBufferedAhead || player.bufferedAhead,
+      );
+      if (
+        recoveryAction !== "none" ||
+        diagnosticNow - lastPlaybackDiagnosticAt >= 10_000
+      ) {
+        lastPlaybackDiagnosticAt = diagnosticNow;
+        reportPlaybackDiagnostic("emby-cmaf-viewer-sample", {
+          action: recoveryAction,
+          mediaTransport: "https-cmaf",
+          controlTransport: sfuViewerActive ? "sfu" : "p2p",
+          renditionId: abrDiagnostics.renditionId,
+          renditionLabel: abrDiagnostics.renditionLabel,
+          renditionBitrate: abrDiagnostics.renditionBitrate,
+          estimatedThroughputBps: Math.round(
+            abrDiagnostics.estimatedThroughputBps,
+          ),
+          bufferedAhead: Number(bufferedAhead.toFixed(2)),
+          playbackTime: Number(playbackTime.toFixed(3)),
+          elementPaused: Boolean(video?.paused),
+          hostPaused: embyHostPaused,
+          frameCounterAvailable,
+          totalVideoFrames: frameSnapshot.frames,
+          framesDecodedDelta,
+          droppedVideoFrames: frameSnapshot.dropped,
+          readyState: mseDiagnostics.readyState,
+          seeking: mseDiagnostics.seeking,
+          bufferedWindows: mseDiagnostics.bufferedWindows.map((range) => [
+            Number(range.start.toFixed(3)),
+            Number(range.end.toFixed(3)),
+          ]),
+          appendQueueItems: mseDiagnostics.appendQueueItems,
+          pendingMediaItems: mseDiagnostics.pendingMediaItems,
+          presentationIdleMs:
+            diagnosticNow - viewerPresentationProgressAt,
+          transportIdleMs: diagnosticNow - viewerTransportProgressAt,
+          cacheHits: abrDiagnostics.cacheHits,
+          networkFetches: abrDiagnostics.networkFetches,
+          rangeRetries: abrDiagnostics.rangeRetries,
+          appendedSegments: abrDiagnostics.appendedSegments,
+          prefetchedSegments: abrDiagnostics.prefetchedSegments,
+          fetchGeneration: abrDiagnostics.fetchGeneration,
+          lastError: abrDiagnostics.lastError,
+        });
+      }
+      const details = [
+        "HTTPS 独立 ABR",
+        sfuViewerActive ? "SFU 控制" : "P2P 控制",
+        abrDiagnostics.renditionLabel || abrDiagnostics.renditionId || "",
+        width && height ? `${width}×${height}` : "",
+        renditionFrameRate > 0
+          ? `${Math.round(renditionFrameRate)} fps`
+          : "帧率计算中",
+        abrDiagnostics.renditionBitrate
+          ? `媒体 ${formatBitrate(abrDiagnostics.renditionBitrate)}`
+          : "",
+        abrDiagnostics.estimatedThroughputBps > 0
+          ? `带宽估计 ${formatBitrate(abrDiagnostics.estimatedThroughputBps)}`
+          : "",
+        `缓冲 ${bufferedAhead.toFixed(1)} 秒`,
+        abrDiagnostics.cacheHits > 0
+          ? `缓存命中 ${abrDiagnostics.cacheHits}`
+          : "",
+        abrDiagnostics.rangeRetries > 0
+          ? `续传 ${abrDiagnostics.rangeRetries}`
+          : "",
+        embyHostPaused ? "放映端已暂停" : "",
+        droppedFrames > 0 ? `丢帧 +${droppedFrames}` : "",
+      ].filter(Boolean);
+      const text = details.join(" · ");
+      if (receiverStreamBadge) {
+        receiverStreamBadge.textContent = text;
+        receiverStreamBadge.hidden = false;
+      }
+      if (mobilePlaybackStats) mobilePlaybackStats.textContent = text;
+      if (desktopPlaybackStats) desktopPlaybackStats.textContent = text;
+      setMediaStatus(
+        embyHostPaused
+          ? `${broadcasterNickname || "朋友"}已暂停 Emby 放映 · ${text}`
+          : `${broadcasterNickname || "朋友"}正在 Emby 高清放映 · ${text}`,
+      );
+      if (embyHostPaused) {
+        setStatus("放映端已暂停 · 等待继续播放", "neutral");
+      }
+      updateEmbyViewerTimeline();
+      return;
+    }
+    const peer = watcherPc;
+    if (!peer || peer.connectionState === "closed") return;
     try {
       const previousDataSnapshot = embyDataSnapshot;
       const stats = await readDataChannelStats(
@@ -3132,7 +3606,6 @@ export async function openChannelSession(
       ) {
         viewerTransportProgressAt = Date.now();
       }
-      const recoveryAction = monitorViewerMediaLiveness("emby");
       const plan = player.activeSession?.plan;
       const plannedBitrate = Number(plan?.bitrate) || 0;
       const receivingTooSlow =
@@ -3201,7 +3674,6 @@ export async function openChannelSession(
           adaptiveHeight: embyAdaptiveHeight || undefined,
         });
       }
-      if (recoveryAction === "replace") return;
       const width = video?.videoWidth || plan?.width || 0;
       const height = video?.videoHeight || plan?.height || 0;
       const measuredBitrate = stats.bitrate || 0;
@@ -3239,8 +3711,10 @@ export async function openChannelSession(
         setStatus("放映端已暂停 · 等待继续播放", "neutral");
       }
       updateEmbyViewerTimeline();
-    } catch {
-      // DataChannel stats are advisory and must not interrupt MSE playback.
+    } catch (error) {
+      // The stats timer owns advisory failure accounting. Propagating this
+      // error only lowers telemetry confidence; it never enters recovery.
+      throw error;
     }
   }
 
@@ -3257,6 +3731,7 @@ export async function openChannelSession(
     if (document.visibilityState === "hidden") {
       resetViewerMediaLiveness(now);
       sfuScreenFrameSnapshot = undefined;
+      sfuScreenReceiverSnapshot = undefined;
       return;
     }
     let frames = 0;
@@ -3296,9 +3771,128 @@ export async function openChannelSession(
     );
   }
 
+  async function updateSfuScreenStats(): Promise<void> {
+    updateSfuScreenLiveness();
+    if (!sfuViewerActive || broadcastCapabilities?.mode === "emby") return;
+    const stats = await sfuSession.readScreenReceiverStats();
+    if (!stats || !sfuViewerActive) return;
+    const previous = sfuScreenReceiverSnapshot;
+    sfuScreenReceiverSnapshot = stats;
+    if (!previous || stats.timestamp <= previous.timestamp) return;
+    const packetDelta = Math.max(
+      0,
+      stats.packetsReceived +
+        stats.packetsLost -
+        previous.packetsReceived -
+        previous.packetsLost,
+    );
+    const lostDelta = Math.max(
+      0,
+      stats.packetsLost - previous.packetsLost,
+    );
+    const decodedDelta = Math.max(
+      0,
+      stats.framesDecoded - previous.framesDecoded,
+    );
+    const droppedDelta = Math.max(
+      0,
+      stats.framesDropped - previous.framesDropped,
+    );
+    const elapsedSeconds = Math.max(
+      0.001,
+      (stats.timestamp - previous.timestamp) / 1_000,
+    );
+    const bitrate = Math.max(
+      0,
+      ((stats.bytesReceived - previous.bytesReceived) * 8) / elapsedSeconds,
+    );
+    if (stats.bytesReceived > previous.bytesReceived) {
+      viewerTransportProgressAt = Date.now();
+    }
+    if (decodedDelta > 0) {
+      viewerPresentationProgressAt = Date.now();
+    }
+    const decision = adaptivePlayback.observe({
+      connectionState: sfuSession.connected ? "connected" : "disconnected",
+      packetLossRatio: packetDelta > 0 ? lostDelta / packetDelta : undefined,
+      jitter: stats.jitter,
+      framesDroppedRatio:
+        decodedDelta + droppedDelta > 0
+          ? droppedDelta / (decodedDelta + droppedDelta)
+          : undefined,
+      frameRate: stats.framesPerSecond,
+      availableBandwidthBps: stats.availableIncomingBitrate,
+      currentRoundTripTime: stats.currentRoundTripTime,
+      transportProgressAgeMs: Date.now() - viewerTransportProgressAt,
+    });
+    if (decision.changed) {
+      sendViewerQualityPreference(false);
+      const preference = currentSfuScreenPreference();
+      setStatus(
+        decision.direction === "down"
+          ? `${decision.reason || "媒体压力"} · 当前设备已切换至 ${preference.height}p/${preference.frameRate} 帧`
+          : `网络持续稳定 · 当前设备正回升至 ${preference.height}p/${preference.frameRate} 帧`,
+        decision.direction === "down" ? "neutral" : "ready",
+      );
+    }
+    const dimensions = `${stats.framesPerSecond ? `${Math.round(stats.framesPerSecond)} fps` : "SFU 分层"}`;
+    const pressure =
+      adaptivePlayback.currentPressure === "healthy"
+        ? ""
+        : adaptivePlayback.currentPressure;
+    setMediaStatus(
+      [
+        `${broadcasterNickname || "朋友"}正在放映`,
+        "服务器 SFU",
+        dimensions,
+        bitrate > 0 ? formatBitrate(bitrate) : "",
+        pressure,
+      ]
+        .filter(Boolean)
+        .join(" · "),
+    );
+  }
+
+  function updateP2pScreenLiveness(): "none" | "repair" | "replace" {
+    if (
+      sfuViewerActive ||
+      broadcastCapabilities?.mode === "emby" ||
+      !remoteFirstFrame ||
+      !video
+    ) {
+      return "none";
+    }
+    if (document.visibilityState === "hidden") {
+      p2pScreenFrameSnapshot = undefined;
+      resetViewerMediaLiveness();
+      return "none";
+    }
+    let frames = 0;
+    try {
+      frames = Number(video.getVideoPlaybackQuality?.().totalVideoFrames) || 0;
+    } catch {
+      // currentTime remains a monotonic presentation fallback.
+    }
+    const currentTime = Math.max(0, Number(video.currentTime) || 0);
+    const previous = p2pScreenFrameSnapshot;
+    p2pScreenFrameSnapshot = { frames, currentTime };
+    if (
+      !previous ||
+      frames > previous.frames ||
+      currentTime > previous.currentTime + 0.01
+    ) {
+      const now = Date.now();
+      // Actual presentation progress is stronger evidence than a missing or
+      // delayed stats report. Keep both health clocks advancing here.
+      viewerTransportProgressAt = now;
+      viewerPresentationProgressAt = now;
+    }
+    return monitorViewerMediaLiveness("screen");
+  }
+
   async function updateInboundStats(): Promise<void> {
     if (sfuViewerActive) {
-      updateSfuScreenLiveness();
+      await updateSfuScreenStats();
       return;
     }
     const peer = watcherPc;
@@ -3309,6 +3903,8 @@ export async function openChannelSession(
     ) {
       return;
     }
+    const recoveryAction = updateP2pScreenLiveness();
+    if (recoveryAction === "replace") return;
     try {
       const previousVideoSnapshot = inboundSnapshot;
       const previousAudioSnapshot = inboundAudioSnapshot;
@@ -3346,7 +3942,6 @@ export async function openChannelSession(
       ) {
         viewerPresentationProgressAt = Date.now();
       }
-      const recoveryAction = monitorViewerMediaLiveness("screen");
       const diagnosticNow = Date.now();
       if (
         recoveryAction !== "none" ||
@@ -3373,7 +3968,6 @@ export async function openChannelSession(
           transportIdleMs: diagnosticNow - viewerTransportProgressAt,
         });
       }
-      if (recoveryAction === "replace") return;
       const liveAudioTrack = remoteStream
         .getAudioTracks()
         .find((track) => track.readyState === "live");
@@ -3555,8 +4149,10 @@ export async function openChannelSession(
           }
         }
       }
-    } catch {
-      // Stats are advisory and must never interrupt playback.
+    } catch (error) {
+      // The stats timer owns advisory failure accounting. Propagating this
+      // error only lowers telemetry confidence; it never enters recovery.
+      throw error;
     }
   }
 
@@ -3831,8 +4427,38 @@ export async function openChannelSession(
             retryWatching("P2P 已连接但尚无视频帧，正在重启发送编码器");
           }
         })
-        .catch(() => {
-          retryWatching("尚未收到视频首帧，正在切换兼容编码");
+        .catch((error) => {
+          if (watcherPc !== peer || remoteFirstFrame) return;
+          reportPlaybackDiagnostic("first-frame-stats-missing", {
+            connectionState: peer.connectionState,
+            iceConnectionState: peer.iceConnectionState,
+            waitedMs: watchAttempts === 1 ? 25_000 : 15_000,
+            message: error instanceof Error ? error.message : String(error),
+          });
+          const now = Date.now();
+          if (
+            firstFrameRepairStartedAt > 0 &&
+            now - firstFrameRepairStartedAt >= 12_000
+          ) {
+            // Rebuild because an independently observed first-frame deadline
+            // remained broken after ICE repair, never because getStats failed.
+            retryWatching(
+              "ICE 修复后仍未收到视频首帧，正在重建兼容媒体连接",
+            );
+            return;
+          }
+          firstFrameRepairStartedAt = now;
+          try {
+            safeSignalSend({
+              type: "media:ice-restart",
+              attempt: Math.max(1, watchAttempts),
+              sessionId: watchSessionId,
+            });
+          } catch {
+            // The next deadline can replace the connection if media stays idle.
+          }
+          setStatus("首帧仍未到达 · 正在修复 ICE 链路", "neutral");
+          armWatchRetry();
         });
     }, watchAttempts === 1 ? 25_000 : 15_000);
   }
@@ -4008,6 +4634,59 @@ export async function openChannelSession(
     return requested || undefined;
   }
 
+  function currentSfuScreenPreference(): {
+    width?: number;
+    height?: number;
+    frameRate?: number;
+    sourceWidth?: number;
+    sourceHeight?: number;
+  } {
+    const capabilities = broadcastCapabilities;
+    if (!capabilities || capabilities.mode === "emby") return {};
+    const sfuSourceScale = Math.min(
+      1,
+      2_560 / capabilities.width,
+      1_440 / capabilities.height,
+    );
+    const sfuSourceWidth = Math.max(
+      1,
+      Math.round(capabilities.width * sfuSourceScale),
+    );
+    const sfuSourceHeight = Math.max(
+      1,
+      Math.round(capabilities.height * sfuSourceScale),
+    );
+    const height = Math.max(
+      1,
+      Math.min(
+        adaptivePlayback.requestedHeight || capabilities.height,
+        sfuSourceHeight,
+      ),
+    );
+    const width = Math.max(
+      1,
+      Math.min(
+        sfuSourceWidth,
+        Math.round((height * sfuSourceWidth) / sfuSourceHeight),
+      ),
+    );
+    return {
+      width,
+      height,
+      frameRate: Math.max(
+        1,
+        Math.min(
+          preferredFrameRate ||
+            adaptivePlayback.requestedFrameRate ||
+            capabilities.frameRate,
+          Math.min(capabilities.frameRate, 30),
+        ),
+      ),
+      sourceWidth: sfuSourceWidth,
+      sourceHeight: sfuSourceHeight,
+    };
+  }
+
   function sendViewerQualityPreference(showFeedback = false): void {
     if (
       !signal ||
@@ -4021,10 +4700,38 @@ export async function openChannelSession(
       ? effectiveEmbyViewerHeight()
       : adaptivePlayback.requestedHeight;
     if (
+      embyMode &&
+      signalFeatures.has("emby-segment-relay-v1")
+    ) {
+      embyAbrViewer?.setPreferredHeight(requestedHeight);
+      if (showFeedback) {
+        notify(
+          `已仅为当前设备设置 Emby ABR 上限：${
+            requestedHeight ? `${requestedHeight}p` : "自动原画"
+          }`,
+        );
+      }
+      return;
+    }
+    if (!embyMode && sfuViewerActive) {
+      const updated = sfuSession.setScreenSubscriptionPreference(
+        currentSfuScreenPreference(),
+      );
+      if (updated && showFeedback) {
+        const preference = currentSfuScreenPreference();
+        notify(
+          `已仅为当前设备切换 SFU 订阅层：${preference.height || "原画"}p / ${preference.frameRate || "原"} 帧`,
+        );
+      }
+      return;
+    }
+    if (
       !safeSignalSend({
         type: "quality:request",
         height: requestedHeight,
-        frameRate: preferredFrameRate || undefined,
+        frameRate:
+          preferredFrameRate ||
+          (!embyMode ? adaptivePlayback.requestedFrameRate : undefined),
       })
     ) {
       return;
@@ -4033,10 +4740,10 @@ export async function openChannelSession(
       notify(
         preferredHeight || preferredFrameRate
           ? embyMode
-            ? "已请求放映端统一切换 Emby 共享画质"
+            ? "已请求兼容共享流切换画质"
             : "已把自动画质上限调整为你的选择"
           : embyMode
-            ? "已请求恢复放映端的 Emby 共享画质"
+            ? "已请求恢复兼容共享流画质"
             : "已恢复自动原画与放映端原帧率",
       );
     }
@@ -4200,6 +4907,42 @@ export async function openChannelSession(
     return sfuSession.connect(sfuAccess, iceServers);
   }
 
+  function clearSfuStabilityTimer(closeRetained = false): void {
+    if (sfuStabilityTimer !== undefined) {
+      window.clearTimeout(sfuStabilityTimer);
+      sfuStabilityTimer = undefined;
+    }
+    if (closeRetained) {
+      retainedWatcherPc?.close();
+      retainedWatcherPc = undefined;
+      retainedRemoteStream?.getTracks().forEach((track) => track.stop());
+      retainedRemoteStream = undefined;
+    }
+  }
+
+  function scheduleStableSfuCommit(): void {
+    if (!retainedWatcherPc || sfuStabilityTimer !== undefined) return;
+    sfuStabilityTimer = window.setTimeout(() => {
+      sfuStabilityTimer = undefined;
+      if (
+        sfuViewerActive &&
+        remoteFirstFrame &&
+        Date.now() - viewerPresentationProgressAt < 2_500
+      ) {
+        const previousPeer = retainedWatcherPc;
+        clearSfuStabilityTimer(true);
+        reportPlaybackDiagnostic("sfu-make-before-break-committed", {
+          stabilizationMs: 7_000,
+          previousState: previousPeer?.connectionState,
+        });
+        return;
+      }
+      if (sfuViewerActive && retainedWatcherPc && !leaving) {
+        scheduleStableSfuCommit();
+      }
+    }, 7_000);
+  }
+
   function prepareSfuViewerSwitch(nextStream?: MediaStream): void {
     clearWatchRetry();
     clearDisconnectGrace();
@@ -4207,7 +4950,19 @@ export async function openChannelSession(
       video.cancelVideoFrameCallback(videoFrameCallbackId);
       videoFrameCallbackId = undefined;
     }
-    watcherPc?.close();
+    const previousWatcher = watcherPc;
+    const keepP2PUntilStable = Boolean(
+      nextStream &&
+        previousWatcher &&
+        remoteFirstFrame &&
+        !["failed", "closed"].includes(previousWatcher.connectionState),
+    );
+    clearSfuStabilityTimer(true);
+    if (keepP2PUntilStable) {
+      retainedWatcherPc = previousWatcher;
+    } else {
+      previousWatcher?.close();
+    }
     watcherPc = undefined;
     watcherRelayOnly = false;
     watcherCandidates = [];
@@ -4216,8 +4971,7 @@ export async function openChannelSession(
     watchRecoveryCycles = 0;
     watchSessionId = "";
     const preserveLastFrame = Boolean(
-      nextStream &&
-        remoteFirstFrame &&
+      keepP2PUntilStable &&
         video &&
         !video.hidden &&
         video.srcObject === remoteStream,
@@ -4232,6 +4986,8 @@ export async function openChannelSession(
       retainedRemoteStream = undefined;
     }
     remoteStream = nextStream || new MediaStream();
+    embyAbrViewer?.destroy();
+    embyAbrViewer = undefined;
     embyViewer?.destroy();
     embyViewer = undefined;
     embyBufferedAhead = 0;
@@ -4239,7 +4995,117 @@ export async function openChannelSession(
     embyStartupLastBufferAhead = 0;
     remoteFirstFrame = false;
     sfuScreenFrameSnapshot = undefined;
+    sfuScreenReceiverSnapshot = undefined;
     resetViewerMediaLiveness();
+  }
+
+  function requestSegmentRelayTokenRefresh(): void {
+    const now = Date.now();
+    if (
+      !signal ||
+      now - lastSegmentRelayRefreshRequestAt < 30_000
+    ) {
+      return;
+    }
+    lastSegmentRelayRefreshRequestAt = now;
+    safeSignalSend({ type: "segment:token-refresh" });
+  }
+
+  function scheduleSegmentRelayTokenRefresh(): void {
+    if (segmentRelayRefreshTimer !== undefined) {
+      window.clearTimeout(segmentRelayRefreshTimer);
+      segmentRelayRefreshTimer = undefined;
+    }
+    if (!segmentRelayAccess) return;
+    const delay = Math.max(
+      5_000,
+      segmentRelayAccess.expiresAt - Date.now() - 2 * 60_000,
+    );
+    segmentRelayRefreshTimer = window.setTimeout(() => {
+      segmentRelayRefreshTimer = undefined;
+      requestSegmentRelayTokenRefresh();
+    }, Math.min(delay, 2_147_000_000));
+  }
+
+  function updateSegmentRelayAccess(
+    value: SegmentRelayAccess | undefined,
+  ): void {
+    const next = sanitizeSegmentRelayAccess(value);
+    if (!next) return;
+    segmentRelayAccess = next;
+    scheduleSegmentRelayTokenRefresh();
+    embyAbrViewer?.updateAccess(next);
+    if (next.scope === "publish") {
+      embyBroadcast?.setSegmentRelayAccess(signalUrl, next);
+    }
+  }
+
+  function attachSegmentRelayViewer(
+    player: EmbyMsePlayer,
+    isActive: () => boolean,
+  ): void {
+    let observedAbrMediaProgress = 0;
+    player.addEventListener("segmentrelay", (event) => {
+      if (
+        !isActive() ||
+        !segmentRelayAccess ||
+        !signalFeatures.has("emby-segment-relay-v1")
+      ) {
+        return;
+      }
+      const detail = (
+        event as CustomEvent<{
+          session: NonNullable<EmbyMsePlayer["activeSession"]>;
+          descriptor: {
+            protocol: "synced-cmaf-v1";
+            assetId: string;
+            mediaVersion: number;
+            manifestPath: string;
+          };
+        }>
+      ).detail;
+      player.enableExternalSegmentTransport();
+      embyAbrViewer?.destroy();
+      const abr = new EmbyAbrSegmentClient({
+        player,
+        signalUrl,
+        access: segmentRelayAccess,
+        onTokenExpiring: requestSegmentRelayTokenRefresh,
+        onDiagnostic: (diagnostics) => {
+          if (!isActive() || embyAbrViewer !== abr) return;
+          const mediaProgress =
+            diagnostics.appendedSegments +
+            diagnostics.cacheHits +
+            diagnostics.networkFetches;
+          if (mediaProgress > observedAbrMediaProgress) {
+            observedAbrMediaProgress = mediaProgress;
+            viewerTransportProgressAt = Date.now();
+          }
+          if (diagnostics.lastError) {
+            reportPlaybackDiagnostic("emby-segment-abr-error", {
+              renditionId: diagnostics.renditionId,
+              message: diagnostics.lastError,
+              fetchGeneration: diagnostics.fetchGeneration,
+              rangeRetries: diagnostics.rangeRetries,
+            });
+          }
+          if (diagnostics.renditionId) {
+            setMediaStatus(
+              `${broadcasterNickname || "朋友"}正在 Emby 高清放映 · ` +
+                `HTTPS 独立 ABR ${diagnostics.renditionLabel || diagnostics.renditionId} · ` +
+                `缓冲 ${embyBufferedAhead.toFixed(1)} 秒`,
+            );
+          }
+        },
+      });
+      embyAbrViewer = abr;
+      abr.setPreferredHeight(effectiveEmbyViewerHeight());
+      abr.start(detail.session, detail.descriptor);
+      reportPlaybackDiagnostic("emby-segment-abr-started", {
+        assetId: detail.descriptor.assetId,
+        mediaVersion: detail.descriptor.mediaVersion,
+      });
+    });
   }
 
   function attachSfuEmbyViewer(
@@ -4262,6 +5128,7 @@ export async function openChannelSession(
     video.autoplay = true;
     video.playsInline = true;
     const active = () => sfuViewerActive && embyViewer === player;
+    attachSegmentRelayViewer(player, active);
     player.addEventListener("session", (event) => {
       if (!active()) return;
       const detail = (
@@ -4393,7 +5260,14 @@ export async function openChannelSession(
         return false;
       }
       if (broadcastCapabilities.mode === "emby") {
-        const channels = await sfuSession.watchEmby(expectedBroadcasterId);
+        const controlOnly =
+          signalFeatures.has("emby-segment-relay-v1") &&
+          Boolean(segmentRelayAccess);
+        const channels = await sfuSession.watchEmby(
+          expectedBroadcasterId,
+          10_000,
+          controlOnly,
+        );
         if (
           watchEpoch !== sfuWatchEpoch ||
           broadcasterId !== expectedBroadcasterId ||
@@ -4413,7 +5287,10 @@ export async function openChannelSession(
         );
         showWaitingStage("SFU 已连接，正在接收 Emby 编码片段…");
       } else {
-        const stream = await sfuSession.watchScreen(expectedBroadcasterId);
+        const stream = await sfuSession.watchScreen(
+          expectedBroadcasterId,
+          currentSfuScreenPreference(),
+        );
         if (
           watchEpoch !== sfuWatchEpoch ||
           broadcasterId !== expectedBroadcasterId ||
@@ -4473,10 +5350,44 @@ export async function openChannelSession(
 
   async function fallbackFromSfu(reason: string): Promise<void> {
     if (!sfuViewerActive || leaving) return;
+    const warmFallbackPeer = retainedWatcherPc;
+    const warmFallbackStream = retainedRemoteStream;
+    const canWarmFallback = Boolean(
+      broadcastCapabilities?.mode !== "emby" &&
+        warmFallbackPeer &&
+        warmFallbackStream?.getVideoTracks().some(
+          (track) => track.readyState === "live",
+        ) &&
+        !["failed", "closed"].includes(
+          warmFallbackPeer!.connectionState,
+        ),
+    );
     sfuFailedBroadcastKey = currentSfuBroadcastKey();
     sfuViewerActive = false;
     reportSfuStatus("viewer", false);
     await sfuSession.stopWatching().catch(() => undefined);
+    if (canWarmFallback && warmFallbackPeer && warmFallbackStream) {
+      clearSfuStabilityTimer();
+      retainedWatcherPc = undefined;
+      retainedRemoteStream = undefined;
+      remoteStream.getTracks().forEach((track) => track.stop());
+      remoteStream = warmFallbackStream;
+      watcherPc = warmFallbackPeer;
+      remoteFirstFrame = true;
+      resetViewerMediaLiveness();
+      attachRemoteStream(warmFallbackPeer);
+      setStatus(`${reason} · P2P 热备用已接管`, "neutral");
+      reportPlaybackDiagnostic("sfu-warm-p2p-fallback", {
+        reason,
+        broadcasterId,
+        peerState: warmFallbackPeer.connectionState,
+      });
+      scheduleSfuPrimaryRecovery("runtime SFU viewer fallback");
+      return;
+    }
+    clearSfuStabilityTimer(true);
+    embyAbrViewer?.destroy();
+    embyAbrViewer = undefined;
     embyViewer?.destroy();
     embyViewer = undefined;
     watchAttempts = 0;
@@ -4568,7 +5479,9 @@ export async function openChannelSession(
         if (!expectedEmbyController) {
           throw new Error("Emby broadcast is unavailable");
         }
-        const channels = await sfuSession.publishEmby();
+        const channels = await sfuSession.publishEmby({
+          controlOnly: expectedEmbyController.segmentRelayActive,
+        });
         if (!stillCurrent()) {
           await sfuSession.stopPublishing().catch(() => undefined);
           return false;
@@ -4585,6 +5498,7 @@ export async function openChannelSession(
         await sfuSession.publishScreen(expectedStream, {
           maxBitrate: expectedPreset.maxBitrate,
           frameRate: expectedPreset.frameRate,
+          contentMode: screenContentMode,
         });
       }
       if (!stillCurrent()) {
@@ -4741,6 +5655,8 @@ export async function openChannelSession(
         remoteStream.getTracks().forEach((track) => track.stop());
       }
       remoteStream = new MediaStream();
+      embyAbrViewer?.destroy();
+      embyAbrViewer = undefined;
       embyViewer?.destroy();
       embyViewer = undefined;
       embyBufferedAhead = 0;
@@ -4768,6 +5684,10 @@ export async function openChannelSession(
               maxBufferSeconds: nativeAndroid ? 48 : 72,
             });
             embyViewer = player;
+            attachSegmentRelayViewer(
+              player,
+              () => watcherPc === peer && embyViewer === player,
+            );
             if (video) {
               video.muted = !soundEnabled;
               video.volume = movieVolume;
@@ -5151,16 +6071,22 @@ export async function openChannelSession(
       autoSoundRetryTimer = undefined;
     }
     viewerStatsTimer = undefined;
+    viewerStatsEpoch += 1;
     viewerStatsPollRunning = false;
+    viewerStatsOutstanding = 0;
+    viewerStatsFailures = 0;
     clearViewerAudioTrackTimer();
     viewerAudioMissing = false;
     inboundSnapshot = undefined;
     inboundAudioSnapshot = undefined;
+    p2pScreenFrameSnapshot = undefined;
     sfuScreenFrameSnapshot = undefined;
+    sfuScreenReceiverSnapshot = undefined;
     viewerAudioStalledSamples = 0;
     viewerAudioEverReceived = false;
     embyDataSnapshot = undefined;
     embyFrameSnapshot = undefined;
+    embyLivenessFrameSnapshot = undefined;
     embyBufferedAhead = 0;
     embyStartupBufferProgressAt = 0;
     embyStartupLastBufferAhead = 0;
@@ -5169,12 +6095,16 @@ export async function openChannelSession(
     viewerTransportProgressAt = 0;
     viewerPresentationProgressAt = 0;
     viewerRecoveryStartedAt = 0;
+    firstFrameRepairStartedAt = 0;
     embyLastPlaybackTime = 0;
     viewerBandwidthWarningShown = false;
+    embyAbrViewer?.destroy();
+    embyAbrViewer = undefined;
     embyViewer?.destroy();
     embyViewer = undefined;
     watcherPc?.close();
     watcherPc = undefined;
+    clearSfuStabilityTimer(true);
     watcherRelayOnly = false;
     watcherCandidates = [];
     pendingWatcherSignals = [];
@@ -5237,6 +6167,7 @@ export async function openChannelSession(
     if (peer) {
       outboundPeers.delete(viewerId);
       peer.pc.close();
+      rebalanceScreenP2pFallbackBudgets();
     }
     failedVideoCodecsByViewer.delete(viewerId);
     receiverPreferences.delete(viewerId);
@@ -5273,20 +6204,54 @@ export async function openChannelSession(
     ) {
       return;
     }
+    const requestedPreference = receiverPreferences.get(viewerId) || {};
     const applied = await boundedRtcOperation(
       applyReceiverPreference(
         peer.pc,
         activePreset,
-        receiverPreferences.get(viewerId) || {},
         {
-          videoBitrateCeiling: peer.bitrateRamp.currentBitrate,
+          ...requestedPreference,
+          height: Math.min(
+            requestedPreference.height || activePreset.height,
+            peer.fallbackHeightCeiling || activePreset.height,
+          ),
+        },
+        {
+          videoBitrateCeiling: Math.min(
+            peer.bitrateRamp.currentBitrate,
+            peer.fallbackBitrateCeiling || Number.POSITIVE_INFINITY,
+          ),
           degradationPreference: peer.degradationPreference,
         },
       ),
       `更新观看端 ${viewerId} 的发送参数超时`,
     );
     if (applied && outboundPeers.get(viewerId) === peer) {
-      peer.bitrateRamp.setTarget(applied.targetBitrate);
+      peer.bitrateRamp.setTarget(
+        Math.min(
+          applied.targetBitrate,
+          peer.fallbackBitrateCeiling || Number.POSITIVE_INFINITY,
+        ),
+      );
+    }
+  }
+
+  function rebalanceScreenP2pFallbackBudgets(): void {
+    const screenPeers = [...outboundPeers.entries()].filter(
+      ([, peer]) => peer.mode === "screen",
+    );
+    for (const [index, [viewerId, peer]] of screenPeers.entries()) {
+      const budget =
+        SCREEN_P2P_FALLBACK_BUDGETS[
+          Math.min(index, SCREEN_P2P_FALLBACK_BUDGETS.length - 1)
+        ];
+      const changed =
+        peer.fallbackBitrateCeiling !== budget.bitrate ||
+        peer.fallbackHeightCeiling !== budget.height;
+      peer.fallbackBitrateCeiling = budget.bitrate;
+      peer.fallbackHeightCeiling = budget.height;
+      peer.bitrateRamp?.setTarget(budget.bitrate);
+      if (changed) void applyOutboundPreference(viewerId, peer);
     }
   }
 
@@ -5305,6 +6270,27 @@ export async function openChannelSession(
       (!embyMode && (!mediaStream || !activePreset))
     ) {
       return;
+    }
+    if (!embyMode) {
+      const existingScreenFallbacks = [...outboundPeers.entries()].filter(
+        ([id, peer]) => id !== viewerId && peer.mode === "screen",
+      ).length;
+      if (existingScreenFallbacks >= MAX_SCREEN_P2P_FALLBACK_VIEWERS) {
+        window.roomDesktop?.reportDiagnostic("p2p-fallback-budget-rejected", {
+          viewerId,
+          activeFallbacks: existingScreenFallbacks,
+          maximumFallbacks: MAX_SCREEN_P2P_FALLBACK_VIEWERS,
+          totalBudgetBps: SCREEN_P2P_FALLBACK_BUDGETS.reduce(
+            (sum, budget) => sum + budget.bitrate,
+            0,
+          ),
+        });
+        notify(
+          `${participants.get(viewerId)?.nickname || "一位观众"}未建立 P2P 备用链路：回退上行预算已满`,
+          "warn",
+        );
+        return;
+      }
     }
     window.roomDesktop?.reportDiagnostic("p2p-offer-start", {
       viewerId,
@@ -5326,6 +6312,14 @@ export async function openChannelSession(
     const codecOrder = embyMode
       ? []
       : codecOrderForAttempt(viewerId, attempt, supportedCodecs);
+    const fallbackBudget = embyMode
+      ? undefined
+      : SCREEN_P2P_FALLBACK_BUDGETS[
+          [...outboundPeers.entries()].filter(
+            ([id, candidate]) =>
+              id !== viewerId && candidate.mode === "screen",
+          ).length
+        ];
     const peer: OutboundPeer = {
       pc: createPeerConnection(
         iceServers,
@@ -5347,12 +6341,18 @@ export async function openChannelSession(
       candidates: [],
       bitrateRamp: activePreset
         ? new VideoBitrateRampController(
-            activePreset.maxBitrate,
-            networkAdvice.routeMode === "relay-preferred"
-              ? 2_000_000
-              : networkAdvice.routeMode === "p2p-preferred"
-                ? 4_000_000
-                : 3_000_000,
+            Math.min(
+              activePreset.maxBitrate,
+              fallbackBudget?.bitrate || activePreset.maxBitrate,
+            ),
+            Math.min(
+              fallbackBudget?.bitrate || Number.POSITIVE_INFINITY,
+              networkAdvice.routeMode === "relay-preferred"
+                ? 2_000_000
+                : networkAdvice.routeMode === "p2p-preferred"
+                  ? 4_000_000
+                  : 3_000_000,
+            ),
             3,
           )
         : undefined,
@@ -5360,11 +6360,21 @@ export async function openChannelSession(
       sessionId,
       mediaReady: false,
       mode: embyMode ? "emby" : "screen",
-      degradationPreference: "maintain-resolution",
+      degradationPreference:
+        screenContentMode === "motion"
+          ? "maintain-framerate"
+          : screenContentMode === "detail"
+            ? "maintain-resolution"
+            : "balanced",
       cpuLimitedSamples: 0,
       cpuStableSamples: 0,
+      statsFailureSamples: 0,
+      statsConfidence: "high",
+      fallbackBitrateCeiling: fallbackBudget?.bitrate,
+      fallbackHeightCeiling: fallbackBudget?.height,
     };
     outboundPeers.set(viewerId, peer);
+    if (!embyMode) rebalanceScreenP2pFallbackBudgets();
     const peerIsCurrent = (): boolean =>
       outboundPeers.get(viewerId) === peer &&
       broadcasterId === selfId &&
@@ -5407,7 +6417,10 @@ export async function openChannelSession(
       preferVideoCodecs(peer.pc, codecOrder);
       await boundedRtcOperation(
         tuneSenders(peer.pc, activePreset!, {
-          videoBitrateCeiling: peer.bitrateRamp!.currentBitrate,
+          videoBitrateCeiling: Math.min(
+            peer.bitrateRamp!.currentBitrate,
+            peer.fallbackBitrateCeiling || Number.POSITIVE_INFINITY,
+          ),
           degradationPreference: peer.degradationPreference,
         }),
         `配置观看端 ${viewerId} 的发送轨超时`,
@@ -5429,6 +6442,7 @@ export async function openChannelSession(
       ) {
         embyBroadcast?.detachViewer(viewerId);
         outboundPeers.delete(viewerId);
+        rebalanceScreenP2pFallbackBudgets();
       }
     });
     // TIAS describes the negotiated session maximum. The sender's live
@@ -5484,6 +6498,7 @@ export async function openChannelSession(
       if (!peerIsCurrent()) return;
       embyBroadcast?.detachViewer(viewerId);
       outboundPeers.delete(viewerId);
+      rebalanceScreenP2pFallbackBudgets();
       peer.pc.close();
       throw error;
     }
@@ -5613,7 +6628,10 @@ export async function openChannelSession(
         // is instantiated; this also forces a fresh keyframe for the viewer.
         await boundedRtcOperation(
           tuneSenders(peer.pc, activePreset, {
-            videoBitrateCeiling: peer.bitrateRamp.currentBitrate,
+            videoBitrateCeiling: Math.min(
+              peer.bitrateRamp.currentBitrate,
+              peer.fallbackBitrateCeiling || Number.POSITIVE_INFINITY,
+            ),
             degradationPreference: peer.degradationPreference,
           }),
           `协商后更新观看端 ${viewerId} 的发送轨超时`,
@@ -5678,14 +6696,32 @@ export async function openChannelSession(
             `读取观看端 ${viewerId} 的 WebRTC 统计超时`,
             RTC_STATS_TIMEOUT_MS,
           );
-        } catch {
+        } catch (error) {
           if (outboundPeers.get(viewerId) === peer) {
-            outboundPeers.delete(viewerId);
-            peer.pc.close();
+            peer.statsFailureSamples += 1;
+            peer.statsConfidence =
+              peer.statsFailureSamples >= 5 ? "missing" : "reduced";
+            if (
+              peer.statsFailureSamples === 3 ||
+              peer.statsFailureSamples === 5
+            ) {
+              reportPlaybackDiagnostic("outbound-stats-missing", {
+                viewerId,
+                consecutiveFailures: peer.statsFailureSamples,
+                confidence: peer.statsConfidence,
+                connectionState: peer.pc.connectionState,
+                iceConnectionState: peer.pc.iceConnectionState,
+                mediaReady: peer.mediaReady,
+                message:
+                  error instanceof Error ? error.message : String(error),
+              });
+            }
           }
           return undefined;
         }
         if (outboundPeers.get(viewerId) !== peer) return undefined;
+        peer.statsFailureSamples = 0;
+        peer.statsConfidence = "high";
         peer.snapshot = stats.snapshot;
         const negotiatedCodec = normalizeVideoCodecMime(stats.codec);
         if (negotiatedCodec) peer.negotiatedVideoCodec = negotiatedCodec;
@@ -6004,6 +7040,7 @@ export async function openChannelSession(
           Math.round(Number(settings.frameRate) || preset.frameRate),
         ),
       ),
+      contentMode: screenContentMode,
     };
   }
 
@@ -6028,7 +7065,8 @@ export async function openChannelSession(
         !broadcastCapabilities ||
         next.width !== broadcastCapabilities.width ||
         next.height !== broadcastCapabilities.height ||
-        next.frameRate !== broadcastCapabilities.frameRate;
+        next.frameRate !== broadcastCapabilities.frameRate ||
+        next.contentMode !== broadcastCapabilities.contentMode;
       if (!changed) return;
       setBroadcastCapabilities(next);
       try {
@@ -6080,6 +7118,15 @@ export async function openChannelSession(
     });
   }
 
+  function applyScreenContentHint(track: MediaStreamTrack): void {
+    track.contentHint =
+      screenContentMode === "detail"
+        ? "detail"
+        : screenContentMode === "motion"
+          ? "motion"
+          : "";
+  }
+
   async function captureSelectedWindow(
     sourceId: string,
     preset: QualityPreset,
@@ -6116,7 +7163,7 @@ export async function openChannelSession(
       );
       const track = stream.getVideoTracks()[0];
       if (track) {
-        track.contentHint = "detail";
+        applyScreenContentHint(track);
         await track
           .applyConstraints({
             width: { ideal: preset.width, max: preset.width },
@@ -6221,7 +7268,7 @@ export async function openChannelSession(
     track: MediaStreamTrack,
     epoch: number,
   ): void {
-    track.contentHint = "detail";
+    applyScreenContentHint(track);
     track.addEventListener("ended", () => {
       if (
         epoch === captureVideoEpoch &&
@@ -6305,7 +7352,7 @@ export async function openChannelSession(
         replacementStream.getTracks().forEach((track) => track.stop());
         return;
       }
-      replacementTrack.contentHint = "detail";
+      applyScreenContentHint(replacementTrack);
       // captureSelectedWindow may have recreated this track at a safe exact
       // width (for example 3616 rather than 3618). Reapplying broad preset
       // constraints here would relax that guard and let WGC expose padded
@@ -7022,6 +8069,14 @@ export async function openChannelSession(
         button.classList.toggle(
           "active",
           Number(button.dataset.sessionFrameRate) === frameRate,
+        );
+      });
+    document
+      .querySelectorAll<HTMLButtonElement>("[data-screen-content-mode]")
+      .forEach((button) => {
+        button.classList.toggle(
+          "active",
+          button.dataset.screenContentMode === screenContentMode,
         );
       });
     const summary = document.querySelector<HTMLElement>(
@@ -9088,6 +10143,7 @@ export async function openChannelSession(
     preference: { height?: number; frameRate?: number },
   ): void {
     receiverPreferences.set(viewerId, preference);
+    if (embyBroadcast?.segmentRelayActive) return;
     if (embyViewerPreferenceTimer !== undefined) {
       window.clearTimeout(embyViewerPreferenceTimer);
     }
@@ -9643,6 +10699,12 @@ export async function openChannelSession(
         onNetworkPressure: handleEmbyNetworkPressure,
       });
       embyBroadcast = controller;
+      if (
+        signalFeatures.has("emby-segment-relay-v1") &&
+        segmentRelayAccess?.scope === "publish"
+      ) {
+        controller.setSegmentRelayAccess(signalUrl, segmentRelayAccess);
+      }
       const stream = await controller.start(
         request,
         embyItemLabel(embySelectedItem),
@@ -10016,6 +11078,7 @@ export async function openChannelSession(
     localStorage.setItem("synced:fullscreen-fit", fullscreenFit);
     updateFullscreenFitUi();
     void resolveFullscreenFit();
+    videoEnhancement?.refresh();
   }
 
   function closeCommandPalette(): void {
@@ -10289,7 +11352,14 @@ export async function openChannelSession(
     }
   }
 
-  async function handleMessage(message: SignalEnvelope): Promise<void> {
+  async function handleMessage(
+    message: SignalEnvelope,
+    operationSignal?: AbortSignal,
+  ): Promise<void> {
+    operationSignal?.throwIfAborted();
+    const ensureScheduledOperationActive = (): void => {
+      operationSignal?.throwIfAborted();
+    };
     if (leaving) return;
     if (message.type === "server:hello") {
       const advertised = Array.isArray(message.networkProbe?.versions)
@@ -10331,6 +11401,10 @@ export async function openChannelSession(
         }
       }
       companion?.updateIceServers(iceServers);
+      return;
+    }
+    if (message.type === "segment:token") {
+      updateSegmentRelayAccess(message.segmentRelay);
       return;
     }
     if (message.type === "channel:joined" && message.clientId) {
@@ -10402,6 +11476,13 @@ export async function openChannelSession(
               .filter((feature) => /^[a-z][a-z0-9-]{0,63}$/i.test(feature))
           : [],
       );
+      if (signalFeatures.has("emby-segment-relay-v1")) {
+        updateSegmentRelayAccess(message.segmentRelay);
+      } else {
+        segmentRelayAccess = undefined;
+        embyAbrViewer?.destroy();
+        embyAbrViewer = undefined;
+      }
       reportedSfuPublisherActive = undefined;
       reportedSfuViewerActive = undefined;
       setSignalStatus("connected", rejoined ? "已重连" : "已连接");
@@ -10415,6 +11496,7 @@ export async function openChannelSession(
         if (!preserveCompanion) {
           await musicController?.stop(false);
           await companion?.destroy();
+          ensureScheduledOperationActive();
           companion = undefined;
         }
       }
@@ -10546,6 +11628,7 @@ export async function openChannelSession(
             3_000,
             "读取桌面网络信息超时",
           );
+          ensureScheduledOperationActive();
           localDirectAddresses = network.lanAddresses;
           desktopNetworkSignature = JSON.stringify({
             addresses: [...network.lanAddresses].sort(),
@@ -10556,6 +11639,7 @@ export async function openChannelSession(
         }
       } else {
         localDirectAddresses = await getNativeLocalAddresses();
+        ensureScheduledOperationActive();
       }
       if (refreshOutboundPeers && broadcasterId === selfId) {
         for (const [viewerId, peer] of [...outboundPeers]) {
@@ -10566,6 +11650,7 @@ export async function openChannelSession(
             peer.sessionId,
             participants.get(viewerId)?.embyCapabilities,
           );
+          ensureScheduledOperationActive();
         }
       }
       updateBroadcastControls();
@@ -10596,6 +11681,7 @@ export async function openChannelSession(
             scheduleSignalReconnect(true);
           }
           await publishBroadcastToSfu();
+          ensureScheduledOperationActive();
         } else {
           setStatus("频道已恢复 · 正在恢复放映", "neutral");
           if (!safeSignalSend({
@@ -10608,18 +11694,23 @@ export async function openChannelSession(
         }
       } else if (broadcasterId && broadcasterId !== selfId) {
         resumeBroadcastAfterReconnect = false;
-        if (mediaStream || embyBroadcast) await cleanupLocalBroadcast();
+        if (mediaStream || embyBroadcast) {
+          await cleanupLocalBroadcast();
+          ensureScheduledOperationActive();
+        }
         if (preserveWatcher) {
           showRemoteStage();
           if (refreshWatcherInBackground) {
             setStatus("网络已切换 · 正在后台更新直连路径", "neutral");
             await beginWatching(true);
+            ensureScheduledOperationActive();
           } else {
             setStatus("服务器已恢复 · 画面继续播放", "ready");
             sendViewerQualityPreference(false);
           }
         } else {
           await beginWatching(true);
+          ensureScheduledOperationActive();
         }
       } else {
         resumeBroadcastAfterReconnect = false;
@@ -10717,9 +11808,11 @@ export async function openChannelSession(
     }
     if (companion) {
       await companion.handle(message);
+      ensureScheduledOperationActive();
     }
 
     if (message.type === "broadcast:granted" && message.broadcasterId === selfId) {
+      updateSegmentRelayAccess(message.segmentRelay);
       awaitingBroadcastGrant = false;
       broadcasterId = selfId;
       broadcasterNickname = nickname;
@@ -10761,6 +11854,7 @@ export async function openChannelSession(
           : window.setInterval(updateOutboundStats, 1_000);
       clearSfuPrimaryRecovery();
       await publishBroadcastToSfu();
+      ensureScheduledOperationActive();
       return;
     }
     if (message.type === "broadcast:started" && message.broadcasterId) {
@@ -10782,6 +11876,7 @@ export async function openChannelSession(
         return;
       }
       await cleanupLocalBroadcast();
+      ensureScheduledOperationActive();
       broadcasterId = message.broadcasterId;
       broadcasterNickname = message.nickname || "朋友";
       clearSfuPrimaryRecovery();
@@ -10791,6 +11886,7 @@ export async function openChannelSession(
       syncDesktopDanmaku();
       updateBroadcastControls();
       await beginWatching(true);
+      ensureScheduledOperationActive();
       return;
     }
     if (
@@ -10805,7 +11901,10 @@ export async function openChannelSession(
     if (message.type === "broadcast:stopped") {
       const wasSelf = broadcasterId === selfId;
       closeWatcher();
-      if (wasSelf) await cleanupLocalBroadcast();
+      if (wasSelf) {
+        await cleanupLocalBroadcast();
+        ensureScheduledOperationActive();
+      }
       broadcasterId = undefined;
       broadcasterNickname = "";
       sfuFailedBroadcastKey = "";
@@ -10834,6 +11933,7 @@ export async function openChannelSession(
           message.sessionId,
           message.embyCapabilities,
         );
+        ensureScheduledOperationActive();
       }
       return;
     }
@@ -10848,7 +11948,12 @@ export async function openChannelSession(
         peer.mediaReady = true;
         if (!peer.negotiatedVideoCodec && peer.mode === "screen") {
           try {
-            const stats = await readOutboundVideoStats(peer.pc, peer.snapshot);
+            const stats = await boundedRtcOperation(
+              readOutboundVideoStats(peer.pc, peer.snapshot),
+              `读取观看端 ${message.viewerId} 就绪统计超时`,
+              RTC_STATS_TIMEOUT_MS,
+            );
+            ensureScheduledOperationActive();
             if (outboundPeers.get(message.viewerId) !== peer) return;
             peer.snapshot = stats.snapshot;
             peer.negotiatedVideoCodec = normalizeVideoCodecMime(stats.codec);
@@ -10929,6 +12034,7 @@ export async function openChannelSession(
           [],
           peer.sessionId,
         );
+        ensureScheduledOperationActive();
       }
       return;
     }
@@ -10942,6 +12048,7 @@ export async function openChannelSession(
         message.attempt,
         message.sessionId,
       );
+      ensureScheduledOperationActive();
       return;
     }
     if (message.type === "viewer:left" && message.viewerId) {
@@ -10961,6 +12068,7 @@ export async function openChannelSession(
       const peer = outboundPeers.get(message.viewerId);
       if (peer && activePreset) {
         await applyOutboundPreference(message.viewerId, peer);
+        ensureScheduledOperationActive();
       }
       return;
     }
@@ -10972,6 +12080,7 @@ export async function openChannelSession(
           message.attempt,
           message.sessionId,
         );
+        ensureScheduledOperationActive();
       } else if (!broadcasterId) {
         queuePendingWatcherSignal(pendingWatcherSignals, {
           data: message.data,
@@ -10984,6 +12093,7 @@ export async function openChannelSession(
           message.attempt,
           message.sessionId,
         );
+        ensureScheduledOperationActive();
       }
       return;
     }
@@ -11013,6 +12123,7 @@ export async function openChannelSession(
         }
         if (awaitingBroadcastGrant) {
           await cleanupLocalBroadcast();
+          ensureScheduledOperationActive();
           updateBroadcastControls();
           notify("当前信令服务版本较旧，不支持这项放映操作", "warn");
         }
@@ -11031,6 +12142,7 @@ export async function openChannelSession(
       }
       if (awaitingBroadcastGrant) {
         await cleanupLocalBroadcast();
+        ensureScheduledOperationActive();
         updateBroadcastControls();
       }
       setSignalStatus("lost", messageText, true);
@@ -11041,6 +12153,9 @@ export async function openChannelSession(
   async function leaveSession(): Promise<void> {
     if (leaving) return;
     leaving = true;
+    signalMessageScheduler.close();
+    videoEnhancement?.destroy();
+    videoEnhancement = undefined;
     hideEmbeddedGame();
     sessionUiAbortController.abort();
     networkProbeAbortController.abort();
@@ -11084,6 +12199,11 @@ export async function openChannelSession(
     video?.removeEventListener("durationchange", updateEmbyViewerTimeline);
     clearSignalReconnectTimer();
     clearChannelJoinAckTimer();
+    if (segmentRelayRefreshTimer !== undefined) {
+      window.clearTimeout(segmentRelayRefreshTimer);
+      segmentRelayRefreshTimer = undefined;
+    }
+    segmentRelayAccess = undefined;
     if (networkChangeDebounceTimer !== undefined) {
       window.clearTimeout(networkChangeDebounceTimer);
       networkChangeDebounceTimer = undefined;
@@ -11291,6 +12411,7 @@ export async function openChannelSession(
       localStorage.setItem("synced:fullscreen-fit", fullscreenFit);
       updateFullscreenFitUi();
       void resolveFullscreenFit();
+      videoEnhancement?.refresh();
       const btn = document.getElementById("dock-smart-crop");
       btn?.classList.toggle("is-on", fullscreenFit === "smart");
       btn?.setAttribute("aria-pressed", String(fullscreenFit === "smart"));
@@ -11677,6 +12798,7 @@ export async function openChannelSession(
         localStorage.setItem("synced:fullscreen-fit", fullscreenFit);
         updateFullscreenFitUi();
         void resolveFullscreenFit();
+        videoEnhancement?.refresh();
       });
     });
   highlightCorrectionInput?.addEventListener("change", () => {
@@ -11686,6 +12808,17 @@ export async function openChannelSession(
       String(highlightCorrection),
     );
     applyHighlightCorrection();
+  });
+  videoEnhancementInput?.addEventListener("change", () => {
+    videoEnhancementPreference = videoEnhancementInput.checked
+      ? "auto"
+      : "off";
+    localStorage.setItem(
+      "synced:video-enhancement",
+      videoEnhancementPreference,
+    );
+    videoEnhancement?.setPreference(videoEnhancementPreference);
+    syncVideoEnhancement();
   });
   const requestBroadcast = (): void => {
     if (broadcasterId === selfId) {
@@ -11821,6 +12954,24 @@ export async function openChannelSession(
         frameRateLockedByUser = true;
         frameRate = Number(button.dataset.sessionFrameRate) as FrameRateOption;
         localStorage.setItem("synced:frame-rate", String(frameRate));
+        syncBroadcastQualityUi();
+      });
+    });
+  document
+    .querySelectorAll<HTMLButtonElement>("[data-screen-content-mode]")
+    .forEach((button) => {
+      button.addEventListener("click", () => {
+        const value = button.dataset.screenContentMode;
+        if (
+          value !== "detail" &&
+          value !== "motion" &&
+          value !== "balanced"
+        ) {
+          return;
+        }
+        screenContentMode = value;
+        qualitySelectionTouched = true;
+        localStorage.setItem("synced:screen-content-mode", value);
         syncBroadcastQualityUi();
       });
     });
@@ -12063,6 +13214,11 @@ export async function openChannelSession(
         adaptivePlayback.configure(
           broadcastCapabilities.height,
           preferredHeight,
+          false,
+          {
+            contentMode: broadcastCapabilities.contentMode,
+            sourceFrameRate: broadcastCapabilities.frameRate,
+          },
         );
       }
       sendViewerQualityPreference(true);
@@ -12141,30 +13297,10 @@ export async function openChannelSession(
   });
   signal.addEventListener("message", (event) => {
     const message = (event as CustomEvent<SignalEnvelope>).detail;
-    // WebSocket events are ordered, but async event callbacks are not awaited
-    // by the browser. Serialize SDP and ICE handling so an answer/candidate can
-    // never overtake the offer that created its peer connection.
-    signalMessageQueue = signalMessageQueue
-      .then(() => handleMessage(message))
-      .catch((error) => {
-        window.roomDesktop?.reportDiagnostic("signal-handler-failed", {
-          type: message.type,
-          attempt: message.attempt,
-          sessionId: message.sessionId,
-          message: error instanceof Error ? error.message : String(error),
-          stack:
-            error instanceof Error
-              ? error.stack?.split("\n").slice(0, 5).join("\n")
-              : undefined,
-        });
-        setStatus("媒体协商失败", "error");
-        notify(
-          error instanceof Error ? error.message : "媒体协商失败",
-          true,
-        );
-      });
+    signalMessageScheduler.dispatch(message);
   });
   signal.addEventListener("close", () => {
+    signalMessageScheduler.reset();
     clearChannelJoinAckTimer();
     networkProbeGeneration += 1;
     networkProbePromise = undefined;

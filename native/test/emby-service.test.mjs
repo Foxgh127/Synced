@@ -9,6 +9,10 @@ import { test } from "node:test";
 import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
+const embyServiceSource = readFileSync(
+  new URL("../electron/emby-service.cjs", import.meta.url),
+  "utf8",
+);
 const {
   browserDirectAudioCompatible,
   browserDirectVideoCompatible,
@@ -2228,17 +2232,22 @@ test("logs in, browses, remuxes one authenticated stream, and never exposes the 
       service.pipeline.child.spawnargs.join(" "),
       new RegExp(token),
     );
-    assert.doesNotMatch(
+    assert.match(
       service.pipeline.child.spawnargs.join(" "),
       /frag_keyframe/,
     );
-    assert.match(
+    assert.doesNotMatch(
       service.pipeline.child.spawnargs.join(" "),
-      /-frag_duration 750000/,
+      /-frag_size/,
     );
     assert.match(
       service.pipeline.child.spawnargs.join(" "),
-      /-frag_size 1500000/,
+      /-frag_duration 2000000/,
+    );
+    assert.match(
+      embyServiceSource,
+      /const fallbackCadenceMs =[\s\S]*?: 2_000;/,
+      "unparsed fragment timing must fall back to the configured two-second GOP cadence",
     );
     assert.match(
       service.pipeline.child.spawnargs.join(" "),
@@ -2279,13 +2288,13 @@ test("logs in, browses, remuxes one authenticated stream, and never exposes the 
     );
     assert.match(init.mimeType, /avc1/i);
     assert.ok(
-      fragments.length >= 3,
-      "four seconds of media should be split into several transport fragments",
+      fragments.length >= 2,
+      `four seconds of media should be split on the two-second GOP cadence (got ${fragments.length})`,
     );
     assert.ok(fragment?.data?.length > 1_000);
     assert.ok(
       fragments.every((event) => event.data.length < 2 * 1024 * 1024),
-      "sub-second muxing keeps real-time DataChannel fragments bounded",
+      "GOP-paced muxing keeps transport fragments bounded",
     );
     assert.ok(Number.isFinite(fragment.mediaTimeMs));
     assert.equal(fragment.keyframe, true);
@@ -2301,7 +2310,10 @@ test("logs in, browses, remuxes one authenticated stream, and never exposes the 
     assert.equal(localStarted.plan.method, "Transcode");
     assert.equal(localStarted.plan.localVideoTranscode, true);
     const localArgs = service.pipeline.child.spawnargs.join(" ");
-    assert.match(localArgs, /-c:v libopenh264/u);
+    assert.match(
+      localArgs,
+      /-c:v (?:h264_nvenc|h264_qsv|h264_amf|libopenh264)/u,
+    );
     assert.match(localArgs, /-maxrate 2200000/u);
     assert.match(localArgs, /-c:a aac/u);
     assert.doesNotMatch(localArgs, new RegExp(token));

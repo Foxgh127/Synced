@@ -172,11 +172,16 @@ test("SFU publication, data sends, and teardown are bounded and stale-safe", () 
   assert.match(sfu, /const SFU_TEARDOWN_TIMEOUT_MS = 2_000/);
   assert.match(
     sfu,
-    /this\.outbound!\(payload\),[\s\S]*?SFU_DATA_SEND_TIMEOUT_MS/,
+    /this\.outbound\(payload, this\.epochController\.signal\),[\s\S]*?SFU_DATA_SEND_TIMEOUT_MS/,
   );
   assert.match(
     sfu,
-    /\.catch\(\(error\) => \{[\s\S]{0,100}?this\.readyState !== "open"[\s\S]{0,100}?this\.failureCount \+= 1/,
+    /SFU_DATA_OUTSTANDING_BYTES[\s\S]*?QuotaExceededError/,
+  );
+  assert.match(sfu, /async closeGracefully[\s\S]*?this\.drain\(\)/);
+  assert.doesNotMatch(
+    sfu.slice(sfu.indexOf("private async pump()"), sfu.indexOf("private drain()")),
+    /\.flush\(/,
   );
   assert.match(sfu, /private publicationGeneration = 0/);
   assert.match(sfu, /isCurrentPublication\(/);

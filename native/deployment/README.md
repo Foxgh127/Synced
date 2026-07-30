@@ -5,11 +5,13 @@
 共同观看现在采用以下顺序：
 
 1. `wss://synced.com.cn/signal` 负责频道状态、临时 TURN 凭据和 LiveKit JWT。
-2. LiveKit SFU 是影片主链路。放映端只上传一份音视频或 Emby fMP4 数据，SFU
-   负责向最多 7 位观众分发。
-3. SFU 建连、发布或运行中断时，客户端才发送 `broadcast:watch-ready`，启用原有
+2. 普通屏幕共享以 LiveKit SFU 为主链路，逐观看端转发独立的
+   1440p/1080p/720p/480p 层。
+3. Emby 使用 `/media/v1/` 的短期签名 HTTPS CMAF 分片；放映端并行生成
+   original/1080p/720p/480p，观看端独立 ABR、Range 重试和磁盘缓存。
+4. SFU 建连、发布或运行中断时，客户端才发送 `broadcast:watch-ready`，启用原有
    P2P/TURN 链路作为故障备用。
-4. coturn 继续服务 P2P、连麦以及 SFU 的严格 NAT 客户端。
+5. coturn 继续服务 P2P、连麦以及 SFU 的严格 NAT 客户端。
 
 信令、coturn 和 LiveKit 都不配置静态带宽上限。码率由端点实测吞吐和 WebRTC
 拥塞控制决定。不要重新加入 coturn 的 `max-bps`/`bps-capacity`，也不要在信令
@@ -17,7 +19,7 @@
 
 ## Docker Compose（主节点）
 
-准备环境和两个不同的密钥：
+准备环境和三个不同的密钥：
 
 ```bash
 cd deployment
@@ -25,7 +27,8 @@ cp .env.example .env
 mkdir -p secrets
 openssl rand -hex 48 > secrets/turn_secret
 openssl rand -hex 48 > secrets/livekit_api_secret
-chmod 600 secrets/turn_secret secrets/livekit_api_secret
+openssl rand -hex 48 > secrets/segment_relay_secret
+chmod 600 secrets/turn_secret secrets/livekit_api_secret secrets/segment_relay_secret
 ```
 
 编辑 `.env`，至少确认：
@@ -62,6 +65,7 @@ Compose 固定使用 `livekit/livekit-server:v1.13.4` 与
 - `/signal` → `127.0.0.1:8787`
 - `/sfu/` → `127.0.0.1:7880/`，保留 WebSocket upgrade
 - `/iceservers` → 信令服务的受 Bearer token 保护的 TURN 刷新接口
+- `/media/v1/` → 受房间与身份短期签名保护的 CMAF 清单、字幕和分片
 - `/healthz`、`/readyz`、`/capabilities` → 信令健康检查
 
 主节点需开放：
@@ -90,8 +94,9 @@ npm run check:public:sfu
 
 ## 备用信令节点
 
-杭州节点只运行 `synced-signal.service`、Nginx 和证书续签。不要在该节点安装或
-启动 coturn、STUN、LiveKit、媒体端口兼容代理或 Docker 媒体容器。
+杭州节点只运行 `synced-signal.service`、HTTPS CMAF 分片缓存、Nginx 和证书续签。
+不要在该节点安装或启动 coturn、STUN、LiveKit、媒体端口兼容代理或 Docker
+媒体容器。
 
 备用节点使用：
 
@@ -100,8 +105,9 @@ npm run check:public:sfu
 - `nginx-synced-standby.conf`：只暴露 `/signal`、`/iceservers` 和健康检查；
 - `deploy-standby-routing.sh`：需要调整 ICE 路由时执行原子更新和回滚。
 
-它仍需持有与腾讯云主节点相同的 TURN secret 和 LiveKit API secret，仅用于签发
-主节点可验证的临时凭据/JWT；媒体不会经过杭州。公网仅开放 TCP `80/443`，不开放
+它仍需持有 TURN secret、LiveKit API secret 和独立的 segment relay secret。
+连接备用信令入口的 Emby 房间只通过杭州的 HTTPS 分片缓存，不开放新的媒体端口。
+公网仅开放 TCP `80/443`，不开放
 UDP `443`、TCP/UDP `3478`、LiveKit 端口或 relay 端口范围。`MAX_CLIENTS=96`
 只是信令连接容量，房间成员上限仍为 8 人。
 
@@ -137,10 +143,16 @@ SFU_ENABLED=true
 SFU_PUBLIC_URL=wss://synced.com.cn/sfu
 LIVEKIT_API_KEY=synced_sfu
 LIVEKIT_API_SECRET_FILE=/etc/synced-livekit.secret
+SEGMENT_RELAY_SECRET_FILE=/etc/synced-segment-relay.secret
+SEGMENT_RELAY_CACHE_DIR=/var/lib/synced/segment-relay
 ```
 
 `/etc/synced-livekit.secret` 应为 `root:synced 0640`，并与 LiveKit 服务配置
-中的 API secret 完全一致。
+中的 API secret 完全一致。`/etc/synced-segment-relay.secret` 同样应为
+`root:synced 0640`，但必须使用独立随机值；systemd 会创建并限制
+`/var/lib/synced/segment-relay`。不配置 `SEGMENT_RELAY_DISK_BYTES` 时，
+磁盘缓存自动使用所在文件系统可用空间的 4%，且最多 5 GiB；仅在运维侧
+明确完成容量规划后才设置固定上限。
 
 主节点沿用 systemd 时，使用仓库中的 `synced-livekit.service`、
 `synced-livekit.env.example`、`livekit-entrypoint.sh` 和

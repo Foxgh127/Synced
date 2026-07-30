@@ -4,12 +4,17 @@ const { Readable } = require("stream");
 const { createHash, randomBytes, randomUUID } = require("crypto");
 const { spawn } = require("child_process");
 const dns = require("dns").promises;
+const fs = require("fs");
+const fsp = fs.promises;
 const net = require("net");
 const path = require("path");
 
 const EMBY_CLIENT = "Synced";
 const EMBY_DEVICE = "Synced Desktop";
 const REQUEST_TIMEOUT_MS = 20_000;
+const PROXY_BODY_IDLE_TIMEOUT_MS = 15_000;
+const PROXY_CLOSE_TIMEOUT_MS = 2_500;
+const PROXY_RANGE_RETRIES = 2;
 const STREAM_INIT_TIMEOUT_MS = 22_000;
 const ENDPOINT_PROBE_TIMEOUT_MS = 5_000;
 const ENDPOINT_RECENT_SUCCESS_MS = 30_000;
@@ -21,6 +26,14 @@ const MAX_EMBY_ENDPOINTS = 8;
 const MAX_LOCAL_TRANSCODE_BITRATE = 12_000_000;
 const MAX_LOCAL_TRANSCODE_WIDTH = 1_920;
 const MAX_LOCAL_TRANSCODE_HEIGHT = 1_080;
+const RELAY_MEMORY_HIGH_WATER_BYTES = 128 * 1024 * 1024;
+const RELAY_MEMORY_LOW_WATER_BYTES = 32 * 1024 * 1024;
+const RELAY_MIN_DISK_BYTES = 64 * 1024 * 1024;
+const RELAY_MAX_DISK_BYTES = 5 * 1024 * 1024 * 1024;
+const RELAY_UPLOAD_CONCURRENCY = 3;
+const RELAY_UPLOAD_IDLE_TIMEOUT_MS = 15_000;
+const RELAY_UPLOAD_MAX_ATTEMPTS = 3;
+const RELAY_FINAL_DRAIN_TIMEOUT_MS = 10_000;
 
 function cleanText(value, maxLength = 256) {
   return String(value || "").trim().slice(0, maxLength);
@@ -603,6 +616,14 @@ function qualityProfile(key) {
       maxHeight: 480,
       forceTranscode: true,
     },
+    "480p-1.8": {
+      key: "480p-1.8",
+      label: "480P · 1.8 Mbps",
+      maxBitrate: 1_800_000,
+      maxWidth: 854,
+      maxHeight: 480,
+      forceTranscode: true,
+    },
     "360p-1.2": {
       key: "360p-1.2",
       label: "360P · 1.2 Mbps",
@@ -1151,6 +1172,7 @@ class EmbyLoopbackProxy {
     this.secret = randomBytes(24).toString("base64url");
     this.server = undefined;
     this.origin = "";
+    this.activeControllers = new Set();
     this.mediaCdnOrigins = new Set(
       (Array.isArray(session.mediaCdnOrigins)
         ? session.mediaCdnOrigins
@@ -1265,97 +1287,234 @@ class EmbyLoopbackProxy {
       response.writeHead(404).end();
       return;
     }
+    let activeController;
+    let deliveredBytes = 0;
+    let headersSent = false;
+    const originalRange = String(request.headers.range || "");
+    const parsedRange = originalRange.match(/^bytes=(\d+)-(\d*)$/i);
+    const rangeStart = parsedRange ? Number(parsedRange[1]) : 0;
+    const rangeEnd = parsedRange?.[2] ? Number(parsedRange[2]) : undefined;
+    const abortActive = () => activeController?.abort();
+    request.on("aborted", abortActive);
+    response.on("close", abortActive);
     try {
-      const timeout = requestTimeout();
-      let upstreamResponse;
-      let finalUrl = upstream;
-      try {
-        const fetched = await fetchWithScopedRedirects(upstream, {
-          method: request.method,
-          allowCrossOrigin: true,
-          headersForUrl: (target) => {
-            const headers = {
-              Accept: request.headers.accept || "*/*",
-              "User-Agent": `${EMBY_CLIENT}/${this.session.version}`,
-            };
-            if (request.headers.range) headers.Range = request.headers.range;
-            if (target.origin === this.session.serverUrl.origin) {
-              headers["X-Emby-Authorization"] = authHeader(
-                this.session.deviceId,
-                this.session.version,
-              );
-              headers["X-Emby-Token"] = this.session.token;
-            }
-            return headers;
-          },
-          signal: timeout.signal,
-          validateUrl: (target, context) =>
-            this.validateMediaTarget(target, context),
-        });
-        upstreamResponse = fetched.response;
-        finalUrl = fetched.finalUrl;
-      } finally {
-        timeout.clear();
-      }
-      if (!upstreamResponse.ok && upstreamResponse.status !== 206) {
-        response.writeHead(upstreamResponse.status).end();
-        return;
-      }
-      const contentType = upstreamResponse.headers.get("content-type") || "";
-      const passHeaders = {
-        "content-type": contentType || "application/octet-stream",
-        "cache-control": "no-store",
-      };
-      for (const name of [
-        "content-length",
-        "content-range",
-        "accept-ranges",
-        "last-modified",
-      ]) {
-        const value = upstreamResponse.headers.get(name);
-        if (value) passHeaders[name] = value;
-      }
-      if (
-        isHlsManifestResponse(contentType, upstream, finalUrl) &&
-        request.method !== "HEAD"
-      ) {
-        const manifest = (
-          await readResponseLimited(
-            upstreamResponse,
-            8 * 1024 * 1024,
-            "Emby HLS 清单异常过大",
-          )
-        ).toString("utf8");
-        const rewritten = rewriteManifest(
-          manifest,
-          this.origin,
-          `/${this.secret}`,
-          finalUrl,
-          (target) => this.manifestAllows(target),
+      for (let attempt = 0; attempt <= PROXY_RANGE_RETRIES; attempt += 1) {
+        const controller = new AbortController();
+        activeController = controller;
+        this.activeControllers.add(controller);
+        const headerTimer = setTimeout(
+          () => controller.abort(new Error("proxy response header timeout")),
+          REQUEST_TIMEOUT_MS,
         );
-        response.writeHead(upstreamResponse.status, {
-          ...passHeaders,
-          "content-length": Buffer.byteLength(rewritten),
-        });
-        response.end(rewritten);
-        return;
+        headerTimer.unref?.();
+        let reader;
+        try {
+          const resumedRange =
+            deliveredBytes > 0
+              ? `bytes=${rangeStart + deliveredBytes}-${
+                  rangeEnd === undefined ? "" : rangeEnd
+                }`
+              : originalRange;
+          const fetched = await fetchWithScopedRedirects(upstream, {
+            method: request.method,
+            allowCrossOrigin: true,
+            headersForUrl: (target) => {
+              const headers = {
+                Accept: request.headers.accept || "*/*",
+                "User-Agent": `${EMBY_CLIENT}/${this.session.version}`,
+              };
+              if (resumedRange) headers.Range = resumedRange;
+              if (target.origin === this.session.serverUrl.origin) {
+                headers["X-Emby-Authorization"] = authHeader(
+                  this.session.deviceId,
+                  this.session.version,
+                );
+                headers["X-Emby-Token"] = this.session.token;
+              }
+              return headers;
+            },
+            signal: controller.signal,
+            validateUrl: (target, context) =>
+              this.validateMediaTarget(target, context),
+          });
+          clearTimeout(headerTimer);
+          const upstreamResponse = fetched.response;
+          const finalUrl = fetched.finalUrl;
+          if (!upstreamResponse.ok && upstreamResponse.status !== 206) {
+            if (attempt < PROXY_RANGE_RETRIES && upstreamResponse.status >= 500) {
+              continue;
+            }
+            if (!headersSent) {
+              response.writeHead(upstreamResponse.status).end();
+            } else {
+              response.destroy();
+            }
+            return;
+          }
+          if (deliveredBytes > 0 && upstreamResponse.status !== 206) {
+            throw new Error("上游不支持媒体 Range 续传");
+          }
+          const contentType =
+            upstreamResponse.headers.get("content-type") || "";
+          const passHeaders = {
+            "content-type": contentType || "application/octet-stream",
+            "cache-control": "no-store",
+          };
+          for (const name of [
+            "content-length",
+            "content-range",
+            "accept-ranges",
+            "last-modified",
+          ]) {
+            const value = upstreamResponse.headers.get(name);
+            if (value) passHeaders[name] = value;
+          }
+          if (
+            isHlsManifestResponse(contentType, upstream, finalUrl) &&
+            request.method !== "HEAD"
+          ) {
+            const manifestBytes = await this.readBodyWithIdleTimeout(
+              upstreamResponse.body,
+              controller,
+              8 * 1024 * 1024,
+            );
+            const manifest = manifestBytes.toString("utf8");
+            const rewritten = rewriteManifest(
+              manifest,
+              this.origin,
+              `/${this.secret}`,
+              finalUrl,
+              (target) => this.manifestAllows(target),
+            );
+            response.writeHead(upstreamResponse.status, {
+              ...passHeaders,
+              "content-length": Buffer.byteLength(rewritten),
+            });
+            response.end(rewritten);
+            return;
+          }
+          if (request.method === "HEAD" || !upstreamResponse.body) {
+            if (!headersSent) {
+              response.writeHead(upstreamResponse.status, passHeaders);
+            }
+            response.end();
+            return;
+          }
+          if (!headersSent) {
+            response.writeHead(upstreamResponse.status, passHeaders);
+            headersSent = true;
+          }
+          reader = upstreamResponse.body.getReader();
+          while (!response.destroyed) {
+            const result = await this.readWithIdleTimeout(
+              reader,
+              controller,
+            );
+            if (result.done) {
+              response.end();
+              return;
+            }
+            const chunk = result.value;
+            deliveredBytes += chunk.byteLength;
+            if (!response.write(chunk)) {
+              await new Promise((resolve, reject) => {
+                let drainTimer;
+                const drained = () => {
+                  cleanup();
+                  resolve();
+                };
+                const closed = () => {
+                  cleanup();
+                  reject(new Error("下游媒体连接已关闭"));
+                };
+                const timedOut = () => {
+                  const error = new Error("下游媒体连接 15 秒未恢复读取");
+                  error.code = "EMBY_PROXY_DOWNSTREAM_IDLE";
+                  controller.abort(error);
+                  cleanup();
+                  reject(error);
+                };
+                const cleanup = () => {
+                  clearTimeout(drainTimer);
+                  response.off("drain", drained);
+                  response.off("close", closed);
+                };
+                response.once("drain", drained);
+                response.once("close", closed);
+                drainTimer = setTimeout(
+                  timedOut,
+                  PROXY_BODY_IDLE_TIMEOUT_MS,
+                );
+                drainTimer.unref?.();
+              });
+            }
+          }
+          return;
+        } catch (error) {
+          if (
+            response.destroyed ||
+            request.destroyed ||
+            attempt >= PROXY_RANGE_RETRIES
+          ) {
+            throw error;
+          }
+          // Retrying from the exact delivered byte prevents duplicate media
+          // after a half-open mobile/CDN connection. A manifest is still
+          // buffered in full, so its retry naturally restarts from byte zero.
+        } finally {
+          clearTimeout(headerTimer);
+          await reader?.cancel().catch(() => undefined);
+          controller.abort();
+          this.activeControllers.delete(controller);
+        }
       }
-      response.writeHead(upstreamResponse.status, passHeaders);
-      if (request.method === "HEAD" || !upstreamResponse.body) {
-        response.end();
-        return;
-      }
-      const readable = Readable.fromWeb(upstreamResponse.body);
-      readable.on("error", () => {
-        if (!response.destroyed) response.destroy();
-      });
-      response.on("close", () => {
-        if (!readable.destroyed) readable.destroy();
-      });
-      readable.pipe(response);
     } catch {
       if (!response.headersSent) response.writeHead(502);
-      response.end();
+      if (!response.destroyed) response.end();
+    } finally {
+      request.off("aborted", abortActive);
+      response.off("close", abortActive);
+    }
+  }
+
+  async readWithIdleTimeout(reader, controller) {
+    let timer;
+    try {
+      return await Promise.race([
+        reader.read(),
+        new Promise((_resolve, reject) => {
+          timer = setTimeout(() => {
+            const error = new Error("Emby 代理响应体 15 秒无数据");
+            error.code = "EMBY_PROXY_BODY_IDLE";
+            controller.abort(error);
+            reject(error);
+          }, PROXY_BODY_IDLE_TIMEOUT_MS);
+          timer.unref?.();
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async readBodyWithIdleTimeout(body, controller, maximumBytes) {
+    if (!body) return Buffer.alloc(0);
+    const reader = body.getReader();
+    const chunks = [];
+    let total = 0;
+    try {
+      for (;;) {
+        const result = await this.readWithIdleTimeout(reader, controller);
+        if (result.done) break;
+        total += result.value.byteLength;
+        if (total > maximumBytes) {
+          throw new Error("Emby HLS 清单异常过大");
+        }
+        chunks.push(Buffer.from(result.value));
+      }
+      return Buffer.concat(chunks, total);
+    } finally {
+      await reader.cancel().catch(() => undefined);
     }
   }
 
@@ -1363,7 +1522,20 @@ class EmbyLoopbackProxy {
     const server = this.server;
     this.server = undefined;
     if (!server) return;
-    await new Promise((resolve) => server.close(resolve));
+    for (const controller of this.activeControllers) {
+      controller.abort(new Error("Emby loopback proxy is closing"));
+    }
+    this.activeControllers.clear();
+    server.closeIdleConnections?.();
+    server.closeAllConnections?.();
+    await Promise.race([
+      new Promise((resolve) => server.close(resolve)),
+      new Promise((resolve) => {
+        const timer = setTimeout(resolve, PROXY_CLOSE_TIMEOUT_MS);
+        timer.unref?.();
+      }),
+    ]);
+    server.closeAllConnections?.();
   }
 }
 
@@ -1495,7 +1667,7 @@ function writeTfdtTime(tfdt, version, timescale, mediaTimeMs) {
 }
 
 function expectedTrackCadenceMs(state) {
-  if (!state.recentCadenceMs.length) return 750;
+  if (!state.recentCadenceMs.length) return 2_000;
   const sorted = [...state.recentCadenceMs].sort((left, right) => left - right);
   const middle = Math.floor(sorted.length / 2);
   return sorted.length % 2
@@ -1683,10 +1855,96 @@ function parseFragmentTiming(fragment, videoTrack) {
   return {};
 }
 
+class BufferRope {
+  constructor() {
+    this.chunks = [];
+    this.head = 0;
+    this.headOffset = 0;
+    this.length = 0;
+  }
+
+  push(chunk) {
+    const value = Buffer.isBuffer(chunk)
+      ? chunk
+      : Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+    if (!value.length) return;
+    this.chunks.push(value);
+    this.length += value.length;
+  }
+
+  peek(size) {
+    const requested = Math.min(this.length, Math.max(0, size));
+    const first = this.chunks[this.head];
+    if (first && first.length - this.headOffset >= requested) {
+      return first.subarray(this.headOffset, this.headOffset + requested);
+    }
+    const output = Buffer.allocUnsafe(requested);
+    this.copyInto(output, requested, false);
+    return output;
+  }
+
+  read(size) {
+    if (size < 0 || size > this.length) {
+      throw new RangeError("BufferRope read exceeds available bytes");
+    }
+    const first = this.chunks[this.head];
+    let output;
+    if (first && first.length - this.headOffset >= size) {
+      output = first.subarray(this.headOffset, this.headOffset + size);
+      this.consume(size);
+    } else {
+      output = Buffer.allocUnsafe(size);
+      this.copyInto(output, size, true);
+    }
+    return output;
+  }
+
+  copyInto(output, size, consume) {
+    let index = this.head;
+    let offset = this.headOffset;
+    let written = 0;
+    while (written < size) {
+      const chunk = this.chunks[index];
+      const available = Math.min(chunk.length - offset, size - written);
+      chunk.copy(output, written, offset, offset + available);
+      written += available;
+      index += 1;
+      offset = 0;
+    }
+    if (consume) this.consume(size);
+  }
+
+  consume(size) {
+    let remaining = size;
+    this.length -= size;
+    while (remaining > 0) {
+      const chunk = this.chunks[this.head];
+      const available = chunk.length - this.headOffset;
+      if (remaining < available) {
+        this.headOffset += remaining;
+        remaining = 0;
+      } else {
+        remaining -= available;
+        this.head += 1;
+        this.headOffset = 0;
+      }
+    }
+    if (this.head >= 64 && this.head * 2 >= this.chunks.length) {
+      this.chunks.splice(0, this.head);
+      this.head = 0;
+    }
+    if (this.length === 0) {
+      this.chunks.length = 0;
+      this.head = 0;
+      this.headOffset = 0;
+    }
+  }
+}
+
 class FragmentedMp4Parser extends EventEmitter {
   constructor() {
     super();
-    this.buffer = Buffer.alloc(0);
+    this.buffer = new BufferRope();
     this.initBoxes = [];
     this.fragmentBoxes = [];
     this.initEmitted = false;
@@ -1700,9 +1958,7 @@ class FragmentedMp4Parser extends EventEmitter {
   push(chunk) {
     if (!chunk?.length) return;
     if (this.finished) throw new Error("MP4 解析器已经结束");
-    this.buffer = this.buffer.length
-      ? Buffer.concat([this.buffer, chunk])
-      : Buffer.from(chunk);
+    this.buffer.push(chunk);
     this.drain(false);
   }
 
@@ -1716,19 +1972,29 @@ class FragmentedMp4Parser extends EventEmitter {
   }
 
   drain(sizeZeroExtendsToEnd) {
-    let offset = 0;
-    while (offset < this.buffer.length) {
-      const box = readBox(
-        this.buffer,
-        offset,
-        sizeZeroExtendsToEnd,
-      );
-      if (!box) break;
-      const payload = this.buffer.subarray(offset, offset + box.size);
-      this.consume(box.type, Buffer.from(payload));
-      offset += box.size;
+    while (this.buffer.length >= 8) {
+      const header = this.buffer.peek(Math.min(16, this.buffer.length));
+      let size = header.readUInt32BE(0);
+      const type = header.toString("ascii", 4, 8);
+      let headerSize = 8;
+      if (size === 1) {
+        if (header.length < 16) break;
+        const bigSize = header.readBigUInt64BE(8);
+        if (bigSize > BigInt(Number.MAX_SAFE_INTEGER)) {
+          throw new Error("媒体片段尺寸超过安全范围");
+        }
+        size = Number(bigSize);
+        headerSize = 16;
+      } else if (size === 0) {
+        if (!sizeZeroExtendsToEnd) break;
+        size = this.buffer.length;
+      }
+      if (size < headerSize || size > 128 * 1024 * 1024) {
+        throw new Error("收到无效的 MP4 box");
+      }
+      if (this.buffer.length < size) break;
+      this.consume(type, this.buffer.read(size));
     }
-    if (offset) this.buffer = this.buffer.subarray(offset);
     if (this.buffer.length > 128 * 1024 * 1024) {
       throw new Error("MP4 解析缓冲区异常增长");
     }
@@ -1952,15 +2218,1002 @@ async function terminateChildProcess(child, options = {}) {
   return await waitForChildExit(child, Math.min(forceWaitMs, 500));
 }
 
+function normalizeSegmentRelayConfig(input) {
+  if (!input || typeof input !== "object") return undefined;
+  let baseUrl;
+  try {
+    baseUrl = new URL(cleanText(input.baseUrl, 2_048));
+  } catch {
+    return undefined;
+  }
+  const roomId = cleanText(input.roomId, 32).toUpperCase();
+  const sessionId = cleanText(input.sessionId, 128);
+  const assetId = cleanText(input.assetId, 64).toLowerCase();
+  const token = cleanText(input.token, 2_048);
+  const mediaVersion = Number(input.mediaVersion);
+  const localHttp =
+    baseUrl.protocol === "http:" &&
+    ["localhost", "127.0.0.1", "::1"].includes(baseUrl.hostname);
+  if (
+    !["https:", "http:"].includes(baseUrl.protocol) ||
+    (baseUrl.protocol === "http:" && !localHttp) ||
+    !/^\/media\/v\d+\/?$/i.test(baseUrl.pathname) ||
+    !/^[23456789A-HJ-NP-Z]{8}$/.test(roomId) ||
+    !/^[a-z0-9-]{8,128}$/i.test(sessionId) ||
+    !/^[a-f0-9]{24,64}$/.test(assetId) ||
+    !Number.isSafeInteger(mediaVersion) ||
+    mediaVersion < 1 ||
+    mediaVersion > 0xffffffff ||
+    token.length < 64
+  ) {
+    return undefined;
+  }
+  baseUrl.username = "";
+  baseUrl.password = "";
+  baseUrl.hash = "";
+  baseUrl.search = "";
+  baseUrl.pathname = `${baseUrl.pathname.replace(/\/+$/, "")}/`;
+  return {
+    baseUrl,
+    token,
+    roomId,
+    sessionId,
+    assetId,
+    mediaVersion,
+  };
+}
+
+function renditionIdForQuality(quality) {
+  const key = cleanText(quality?.key || quality, 32).toLowerCase();
+  if (key === "original") return "original";
+  if (key === "1080p-8") return "1080p8";
+  if (key === "720p-4") return "720p4";
+  if (key === "480p-1.8") return "480p18";
+  return `selected-${key.replace(/[^a-z0-9-]/g, "-")}`.slice(0, 32);
+}
+
+function segmentCacheBudget(rootDir, requested) {
+  const explicit = Number(requested);
+  if (Number.isFinite(explicit) && explicit > 0) {
+    return Math.min(
+      RELAY_MAX_DISK_BYTES,
+      Math.max(256 * 1024 * 1024, Math.floor(explicit)),
+    );
+  }
+  try {
+    fs.mkdirSync(rootDir, { recursive: true });
+    const disk = fs.statfsSync(rootDir);
+    const freeBytes = Number(disk.bavail) * Number(disk.bsize);
+    return Math.min(
+      RELAY_MAX_DISK_BYTES,
+      Math.max(RELAY_MIN_DISK_BYTES, Math.floor(freeBytes * 0.04)),
+    );
+  } catch {
+    return 2 * 1024 * 1024 * 1024;
+  }
+}
+
+const hardwareEncoderProbeCache = new Map();
+
+async function probeHardwareEncoder(ffmpegPath) {
+  if (hardwareEncoderProbeCache.has(ffmpegPath)) {
+    return hardwareEncoderProbeCache.get(ffmpegPath);
+  }
+  const operation = (async () => {
+    for (const encoder of ["h264_nvenc", "h264_qsv", "h264_amf"]) {
+      const supported = await new Promise((resolve) => {
+        let child;
+        try {
+          child = spawn(
+            ffmpegPath,
+            [
+              "-hide_banner",
+              "-loglevel",
+              "error",
+              "-f",
+              "lavfi",
+              "-i",
+              "color=size=128x72:rate=30:duration=0.1",
+              "-frames:v",
+              "1",
+              "-c:v",
+              encoder,
+              "-f",
+              "null",
+              "-",
+            ],
+            {
+              windowsHide: true,
+              stdio: ["ignore", "ignore", "ignore"],
+            },
+          );
+        } catch {
+          resolve(false);
+          return;
+        }
+        const timer = setTimeout(() => {
+          try {
+            child.kill("SIGKILL");
+          } catch {
+            // The probe may have exited between timer ticks.
+          }
+          resolve(false);
+        }, 4_000);
+        timer.unref?.();
+        child.once("error", () => {
+          clearTimeout(timer);
+          resolve(false);
+        });
+        child.once("close", (code) => {
+          clearTimeout(timer);
+          resolve(code === 0);
+        });
+      });
+      if (supported) return encoder;
+    }
+    return undefined;
+  })();
+  hardwareEncoderProbeCache.set(ffmpegPath, operation);
+  return operation;
+}
+
+function appendH264EncoderArguments(
+  args,
+  encoder,
+  encoding,
+  frameRate,
+) {
+  const gopFrames = Math.max(24, Math.round(frameRate * 2));
+  args.push("-c:v", encoder);
+  if (encoder === "h264_nvenc") {
+    args.push("-preset", "p4", "-tune", "hq", "-rc", "vbr");
+  } else if (encoder === "h264_qsv") {
+    args.push("-preset", "medium", "-look_ahead", "0");
+  } else if (encoder === "h264_amf") {
+    args.push("-quality", "quality", "-rc", "cbr");
+  } else {
+    args.push("-profile:v", "high", "-rc_mode", "bitrate");
+  }
+  args.push(
+    "-b:v",
+    String(encoding.videoBitrate),
+    "-maxrate",
+    String(encoding.videoBitrate),
+    "-bufsize",
+    String(Math.min(36_000_000, encoding.videoBitrate * 2)),
+    "-g",
+    String(gopFrames),
+    "-keyint_min",
+    String(gopFrames),
+    "-sc_threshold",
+    "0",
+    "-force_key_frames",
+    "expr:gte(t,n_forced*2)",
+    "-tag:v",
+    "avc1",
+  );
+}
+
+class CmafRelayCoordinator {
+  constructor(config, options = {}) {
+    this.config = config;
+    this.token = config.token;
+    this.sendEvent =
+      typeof options.sendEvent === "function" ? options.sendEvent : () => {};
+    this.rootDir = path.resolve(
+      options.cacheDir ||
+        path.join(process.cwd(), ".synced-emby-segment-cache"),
+      config.assetId,
+      String(config.mediaVersion),
+    );
+    fs.mkdirSync(this.rootDir, { recursive: true });
+    this.maxDiskBytes = segmentCacheBudget(
+      this.rootDir,
+      options.maxDiskBytes,
+    );
+    this.renditions = new Map();
+    this.records = new Map();
+    this.failedRecords = new Set();
+    this.uploadQueue = [];
+    this.uploadHead = 0;
+    this.activeUploads = 0;
+    this.memoryQueuedBytes = 0;
+    this.diskBytes = 0;
+    this.manifestDirty = false;
+    this.manifestUploading = false;
+    this.manifestRetryTimer = undefined;
+    this.manifestRetryAttempts = 0;
+    this.manifestEnded = false;
+    this.manifestSubtitle = undefined;
+    this.playbackAnchorTimeMs = undefined;
+    this.closed = false;
+    this.generation = 1;
+    this.controller = new AbortController();
+  }
+
+  updateToken(token) {
+    const next = cleanText(token, 2_048);
+    if (next.length < 64 || next === this.token) return false;
+    this.token = next;
+    for (const record of this.failedRecords) {
+      record.failed = false;
+      this.uploadQueue.push(record);
+    }
+    this.failedRecords.clear();
+    this.pumpUploads();
+    this.scheduleManifest();
+    return true;
+  }
+
+  registerProducer(renditionId, controls = {}) {
+    const state = this.ensureRendition(renditionId);
+    state.pause = typeof controls.pause === "function" ? controls.pause : () => {};
+    state.resume =
+      typeof controls.resume === "function" ? controls.resume : () => {};
+    this.updatePressure();
+  }
+
+  unregisterProducer(renditionId) {
+    const state = this.renditions.get(renditionId);
+    if (!state) return;
+    state.pause = () => {};
+    state.resume = () => {};
+  }
+
+  updatePlaybackAnchor(positionTicks) {
+    const ticks = Number(positionTicks);
+    if (!Number.isFinite(ticks) || ticks < 0 || this.closed) return false;
+    const next = ticks / 10_000;
+    const changed =
+      this.playbackAnchorTimeMs === undefined ||
+      Math.abs(next - this.playbackAnchorTimeMs) >= 250;
+    this.playbackAnchorTimeMs = next;
+    this.updatePressure();
+    if (changed) this.scheduleManifest();
+    return changed;
+  }
+
+  forwardWindowMs() {
+    const totalBitrate = [...this.renditions.values()].reduce(
+      (sum, state) =>
+        sum + Math.max(0, Number(state.plan?.bitrate) || 0),
+      0,
+    );
+    if (!totalBitrate) return 2 * 60 * 60_000;
+    const totalBudgetedMs = Math.floor(
+      ((this.maxDiskBytes * 8 * 0.72) / totalBitrate) * 1_000,
+    );
+    // Reserve one minute of the quota for the current/rewind window. On a
+    // small volume, urgent playback wins over a nominal two-minute prefetch
+    // floor; larger volumes naturally expand toward the two-hour ceiling.
+    const forwardBudgetedMs = totalBudgetedMs - 60_000;
+    return Math.min(
+      2 * 60 * 60_000,
+      Math.max(15_000, forwardBudgetedMs),
+    );
+  }
+
+  ensureRendition(renditionId) {
+    const id = /^[a-z0-9][a-z0-9-]{0,31}$/i.test(String(renditionId || ""))
+      ? String(renditionId).toLowerCase()
+      : "selected";
+    let state = this.renditions.get(id);
+    if (!state) {
+      state = {
+        id,
+        plan: undefined,
+        mimeType: "",
+        switchGroup: "",
+        initPath: "",
+        initUploaded: false,
+        segments: new Map(),
+        descriptors: new Map(),
+        pending: [],
+        pendingHead: 0,
+        spooling: false,
+        recentCadenceMs: [],
+        previousRawTimeMs: undefined,
+        previousTimelineTimeMs: undefined,
+        timestampOffsetMs: 0,
+        pause: () => {},
+        resume: () => {},
+        pressurePaused: false,
+        ended: false,
+      };
+      this.renditions.set(id, state);
+    }
+    return state;
+  }
+
+  publishInit(renditionId, plan, mimeType, data, title) {
+    if (this.closed) return;
+    const state = this.ensureRendition(renditionId);
+    state.plan = plan;
+    state.mimeType = cleanText(mimeType, 180);
+    state.switchGroup = `${state.mimeType
+      .replace(/\s+/g, "")
+      .replace(/level-id=[^,;"]+/gi, "")
+      .slice(0, 96)}:${
+        plan.method === "Transcode" || plan.localVideoTranscode
+          ? "gop2"
+          : "source-gop"
+      }`;
+    state.title = cleanText(title, 300) || "Emby 影片";
+    state.initPath = this.relativeMediaPath(state.id, "init.mp4");
+    this.enqueueSpool(state, {
+      kind: "init",
+      sequence: 0,
+      data,
+      relativePath: state.initPath,
+      contentType: "video/mp4",
+      headers: {},
+    });
+  }
+
+  publishFragment(renditionId, fragment) {
+    if (this.closed) return;
+    const state = this.ensureRendition(renditionId);
+    if (!state.plan || !state.mimeType) return;
+    const rawTimeMs = Number(fragment.mediaTimeMs);
+    let timelineTimeMs;
+    if (
+      state.previousRawTimeMs === undefined ||
+      state.previousTimelineTimeMs === undefined
+    ) {
+      const startMs = Number(state.plan.startTimeTicks || 0) / 10_000;
+      state.timestampOffsetMs = startMs - rawTimeMs;
+      timelineTimeMs = startMs;
+    } else {
+      const rawDelta = rawTimeMs - state.previousRawTimeMs;
+      const sorted = [...state.recentCadenceMs].sort((left, right) => left - right);
+      const cadence = sorted.length
+        ? sorted[Math.floor(sorted.length / 2)]
+        : 2_000;
+      if (rawDelta >= 100 && rawDelta <= 6_000) {
+        state.recentCadenceMs.push(rawDelta);
+        if (state.recentCadenceMs.length > 16) {
+          state.recentCadenceMs.shift();
+        }
+        timelineTimeMs = rawTimeMs + state.timestampOffsetMs;
+      } else {
+        timelineTimeMs = state.previousTimelineTimeMs + cadence;
+        state.timestampOffsetMs = timelineTimeMs - rawTimeMs;
+      }
+      const previous = state.descriptors.get(
+        Number(fragment.sequence) - 1,
+      );
+      if (previous) {
+        previous.durationMs = Math.max(
+          1,
+          timelineTimeMs - previous.timelineTimeMs,
+        );
+        this.scheduleManifest();
+      }
+    }
+    state.previousRawTimeMs = rawTimeMs;
+    state.previousTimelineTimeMs = timelineTimeMs;
+    const sequence = Number(fragment.sequence);
+    const relativePath = this.relativeMediaPath(
+      state.id,
+      `segments/${sequence}.m4s`,
+    );
+    const descriptor = {
+      sequence,
+      mediaTimeMs: rawTimeMs,
+      timelineTimeMs,
+      durationMs: Math.max(
+        1,
+        state.recentCadenceMs.at(-1) || 2_000,
+      ),
+      keyframe: fragment.keyframe === true,
+      bytes: fragment.data.length,
+      path: relativePath,
+    };
+    state.descriptors.set(sequence, descriptor);
+    this.enqueueSpool(state, {
+      kind: "segment",
+      sequence,
+      data: fragment.data,
+      relativePath,
+      contentType: "video/iso.segment",
+      headers: {
+        "x-synced-media-time-ms": String(rawTimeMs),
+        "x-synced-duration-ms": String(
+          Math.max(
+            1,
+            state.recentCadenceMs.at(-1) || 2_000,
+          ),
+        ),
+        "x-synced-keyframe": String(fragment.keyframe === true),
+        "x-synced-bitrate": String(
+          Math.max(1, Number(state.plan.bitrate) || 1),
+        ),
+      },
+      descriptor,
+    });
+  }
+
+  markRenditionEnded(renditionId) {
+    const state = this.renditions.get(renditionId);
+    if (!state) return;
+    state.ended = true;
+    // The ended marker is published only after the spool and upload queues
+    // drain. Publishing it here can make viewers stop polling before the last
+    // moof/mdat pairs have reached the relay.
+    this.scheduleManifest();
+  }
+
+  relativeMediaPath(renditionId, suffix) {
+    const base = this.config.baseUrl.pathname;
+    return (
+      `${base}rooms/${this.config.roomId}/assets/${this.config.assetId}/` +
+      `versions/${this.config.mediaVersion}/renditions/${renditionId}/${suffix}`
+    );
+  }
+
+  manifestPath() {
+    const base = this.config.baseUrl.pathname;
+    return (
+      `${base}rooms/${this.config.roomId}/assets/${this.config.assetId}/` +
+      `versions/${this.config.mediaVersion}/manifest.json`
+    );
+  }
+
+  subtitlePath() {
+    const base = this.config.baseUrl.pathname;
+    return (
+      `${base}rooms/${this.config.roomId}/assets/${this.config.assetId}/` +
+      `versions/${this.config.mediaVersion}/subtitle.vtt`
+    );
+  }
+
+  publishSubtitle(subtitle) {
+    const text = String(subtitle?.text || "");
+    if (
+      this.closed ||
+      !text.trim() ||
+      Buffer.byteLength(text) > 12 * 1024 * 1024
+    ) {
+      return;
+    }
+    const relativePath = this.subtitlePath();
+    const body = Buffer.from(text, "utf8");
+    const filePath = path.join(this.rootDir, "subtitle.vtt");
+    void fsp
+      .writeFile(filePath, body, { mode: 0o600 })
+      .then(() =>
+        this.uploadFile(
+          new URL(relativePath, this.config.baseUrl),
+          filePath,
+          body.length,
+          {
+            "content-type": "text/vtt; charset=utf-8",
+            "x-content-sha256": createHash("sha256")
+              .update(body)
+              .digest("hex"),
+          },
+        ),
+      )
+      .then(() => {
+        this.manifestSubtitle = {
+          path: relativePath,
+          language: cleanText(subtitle.language, 24) || undefined,
+          title: cleanText(subtitle.title, 160) || "字幕",
+        };
+        this.scheduleManifest();
+      })
+      .catch((error) => {
+        this.sendEvent({
+          type: "warning",
+          code: "segment-subtitle-upload-failed",
+          message: cleanText(error?.message || error, 500),
+        });
+      });
+  }
+
+  enqueueSpool(state, item) {
+    const data = Buffer.isBuffer(item.data)
+      ? item.data
+      : Buffer.from(item.data);
+    if (data.length > 96 * 1024 * 1024) {
+      this.sendEvent({
+        type: "warning",
+        code: "segment-too-large",
+        message: `${state.id} 分片超过 96 MiB，已拒绝进入缓存`,
+      });
+      return;
+    }
+    item.data = data;
+    item.sha256 = createHash("sha256").update(data).digest("hex");
+    if (item.descriptor) item.descriptor.sha256 = item.sha256;
+    state.pending.push(item);
+    this.memoryQueuedBytes += data.length;
+    this.updatePressure();
+    this.pumpSpool(state);
+  }
+
+  pumpSpool(state) {
+    if (
+      state.spooling ||
+      this.closed ||
+      state.pendingHead >= state.pending.length
+    ) {
+      return;
+    }
+    state.spooling = true;
+    const generation = this.generation;
+    void (async () => {
+      while (
+        !this.closed &&
+        generation === this.generation &&
+        state.pendingHead < state.pending.length
+      ) {
+        const item = state.pending[state.pendingHead++];
+        const fileName =
+          item.kind === "init" ? "init.mp4" : `${item.sequence}.m4s`;
+        const directory = path.join(this.rootDir, state.id);
+        const filePath = path.join(directory, fileName);
+        const temporaryPath = `${filePath}.${randomUUID()}.tmp`;
+        try {
+          await fsp.mkdir(directory, { recursive: true });
+          await fsp.writeFile(temporaryPath, item.data, { mode: 0o600 });
+          await fsp.rename(temporaryPath, filePath).catch(async (error) => {
+            if (error?.code !== "EEXIST" && error?.code !== "EPERM") {
+              throw error;
+            }
+            await fsp.unlink(filePath).catch(() => undefined);
+            await fsp.rename(temporaryPath, filePath);
+          });
+          const key = `${state.id}:${item.kind}:${item.sequence}`;
+          const previous = this.records.get(key);
+          if (previous) this.diskBytes -= previous.bytes;
+          const record = {
+            ...item,
+            data: undefined,
+            key,
+            renditionId: state.id,
+            filePath,
+            bytes: item.data.length,
+            uploaded: false,
+            failed: false,
+            cachedAt: Date.now(),
+          };
+          this.records.set(key, record);
+          this.diskBytes += record.bytes;
+          this.uploadQueue.push(record);
+          this.pumpUploads();
+        } catch (error) {
+          await fsp.unlink(temporaryPath).catch(() => undefined);
+          this.sendEvent({
+            type: "warning",
+            code: "segment-spool-failed",
+            message: cleanText(error?.message || error, 500),
+          });
+        } finally {
+          this.memoryQueuedBytes = Math.max(
+            0,
+            this.memoryQueuedBytes - item.data.length,
+          );
+          item.data = undefined;
+          this.evictDisk();
+          this.updatePressure();
+        }
+      }
+      if (
+        state.pendingHead > 512 &&
+        state.pendingHead * 2 >= state.pending.length
+      ) {
+        state.pending = state.pending.slice(state.pendingHead);
+        state.pendingHead = 0;
+      }
+    })().finally(() => {
+      state.spooling = false;
+      if (state.pendingHead < state.pending.length) this.pumpSpool(state);
+    });
+  }
+
+  pumpUploads() {
+    while (
+      !this.closed &&
+      this.activeUploads < RELAY_UPLOAD_CONCURRENCY &&
+      this.uploadHead < this.uploadQueue.length
+    ) {
+      const record = this.uploadQueue[this.uploadHead++];
+      if (record.uploaded || record.failed) continue;
+      this.activeUploads += 1;
+      void this.uploadRecord(record)
+        .catch((error) => {
+          record.failed = true;
+          this.failedRecords.add(record);
+          this.sendEvent({
+            type: "warning",
+            code: "segment-relay-upload-failed",
+            message: cleanText(error?.message || error, 500),
+            renditionId: record.renditionId,
+          });
+        })
+        .finally(() => {
+          this.activeUploads = Math.max(0, this.activeUploads - 1);
+          if (
+            this.uploadHead > 1_024 &&
+            this.uploadHead * 2 >= this.uploadQueue.length
+          ) {
+            this.uploadQueue = this.uploadQueue.slice(this.uploadHead);
+            this.uploadHead = 0;
+          }
+          this.evictDisk();
+          this.updatePressure();
+          this.pumpUploads();
+        });
+    }
+  }
+
+  async uploadRecord(record) {
+    const url = new URL(record.relativePath, this.config.baseUrl);
+    await this.uploadFile(url, record.filePath, record.bytes, {
+      "content-type": record.contentType,
+      "x-content-sha256": record.sha256,
+      ...record.headers,
+    });
+    record.uploaded = true;
+    const state = this.renditions.get(record.renditionId);
+    if (!state) return;
+    if (record.kind === "init") {
+      state.initUploaded = true;
+    } else if (record.descriptor) {
+      state.segments.set(record.sequence, record.descriptor);
+    }
+    this.scheduleManifest();
+  }
+
+  async uploadFile(url, filePath, bytes, headers) {
+    let lastError;
+    for (let attempt = 1; attempt <= RELAY_UPLOAD_MAX_ATTEMPTS; attempt += 1) {
+      if (this.closed || this.controller.signal.aborted) {
+        throw new Error("分片上传已取消");
+      }
+      const controller = new AbortController();
+      const abort = () => controller.abort(this.controller.signal.reason);
+      this.controller.signal.addEventListener("abort", abort, { once: true });
+      const stream = fs.createReadStream(filePath);
+      let idleTimer;
+      const refreshIdle = () => {
+        clearTimeout(idleTimer);
+        idleTimer = setTimeout(
+          () => controller.abort("segment-upload-idle"),
+          RELAY_UPLOAD_IDLE_TIMEOUT_MS,
+        );
+        idleTimer.unref?.();
+      };
+      refreshIdle();
+      const monitoredBody = (async function* () {
+        for await (const chunk of stream) {
+          refreshIdle();
+          yield chunk;
+        }
+      })();
+      try {
+        const response = await fetch(url, {
+          method: "PUT",
+          headers: {
+            authorization: `Bearer ${this.token}`,
+            "content-length": String(bytes),
+            ...headers,
+          },
+          body: monitoredBody,
+          duplex: "half",
+          signal: controller.signal,
+        });
+        if (!response.ok) {
+          throw new Error(`HTTPS 分片上传失败（${response.status}）`);
+        }
+        await response.body?.cancel().catch(() => undefined);
+        return;
+      } catch (error) {
+        lastError = error;
+        stream.destroy();
+        if (attempt < RELAY_UPLOAD_MAX_ATTEMPTS) {
+          await new Promise((resolve) =>
+            setTimeout(resolve, 250 * 2 ** (attempt - 1)),
+          );
+        }
+      } finally {
+        clearTimeout(idleTimer);
+        this.controller.signal.removeEventListener("abort", abort);
+      }
+    }
+    throw lastError || new Error("HTTPS 分片上传失败");
+  }
+
+  scheduleManifest() {
+    this.manifestDirty = true;
+    if (
+      this.manifestUploading ||
+      this.manifestRetryTimer ||
+      this.closed
+    ) {
+      return;
+    }
+    this.manifestUploading = true;
+    let failed = false;
+    void this.flushManifest()
+      .then(() => {
+        this.manifestRetryAttempts = 0;
+      })
+      .catch((error) => {
+        failed = true;
+        this.manifestDirty = true;
+        this.manifestRetryAttempts += 1;
+        this.sendEvent({
+          type: "warning",
+          code: "segment-manifest-upload-failed",
+          message: cleanText(error?.message || error, 500),
+        });
+        if (!this.closed && !this.manifestRetryTimer) {
+          const retryMs = Math.min(
+            15_000,
+            500 * 2 ** Math.min(5, this.manifestRetryAttempts - 1),
+          );
+          this.manifestRetryTimer = setTimeout(() => {
+            this.manifestRetryTimer = undefined;
+            this.scheduleManifest();
+          }, retryMs);
+          this.manifestRetryTimer.unref?.();
+        }
+      })
+      .finally(() => {
+        this.manifestUploading = false;
+        if (
+          this.manifestDirty &&
+          !this.closed &&
+          !failed &&
+          !this.manifestRetryTimer
+        ) {
+          this.scheduleManifest();
+        }
+      });
+  }
+
+  async flushManifest() {
+    while (this.manifestDirty && !this.closed) {
+      this.manifestDirty = false;
+      const ready = [...this.renditions.values()].filter(
+        (state) => state.initUploaded && state.plan,
+      );
+      if (!ready.length) continue;
+      const primary = ready[0];
+      const anchorTimeMs =
+        this.playbackAnchorTimeMs ??
+        Number(primary.plan.startTimeTicks || 0) / 10_000;
+      for (const state of ready) {
+        for (const [sequence, descriptor] of state.descriptors) {
+          if (descriptor.timelineTimeMs >= anchorTimeMs - 120_000) break;
+          state.descriptors.delete(sequence);
+          state.segments.delete(sequence);
+        }
+      }
+      const buildManifest = (deepWindowMs) => ({
+        protocol: "synced-cmaf-v1",
+        segmentEncoding: "tuple-v1",
+        roomId: this.config.roomId,
+        sessionId: this.config.sessionId,
+        assetId: this.config.assetId,
+        mediaVersion: this.config.mediaVersion,
+        title: primary.title || "Emby 影片",
+        startTimeTicks: Number(primary.plan.startTimeTicks) || 0,
+        runtimeTicks: Number(primary.plan.runtimeTicks) || undefined,
+        updatedAt: Date.now(),
+        ended: this.manifestEnded,
+        subtitle: this.manifestSubtitle,
+        renditions: ready
+          .map((state) => ({
+            id: state.id,
+            label: cleanText(state.plan.quality?.label || state.id, 80),
+            width: Number(state.plan.width) || 1,
+            height: Number(state.plan.height) || 1,
+            frameRate: Number(state.plan.frameRate) || 30,
+            bitrate: Number(state.plan.bitrate) || 1,
+            mimeType: state.mimeType,
+            switchGroup: state.switchGroup,
+            initPath: state.initPath,
+            segments: [...state.segments.values()]
+              .filter(
+                (segment) =>
+                  segment.timelineTimeMs >= anchorTimeMs - 60_000 &&
+                  segment.timelineTimeMs <= anchorTimeMs + deepWindowMs,
+              )
+              .sort(
+                (left, right) =>
+                  left.timelineTimeMs - right.timelineTimeMs ||
+                  left.sequence - right.sequence,
+              )
+              .map((segment) => [
+                segment.sequence,
+                segment.mediaTimeMs,
+                segment.timelineTimeMs,
+                segment.durationMs,
+                segment.keyframe ? 1 : 0,
+                segment.bytes,
+                segment.sha256,
+              ]),
+          }))
+          .sort(
+            (left, right) =>
+              left.bitrate - right.bitrate || left.height - right.height,
+          ),
+      });
+      let deepWindowMs = this.forwardWindowMs();
+      let manifest = buildManifest(deepWindowMs);
+      let body = Buffer.from(JSON.stringify(manifest));
+      while (body.length > 1_900_000 && deepWindowMs > 5 * 60_000) {
+        deepWindowMs = Math.max(5 * 60_000, Math.floor(deepWindowMs * 0.75));
+        manifest = buildManifest(deepWindowMs);
+        body = Buffer.from(JSON.stringify(manifest));
+      }
+      const filePath = path.join(this.rootDir, "manifest.json");
+      await fsp.writeFile(filePath, body, { mode: 0o600 });
+      try {
+        await this.uploadFile(
+          new URL(this.manifestPath(), this.config.baseUrl),
+          filePath,
+          body.length,
+          {
+            "content-type": "application/json; charset=utf-8",
+            "x-content-sha256": createHash("sha256")
+              .update(body)
+              .digest("hex"),
+          },
+        );
+      } catch (error) {
+        this.manifestDirty = true;
+        throw error;
+      }
+    }
+  }
+
+  evictDisk() {
+    if (this.diskBytes <= this.maxDiskBytes) return;
+    const targetBytes = this.maxDiskBytes * 0.85;
+    for (const [key, record] of this.records) {
+      if (this.diskBytes <= targetBytes) break;
+      if (!record.uploaded || record.kind === "init") continue;
+      this.records.delete(key);
+      this.diskBytes = Math.max(0, this.diskBytes - record.bytes);
+      void fsp.unlink(record.filePath).catch(() => undefined);
+    }
+  }
+
+  updatePressure() {
+    const storagePressured =
+      this.memoryQueuedBytes >= RELAY_MEMORY_HIGH_WATER_BYTES ||
+      this.diskBytes >= this.maxDiskBytes;
+    const storageRecovered =
+      this.memoryQueuedBytes <= RELAY_MEMORY_LOW_WATER_BYTES &&
+      this.diskBytes < this.maxDiskBytes * 0.9;
+    const forwardWindowMs = this.forwardWindowMs();
+    for (const state of this.renditions.values()) {
+      const aheadMs =
+        this.playbackAnchorTimeMs !== undefined &&
+        state.previousTimelineTimeMs !== undefined
+          ? state.previousTimelineTimeMs - this.playbackAnchorTimeMs
+          : 0;
+      const horizonPressured = aheadMs >= forwardWindowMs;
+      const horizonRecovered = aheadMs <= forwardWindowMs * 0.9;
+      if (
+        (storagePressured || horizonPressured) &&
+        !state.pressurePaused
+      ) {
+        state.pressurePaused = true;
+        state.pause();
+      } else if (
+        storageRecovered &&
+        horizonRecovered &&
+        state.pressurePaused
+      ) {
+        state.pressurePaused = false;
+        state.resume();
+      }
+    }
+  }
+
+  dataQueuesDrained() {
+    return (
+      this.activeUploads === 0 &&
+      this.uploadHead >= this.uploadQueue.length &&
+      [...this.renditions.values()].every(
+        (state) =>
+          !state.spooling && state.pendingHead >= state.pending.length,
+      )
+    );
+  }
+
+  async waitForFinalDrain(timeoutMs = RELAY_FINAL_DRAIN_TIMEOUT_MS) {
+    const deadline = performance.now() + timeoutMs;
+    while (!this.closed && performance.now() < deadline) {
+      for (const state of this.renditions.values()) this.pumpSpool(state);
+      this.pumpUploads();
+      if (this.dataQueuesDrained()) return true;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    return this.dataQueuesDrained();
+  }
+
+  async waitForManifestIdle(timeoutMs = 3_000) {
+    const deadline = performance.now() + timeoutMs;
+    while (
+      !this.closed &&
+      this.manifestUploading &&
+      performance.now() < deadline
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    return !this.manifestUploading;
+  }
+
+  async close(ended = false) {
+    if (this.closed) return;
+    if (this.manifestRetryTimer) {
+      clearTimeout(this.manifestRetryTimer);
+      this.manifestRetryTimer = undefined;
+    }
+    if (ended) {
+      const drained = await this.waitForFinalDrain();
+      await this.waitForManifestIdle();
+      this.manifestEnded = true;
+      this.manifestDirty = true;
+      let finalManifestTimer;
+      try {
+        await Promise.race([
+          this.flushManifest().catch((error) => {
+            this.sendEvent({
+              type: "warning",
+              code: "segment-final-manifest-upload-failed",
+              message: cleanText(error?.message || error, 500),
+            });
+          }),
+          new Promise((resolve) => {
+            finalManifestTimer = setTimeout(resolve, 3_000);
+          }),
+        ]);
+      } finally {
+        clearTimeout(finalManifestTimer);
+      }
+      if (!drained) {
+        this.sendEvent({
+          type: "warning",
+          code: "segment-relay-final-drain-timeout",
+          message: "分片尾部在 10 秒内未完成上传，已执行有界关闭",
+        });
+      }
+    }
+    this.closed = true;
+    this.generation += 1;
+    this.controller.abort("relay-closed");
+    for (const state of this.renditions.values()) {
+      if (state.pressurePaused) state.resume();
+    }
+  }
+}
+
 class EmbyService {
   constructor(options = {}) {
-    this.version = cleanText(options.version || "2.8.1", 32);
+    this.version = cleanText(options.version || "2.9.0", 32);
     this.deviceId = cleanText(options.deviceId || randomUUID(), 128);
     this.ffmpegPath = resolveFfmpegPath(options);
     this.spawnProcess =
       typeof options.spawnProcess === "function" ? options.spawnProcess : spawn;
+    this.allowHardwareEncoding =
+      options.allowHardwareEncoding !== false &&
+      this.spawnProcess === spawn;
     this.sendEvent =
       typeof options.sendEvent === "function" ? options.sendEvent : () => {};
+    this.cacheDir = cleanText(options.cacheDir, 4_096) || undefined;
+    this.maxSegmentCacheBytes =
+      Number(options.maxSegmentCacheBytes) || undefined;
+    this.relayCoordinator = options.relayCoordinator;
+    this.ownsRelayCoordinator = false;
+    this.auxiliary = options.auxiliary === true;
+    this.auxiliaryServices = new Map();
     this.streamInitTimeoutMs = Math.max(
       500,
       Math.min(
@@ -1968,6 +3221,16 @@ class EmbyService {
         Number(options.streamInitTimeoutMs) || STREAM_INIT_TIMEOUT_MS,
       ),
     );
+    this.childServiceOptions = {
+      version: this.version,
+      deviceId: this.deviceId,
+      ffmpegPath: this.ffmpegPath,
+      spawnProcess: this.spawnProcess,
+      streamInitTimeoutMs: this.streamInitTimeoutMs,
+      cacheDir: this.cacheDir,
+      maxSegmentCacheBytes: this.maxSegmentCacheBytes,
+      allowHardwareEncoding: this.allowHardwareEncoding,
+    };
     this.session = undefined;
     this.pipeline = undefined;
     this.streamGeneration = 0;
@@ -2850,6 +4113,17 @@ class EmbyService {
     if (generation !== this.streamGeneration) {
       throw new Error("Emby 启动请求已被停止或替代");
     }
+    const hardwareVideoEncoder =
+      plan.internal.localVideoTranscode && this.allowHardwareEncoding
+        ? await probeHardwareEncoder(this.ffmpegPath)
+        : undefined;
+    if (generation !== this.streamGeneration) {
+      throw new Error("Emby 启动请求已被停止或替代");
+    }
+    if (plan.internal.localVideoTranscode) {
+      plan.public.localVideoEncoder =
+        hardwareVideoEncoder || "libopenh264";
+    }
     const proxy = new EmbyLoopbackProxy(this.requireSession());
     await proxy.start();
     if (generation !== this.streamGeneration) {
@@ -2858,6 +4132,35 @@ class EmbyService {
     }
     const pipelineId = randomUUID();
     const parser = new FragmentedMp4Parser();
+    const relayConfig = normalizeSegmentRelayConfig(input.segmentRelay);
+    if (relayConfig && !this.relayCoordinator) {
+      this.relayCoordinator = new CmafRelayCoordinator(relayConfig, {
+        cacheDir: this.cacheDir,
+        maxDiskBytes: this.maxSegmentCacheBytes,
+        sendEvent: (event) =>
+          this.sendEvent({
+            ...event,
+            pipelineId,
+          }),
+      });
+      this.ownsRelayCoordinator = true;
+    }
+    const relayCoordinator = relayConfig
+      ? this.relayCoordinator
+      : undefined;
+    if (relayCoordinator && !this.auxiliary) {
+      relayCoordinator.updatePlaybackAnchor(plan.public.startTimeTicks);
+    }
+    // The host preview pipeline is paced by local MSE flow control. Deep
+    // caching uses independent auxiliary producers so cache pressure can
+    // never pause the host's urgent playback path.
+    const relayProducer =
+      relayCoordinator && this.auxiliary
+        ? relayCoordinator
+        : undefined;
+    const renditionId =
+      cleanText(input.renditionId, 32).toLowerCase() ||
+      renditionIdForQuality(plan.public.quality);
     const startSeconds = plan.public.startTimeTicks / 10_000_000;
     const readAhead = embyReadAheadProfile(
       plan.public.bitrate,
@@ -2870,13 +4173,17 @@ class EmbyService {
       "-nostdin",
       "-fflags",
       "+genpts+discardcorrupt",
-      "-readrate",
-      String(readAhead.readRate),
-      "-readrate_initial_burst",
-      String(readAhead.initialBurstSeconds),
-      "-readrate_catchup",
-      String(readAhead.catchupRate),
     ];
+    if (!(relayCoordinator && input.singleRendition === true)) {
+      args.push(
+        "-readrate",
+        String(readAhead.readRate),
+        "-readrate_initial_burst",
+        String(readAhead.initialBurstSeconds),
+        "-readrate_catchup",
+        String(readAhead.catchupRate),
+      );
+    }
     if (
       startSeconds > 0 &&
       (["DirectPlay", "LocalRemux"].includes(plan.public.method) ||
@@ -2928,22 +4235,12 @@ class EmbyService {
       args.push(
         "-vf",
         `scale=w='min(iw,${encoding.maxWidth})':h='min(ih,${encoding.maxHeight})':force_original_aspect_ratio=decrease:force_divisible_by=2,fps=${encodingFrameRate},setsar=1,format=yuv420p`,
-        "-c:v",
-        "libopenh264",
-        "-profile:v",
-        "high",
-        "-rc_mode",
-        "bitrate",
-        "-b:v",
-        String(encoding.videoBitrate),
-        "-maxrate",
-        String(encoding.videoBitrate),
-        "-bufsize",
-        String(Math.min(36_000_000, encoding.videoBitrate * 2)),
-        "-force_key_frames",
-        "expr:gte(t,n_forced*2)",
-        "-tag:v",
-        "avc1",
+      );
+      appendH264EncoderArguments(
+        args,
+        hardwareVideoEncoder || "libopenh264",
+        encoding,
+        encodingFrameRate,
       );
     } else {
       args.push("-c:v", "copy");
@@ -2979,16 +4276,11 @@ class EmbyService {
       "-max_interleave_delta",
       "0",
       "-movflags",
-      "+empty_moov+default_base_moof",
+      "+empty_moov+default_base_moof+frag_keyframe",
       "-frag_duration",
-      "750000",
+      "2000000",
       "-min_frag_duration",
-      "350000",
-      // A duration boundary alone can still produce multi-megabyte 4K
-      // fragments around large keyframes. Bound each IPC/MSE unit as well so
-      // the renderer stays responsive during the startup burst.
-      "-frag_size",
-      "1500000",
+      "1000000",
       "-f",
       "mp4",
       "pipe:1",
@@ -3019,8 +4311,30 @@ class EmbyService {
       stopReported: false,
       initReceived: false,
       initTimer: undefined,
+      lastParsedMediaTimeMs: undefined,
+      lastParsedSequence: 0,
+      lastEmittedMediaTimeMs: undefined,
+      lastEmittedSequence: 0,
+      recentFragmentCadenceMs: [],
+      renditionId,
+      relayCoordinator: relayProducer,
+      relayPaused: false,
+      progressWatchdog: undefined,
+      lastProgressAt: Date.now(),
     };
     this.pipeline = pipeline;
+    relayProducer?.registerProducer(renditionId, {
+      pause: () => {
+        if (this.pipeline !== pipeline || pipeline.stopping) return;
+        pipeline.relayPaused = true;
+        pipeline.child.stdout.pause();
+      },
+      resume: () => {
+        if (this.pipeline !== pipeline || pipeline.stopping) return;
+        pipeline.relayPaused = false;
+        if (!pipeline.paused) pipeline.child.stdout.resume();
+      },
+    });
     pipeline.initTimer = setTimeout(() => {
       if (
         this.pipeline !== pipeline ||
@@ -3061,22 +4375,74 @@ class EmbyService {
         data,
         mimeType,
         plan: plan.public,
+        renditionId,
+        auxiliary: this.auxiliary,
       });
+      relayProducer?.publishInit(
+        renditionId,
+        plan.public,
+        mimeType,
+        data,
+        cleanText(input.title, 300) || plan.public.itemId,
+      );
     });
     parser.on(
       "fragment",
       ({ sequence, mediaTimeMs, keyframe, timelineRepairs, data }) => {
       if (this.pipeline !== pipeline) return;
+      const parsedMediaTimeMs = Number.isFinite(mediaTimeMs)
+        ? mediaTimeMs
+        : undefined;
+      if (
+        parsedMediaTimeMs !== undefined &&
+        pipeline.lastParsedMediaTimeMs !== undefined &&
+        sequence > pipeline.lastParsedSequence
+      ) {
+        const cadence =
+          (parsedMediaTimeMs - pipeline.lastParsedMediaTimeMs) /
+          (sequence - pipeline.lastParsedSequence);
+        if (cadence >= 100 && cadence <= 4_000) {
+          pipeline.recentFragmentCadenceMs.push(cadence);
+          if (pipeline.recentFragmentCadenceMs.length > 16) {
+            pipeline.recentFragmentCadenceMs.shift();
+          }
+        }
+      }
+      if (parsedMediaTimeMs !== undefined) {
+        pipeline.lastParsedMediaTimeMs = parsedMediaTimeMs;
+        pipeline.lastParsedSequence = sequence;
+      }
+      const sortedCadence = [...pipeline.recentFragmentCadenceMs].sort(
+        (left, right) => left - right,
+      );
+      const fallbackCadenceMs = sortedCadence.length
+        ? sortedCadence[Math.floor(sortedCadence.length / 2)]
+        : 2_000;
+      const normalizedMediaTimeMs =
+        parsedMediaTimeMs ??
+        (pipeline.lastEmittedMediaTimeMs !== undefined
+          ? pipeline.lastEmittedMediaTimeMs +
+            Math.max(1, sequence - pipeline.lastEmittedSequence) *
+              fallbackCadenceMs
+          : plan.public.startTimeTicks / 10_000);
+      pipeline.lastEmittedMediaTimeMs = normalizedMediaTimeMs;
+      pipeline.lastEmittedSequence = sequence;
       this.sendEvent({
         type: "fragment",
         pipelineId,
         sequence,
         timestampMs: Date.now(),
-        mediaTimeMs: Number.isFinite(mediaTimeMs)
-          ? mediaTimeMs
-          : plan.public.startTimeTicks / 10_000 + (sequence - 1) * 1_500,
-        keyframe: keyframe !== false,
+        mediaTimeMs: normalizedMediaTimeMs,
+        keyframe: keyframe === true,
         timelineRepairs,
+        data,
+        renditionId,
+        auxiliary: this.auxiliary,
+      });
+      relayProducer?.publishFragment(renditionId, {
+        sequence,
+        mediaTimeMs: normalizedMediaTimeMs,
+        keyframe: keyframe === true,
         data,
       });
       },
@@ -3111,6 +4477,7 @@ class EmbyService {
     };
     child.stdout.on("data", (chunk) => {
       if (parserFailed || this.pipeline !== pipeline) return;
+      pipeline.lastProgressAt = Date.now();
       try {
         parser.push(chunk);
       } catch (error) {
@@ -3120,6 +4487,7 @@ class EmbyService {
     child.stdout.once("end", finishParser);
     child.stdout.once("close", finishParser);
     child.stderr.on("data", (chunk) => {
+      pipeline.lastProgressAt = Date.now();
       pipeline.stderr = `${pipeline.stderr}${chunk.toString("utf8")}`.slice(
         -12_000,
       );
@@ -3135,6 +4503,7 @@ class EmbyService {
     });
     child.once("close", (code) => {
       if (this.pipeline !== pipeline || pipeline.stopping) return;
+      relayProducer?.markRenditionEnded(renditionId);
       const detail = pipeline.stderr
         .split(/\r?\n/)
         .map((line) => line.trim())
@@ -3157,14 +4526,39 @@ class EmbyService {
       type: "started",
       pipelineId,
       plan: plan.public,
+      renditionId,
+      auxiliary: this.auxiliary,
     });
-    void this.subtitleText(input, plan)
+    pipeline.progressWatchdog = setInterval(() => {
+      if (
+        this.pipeline !== pipeline ||
+        pipeline.stopping ||
+        pipeline.paused ||
+        pipeline.relayPaused
+      ) {
+        return;
+      }
+      if (Date.now() - pipeline.lastProgressAt < 30_000) return;
+      this.sendEvent({
+        type: "error",
+        pipelineId,
+        renditionId,
+        auxiliary: this.auxiliary,
+        message: "FFmpeg/代理连续 30 秒没有媒体进度，已终止当前管线",
+      });
+      void this.stopStream("progress-timeout");
+    }, 5_000);
+    pipeline.progressWatchdog.unref?.();
+    if (input.skipSubtitle !== true) void this.subtitleText(input, plan)
       .catch((error) => ({
         supported: false,
         message: cleanText(error?.message || error, 500),
       }))
       .then((subtitle) => {
         if (subtitle && this.pipeline === pipeline) {
+          if (subtitle.supported && subtitle.text) {
+            relayCoordinator?.publishSubtitle(subtitle);
+          }
           this.sendEvent({
             type: "subtitle",
             pipelineId,
@@ -3172,22 +4566,157 @@ class EmbyService {
           });
         }
       });
+    if (
+      relayCoordinator &&
+      this.ownsRelayCoordinator &&
+      input.singleRendition !== true
+    ) {
+      void this.startAuxiliaryRenditions(input);
+    }
     return { pipelineId, plan: plan.public };
   }
 
-  setFlowPaused(paused, expectedPipelineId) {
+  async startAuxiliaryRenditions(input) {
+    const coordinator = this.relayCoordinator;
+    if (!coordinator || this.auxiliary || this.pipeline?.stopping) return;
+    const specifications = [
+      {
+        id: "original",
+        quality: "original",
+        allowHevc: input.allowHevc === true,
+        forceVideoTranscode: false,
+      },
+      {
+        id: "1080p8",
+        quality: "1080p-8",
+        allowHevc: false,
+        forceVideoTranscode: true,
+      },
+      {
+        id: "720p4",
+        quality: "720p-4",
+        allowHevc: false,
+        forceVideoTranscode: true,
+      },
+      {
+        id: "480p18",
+        quality: "480p-1.8",
+        allowHevc: false,
+        forceVideoTranscode: true,
+      },
+    ];
+    for (const [index, specification] of specifications.entries()) {
+      if (!this.pipeline || this.pipeline.stopping || this.relayCoordinator !== coordinator) {
+        return;
+      }
+      if (index > 0) {
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+      const service = new EmbyService({
+        ...this.childServiceOptions,
+        relayCoordinator: coordinator,
+        auxiliary: true,
+        sendEvent: (event) => {
+          if (
+            event.type === "init" ||
+            event.type === "fragment" ||
+            event.type === "started" ||
+            event.type === "subtitle"
+          ) {
+            return;
+          }
+          this.sendEvent({
+            ...event,
+            renditionId: specification.id,
+            auxiliary: true,
+          });
+        },
+      });
+      service.session = this.session;
+      this.auxiliaryServices.set(specification.id, service);
+      void service
+        .startStream({
+          ...input,
+          quality: specification.quality,
+          allowHevc: specification.allowHevc,
+          forceVideoTranscode: specification.forceVideoTranscode,
+          renditionId: specification.id,
+          singleRendition: true,
+          skipSubtitle: true,
+        })
+        .catch((error) => {
+          if (this.auxiliaryServices.get(specification.id) === service) {
+            this.auxiliaryServices.delete(specification.id);
+          }
+          this.sendEvent({
+            type: "warning",
+            pipelineId: this.pipeline?.id || "",
+            code: "auxiliary-rendition-failed",
+            message: `${specification.id} 档位启动失败：${cleanText(
+              error?.message || error,
+              420,
+            )}`,
+            renditionId: specification.id,
+            auxiliary: true,
+          });
+          return service.stopStream("auxiliary-start-failed");
+        });
+    }
+  }
+
+  updateSegmentRelayAccess(input = {}) {
+    const token = cleanText(input.token, 2_048);
+    if (token.length < 64) return { updated: false };
+    const updated = this.relayCoordinator?.updateToken(token) === true;
+    for (const service of this.auxiliaryServices.values()) {
+      service.relayCoordinator?.updateToken(token);
+    }
+    return {
+      updated,
+      pipelineId: this.pipeline?.id || "",
+    };
+  }
+
+  setFlowPaused(paused, expectedPipelineId, generation = 0) {
     const pipeline = this.pipeline;
+    const requestedPipelineId = cleanText(expectedPipelineId, 128);
+    const requestedGeneration = Math.max(0, Number(generation) || 0);
     if (
       !pipeline ||
-      (expectedPipelineId && pipeline.id !== expectedPipelineId) ||
-      pipeline.stopping ||
-      pipeline.paused === Boolean(paused)
+      (requestedPipelineId && pipeline.id !== requestedPipelineId)
     ) {
-      return;
+      return {
+        pipelineId: pipeline?.id || requestedPipelineId || "",
+        generation: requestedGeneration,
+        actualPaused: Boolean(pipeline?.paused),
+        applied: false,
+      };
     }
-    pipeline.paused = Boolean(paused);
-    if (pipeline.paused) pipeline.child.stdout.pause();
-    else pipeline.child.stdout.resume();
+    if (!pipeline.stopping && pipeline.paused !== Boolean(paused)) {
+      pipeline.paused = Boolean(paused);
+      if (pipeline.paused) pipeline.child.stdout.pause();
+      else if (!pipeline.relayPaused) pipeline.child.stdout.resume();
+    }
+    return {
+      pipelineId: pipeline.id,
+      generation: requestedGeneration,
+      actualPaused: Boolean(pipeline.paused),
+      applied: !pipeline.stopping,
+    };
+  }
+
+  getFlowState(expectedPipelineId) {
+    const pipeline = this.pipeline;
+    const expected = cleanText(expectedPipelineId, 128);
+    return {
+      pipelineId: pipeline?.id || expected || "",
+      actualPaused: Boolean(pipeline?.paused),
+      active: Boolean(
+        pipeline &&
+          !pipeline.stopping &&
+          (!expected || pipeline.id === expected),
+      ),
+    };
   }
 
   async reportPlayback(input = {}) {
@@ -3221,6 +4750,9 @@ class EmbyService {
       CanSeek: true,
     };
     pipeline.lastPositionTicks = body.PositionTicks;
+    if (!this.auxiliary) {
+      this.relayCoordinator?.updatePlaybackAnchor(body.PositionTicks);
+    }
     let reported = false;
     try {
       await this.request(endpoint, {
@@ -3247,11 +4779,30 @@ class EmbyService {
     if (options.preserveGeneration !== true) {
       this.streamGeneration += 1;
     }
+    const auxiliaryServices = [...this.auxiliaryServices.values()];
+    this.auxiliaryServices.clear();
+    const stoppingAuxiliaries = Promise.allSettled(
+      auxiliaryServices.map((service) =>
+        service.stopStream(reason, { preserveGeneration: true }),
+      ),
+    );
     const pipeline = this.pipeline;
-    if (!pipeline) return;
+    if (!pipeline) {
+      await stoppingAuxiliaries;
+      if (this.ownsRelayCoordinator && this.relayCoordinator) {
+        const coordinator = this.relayCoordinator;
+        this.relayCoordinator = undefined;
+        this.ownsRelayCoordinator = false;
+        await coordinator.close(reason === "exited").catch(() => undefined);
+      }
+      return;
+    }
     pipeline.stopping = true;
     clearTimeout(pipeline.initTimer);
     pipeline.initTimer = undefined;
+    clearInterval(pipeline.progressWatchdog);
+    pipeline.progressWatchdog = undefined;
+    pipeline.relayCoordinator?.unregisterProducer(pipeline.renditionId);
     // reportPlayback captures the current pipeline synchronously before its
     // first await. Keep that request best-effort in the background so an
     // unreachable Emby server cannot leave FFmpeg alive for the 20 s HTTP
@@ -3271,11 +4822,25 @@ class EmbyService {
     // terminated.
     const terminating = terminateChildProcess(pipeline.child);
     const closingProxy = pipeline.proxy.close();
-    await Promise.allSettled([terminating, closingProxy]);
+    await Promise.allSettled([
+      terminating,
+      closingProxy,
+      stoppingAuxiliaries,
+    ]);
+    if (this.ownsRelayCoordinator && this.relayCoordinator) {
+      const coordinator = this.relayCoordinator;
+      this.relayCoordinator = undefined;
+      this.ownsRelayCoordinator = false;
+      await coordinator
+        .close(reason === "exited" || reason === "ended")
+        .catch(() => undefined);
+    }
     this.sendEvent({
       type: "stopped",
       pipelineId: pipeline.id,
       reason: cleanText(reason, 64),
+      renditionId: pipeline.renditionId,
+      auxiliary: this.auxiliary,
     });
   }
 
@@ -3288,6 +4853,7 @@ module.exports = {
   browserDirectVideoCompatible,
   buildDeviceProfile,
   browserDirectAudioCompatible,
+  CmafRelayCoordinator,
   chooseSource,
   decodeSubtitleBuffer,
   embyApiBaseCandidates,
@@ -3300,8 +4866,10 @@ module.exports = {
   isHlsManifestResponse,
   normalizeEndpointUrls,
   normalizeEmbyFrameRate,
+  normalizeSegmentRelayConfig,
   normalizeServerUrl,
   qualityProfile,
+  renditionIdForQuality,
   rewriteManifest,
   terminateChildProcess,
 };

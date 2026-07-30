@@ -1,6 +1,6 @@
 # “同频”项目完整说明
 
-> - 适用版本：Native `2.8.1`
+> - 适用版本：Native `2.9.0`
 > - 面向读者：第一次接触本项目的产品、设计、测试、运维和开发人员
 > - 最重要的入口：当前 Windows / Android 产品在 [`native/`](./native/)；仓库根目录还保留了一套独立的 VDO.Ninja 网页实现。
 
@@ -12,8 +12,10 @@ Android 成员本地解码观看，所有成员还能连麦和发弹幕。
 
 系统刻意把不同流量分开：
 
-- 电影画面、声音和 Emby 数据：优先由放映端上传一份到腾讯云 LiveKit SFU，再由
-  SFU 向观看者分发；SFU 故障时回退到原有 P2P/TURN 链路。
+- 普通屏幕画面与声音：优先由放映端上传一份多层流到腾讯云 LiveKit SFU，再按
+  每位观看者的独立订阅档位分发；SFU 故障时回退到有总上行预算的 P2P/TURN。
+- Emby：放映端生成共享时间轴的多档 CMAF，通过短期签名 HTTPS 上传；观看端各自
+  ABR 下载和缓存。LiveKit/P2P 仅传播放控制、房间时钟和清单刷新。
 - 连麦语音：优先成员之间直连；复杂 NAT、公司网或代理环境下可以回退到 TURN。
 - 频道状态、SDP/ICE、聊天文字：通过 WSS 信令服务器传递。
 - 服务器不保存电影、声音或聊天历史，频道内存状态在最后一人离开后删除。
@@ -74,37 +76,48 @@ flowchart LR
         NG["Nginx：TLS / WSS 443"]
         SS["主信令：127.0.0.1:8787"]
         LK["LiveKit SFU"]
+        SR["HTTPS CMAF relay + 磁盘 LRU"]
         ST["coturn：STUN + TURN"]
         NG --> SS
         NG --> LK
+        NG --> SR
     end
 
     subgraph Aliyun["阿里云备用节点"]
         ANG["Nginx：TLS / WSS 443"]
         ASS["备用信令：127.0.0.1:8787"]
+        ASR["HTTPS CMAF relay + 磁盘 LRU"]
         ANG --> ASS
+        ANG --> ASR
     end
 
     WR <-->|"WSS：频道、SDP/ICE、聊天"| NG
     AR <-->|"WSS：频道、SDP/ICE、聊天"| NG
     WR -.->|"运维手动切换的备用 WSS"| ANG
     AR -.->|"运维手动切换的备用 WSS"| ANG
-    WR -->|"一份电影媒体 / Emby 数据"| LK
-    LK -->|"SFU 分发"| WR
-    LK -->|"SFU 分发"| AR
+    WR -->|"普通屏幕 1440p/1080p/720p"| LK
+    LK -->|"逐观看者分层转发"| WR
+    LK -->|"逐观看者分层转发"| AR
     WR -.->|"STUN / 必要时 TURN"| ST
     AR -.->|"STUN / 必要时 TURN"| ST
-    WR <-->|"SFU 故障时电影 P2P；语音 Mesh"| AR
-    EF -->|"fMP4 分片 / DataTrack"| LK
+    WR <-->|"SFU 故障时屏幕 P2P；语音 Mesh"| AR
+    EF -->|"多档 CMAF 上传"| SR
+    SR -->|"独立 ABR / Range 下载"| WR
+    SR -->|"独立 ABR / Range 下载"| AR
 ```
 
-这里不使用数据库，也不保存媒体：
+这里不使用数据库；媒体只进入受身份签名保护、按容量和 LRU 淘汰的临时分片缓存：
 
-- LiveKit 是电影主链路；一位放映者只上传一份，SFU 向最多 7 位观看者分发。
+- LiveKit 是普通屏幕主链路；一位放映者发布显式 1440p/1080p/720p simulcast
+  与独立 480p 应急轨，SFU 按观看者选择层并用 dynacast 停掉无人订阅的层。
+- Emby 主数据面是 HTTPS CMAF；默认并行提供 original/1080p/720p/480p，每位
+  观看者自行 ABR、Range 重试与磁盘缓存，单个弱端不会改变全房间质量。
 - 8 人全部连麦时，语音仍采用点对点 Mesh，每个成员最多连接另外 7 人。
-- Node 服务器处理频道状态并签发临时 TURN 凭据和 LiveKit JWT，不解析媒体内容。
+- Node 服务器处理频道状态并签发临时 TURN、LiveKit 与 CMAF 凭据，同时保存有界、
+  可淘汰的不可变 CMAF 对象；它不持有 Emby 令牌，不解析影片语义。
 - LiveKit 建连、发布或运行失败时，客户端自动启用 P2P；严格 NAT 下可使用腾讯云
-  TURN。阿里云只运行备用信令，不承载 STUN、TURN、LiveKit 或媒体。
+  TURN。阿里云不承载 STUN、TURN 或 LiveKit，但运行备用信令和只经 443 暴露的
+  独立有界 CMAF 缓存。
 
 ## 4. 一次完整使用流程
 
@@ -170,10 +183,12 @@ flowchart LR
 
 ### 4.5 建立电影 WebRTC
 
-观看端先使用入房响应中的短期 LiveKit 凭据连接腾讯云 SFU；放映端向同一 SFU
-房间发布一份音视频或 Emby DataTrack。只有 SFU 建连、发布或运行失败时，观看者
-才发送 `broadcast:watch-ready`，放映者为该观看者创建独立的 P2P
-`RTCPeerConnection`。
+观看端先使用入房响应中的短期 LiveKit 凭据连接腾讯云 SFU；普通屏幕放映端向同一
+房间发布显式 1440p/1080p/720p simulcast 和 480p 应急轨。观看端通过
+`RemoteTrackPublication.setVideoQuality()`、`setVideoDimensions()` 与
+`setVideoFPS()` 改变自己的订阅，不要求放映端重建全局流。只有 SFU 建连、发布
+或运行失败时，观看者才发送 `broadcast:watch-ready`，放映端为至多两个故障观看者
+创建有 1080p8/720p4 总预算的 P2P `RTCPeerConnection`。
 
 可靠性措施包括：
 
@@ -184,16 +199,17 @@ flowchart LR
   普通 1080p30 窗口误用 32 Mbps。
 - H.264/VP9/VP8 的 RTX、RED、ULPFEC 修复格式不会因编码排序而被禁用。
 - 只有真正解码出第一帧后，观看端才发送 `media:ready`。
-- 信令重连不主动销毁仍健康的 SFU 或 P2P 观看链路。
+- 信令重连不主动销毁仍健康的 SFU 或 P2P 观看链路；回切 SFU 使用
+  make-before-break，稳定 7 秒后才关闭 P2P。
 - ICE 只接受可用的直连候选；虚拟网卡、TUN/VPN 和隐私化 mDNS 候选会按策略处理。
 - 便携版可添加仅针对本程序的 Windows TCP/UDP 入站防火墙规则。
 
-P2P 是故障备用而不是默认分发拓扑；直连失败时允许使用腾讯云 TURN。服务器不设置
+P2P 是普通屏幕故障备用而不是默认分发拓扑；直连失败时允许使用腾讯云 TURN。服务器不设置
 静态媒体带宽上限，实际码率由端点能力、链路吞吐与 WebRTC 拥塞控制决定。
 
 ### 4.6 播放、统计和自适应
 
-观看端从 `getStats()` 读取：
+观看端在可用时从 `getStats()` 读取：
 
 - 实际解码分辨率；
 - 接收帧率；
@@ -202,14 +218,18 @@ P2P 是故障备用而不是默认分发拓扑；直连失败时允许使用腾�
 - 丢包、抖动和冻结增量；
 - 解码耗时、接收端丢帧、软/硬件解码状态与实际抖动缓冲目标。
 
-`native/src/adaptive-playback.ts` 在网络指标或接收设备解码压力持续恶化时才逐级
-降清晰度，短暂抖动不会立刻降级；网络与解码持续稳定后再逐级恢复，且不会超过
-观看者自己设置的上限。电影连接设置约 180 ms 的接收抖动目标以吸收普通 Wi‑Fi
-波动，独立语音连接在直连时约 90 ms、中继时约 125 ms，兼顾自然通话与抗抖动。
+`native/src/adaptive-playback.ts` 把 network/encoder/decoder/render/transport
+压力分别分类。严重丢包、buffer debt 或解码压力在 1–2 秒内降档；升档要求连续
+稳定至少 20 秒、升级后保持 20 秒、可用带宽达到下一档约 1.5 倍，连续失败会延长
+冷却。`detail` 内容优先保留像素，`motion` 优先保留帧率，`balanced` 取中间策略。
+`getStats()` 超时只累计 telemetry missing：最多保留两个不可取消的 Chromium 原生
+采样，连续 3/5 次才把统计置信度降为 reduced/missing；实际 HTML 视频帧、媒体时钟、
+字节和 ICE 状态独立判断健康，统计失败本身不能触发重连。电影连接设置约 180 ms
+的接收抖动目标，独立语音连接在直连时约 90 ms、中继时约 125 ms。
 
-发送端在正常状态下保持观看者请求的物理分辨率，避免 Chromium 的通用
-`balanced` 适配器把稳定的 1080p30 路径长期降到模糊小画面。只有编码器连续三次
-报告 CPU 压力时，该观看链路才临时切到帧率优先；连续稳定 10 秒后自动恢复原画。
+SFU 主线路把自适应结果直接应用到该观看者自己的订阅层；P2P 备用才修改对应
+`RTCRtpSender`。发送端在正常状态下保持请求的物理分辨率；只有编码器持续报告
+CPU 压力时才临时切到帧率优先，稳定后恢复。
 
 ### 4.7 Emby 高清播放
 
@@ -223,31 +243,43 @@ Windows 成员打开“开始放映”后可以在普通屏幕共享与 Emby 高
    渲染器、信令服务器、SDP、房间成员和朋友客户端永远拿不到令牌，跨域重定向会
    删除全部 Emby 认证头。若系统加密不可用，账户只保留到本次程序退出。
 3. 主进程可切换已保存账户；有搜索词时并发查询所有账户并合并、标注结果来源。
-   随后读取所选服务器的媒体库并请求 `PlaybackInfo`，声明统一 H.264/AAC fMP4 能力、质量
-   上限、分辨率、字幕和可选 HEVC。优先 Direct Play，再选 Direct Stream，最后由
-   Emby 服务器生成一份限码转码流。
-4. 固定哈希的 FFmpeg 8.1 LGPL 独立程序从随机密钥的 `127.0.0.1` 回环代理持续
-   读取媒体，视频尽量 `copy`，仅在必要时把音频转换成 192 kbps AAC，再按时间
-   输出约 750 毫秒一个的 fragmented MP4，避免长 GOP 形成 5–11 MB 巨型片段。
-5. `emby-transport.ts` 把片段拆成 48 KiB 数据块；主路径通过 LiveKit DataTrack
-   发送，SFU 故障时使用逐观看者 P2P DataChannel。头部携带房间、播放会话、媒体
-   版本、逐观众传输代次、真实 `tfdt` 媒体时间、片段/块序号、关键帧、长度和
-   CRC32。每位观众有独立可靠乱序 DataChannel 与 256 KiB/64 KiB 高低水位，
-   内存队列限制为 16 MiB，并在 8 MiB 以上主动丢弃过时片段；慢观众不会阻塞其他
-   观众，重同步后的迟到旧代次包也不会重新进入播放器。
-6. 放映端缓存最近 60 秒，观众缺块时按编号补要；超过 10 秒仍不完整的组装会被
-   放弃，已经落后播放点 8 秒以上的迟到片段不会进入 `SourceBuffer`。
-7. `emby-player.ts` 在 Electron/Android 的 MSE 中追加 fMP4，8 秒起播、24 秒目标、
-   32 秒上限。播放器先等待 init，并给缺片留下 1.2 秒修复窗口，再按序追加媒体。
-   播放、暂停、倍速和跳转使用单调递增状态版本；0.1–0.35 秒误差以 0.96/1.04
-   倍速平滑纠正，超过 0.35 秒直接 seek；观看端缓冲不足且 SCTP 与 JS 总排队达到
-   约 1.8 秒时，主机主动清除旧片段并重新发送当前关键帧缓存。2.5 秒以上未缓冲
-   偏差会暂停旧画面并硬追齐，确保正常恢复目标不超过 3 秒。
+   随后读取所选服务器的媒体库并请求 `PlaybackInfo`。优先兼容原画/Direct Stream，
+   再按需使用 Emby 转码；本机编码器按 NVENC→QSV→AMF→有界软件兜底探测。
+4. 固定哈希的 FFmpeg 8.1 LGPL 独立程序从随机密钥的 `127.0.0.1` 回环代理读取
+   媒体。代理的 AbortController 保持到正文结束，正文 15 秒无字节会真正中止，
+   Range 请求按预算重试；停止时有界关闭现有连接和空闲连接。
+5. `CmafRelayCoordinator` 并行生成共享时间轴、约 2 秒 GOP 对齐的
+   original/1080p/720p/480p。未知关键帧一律视为 false；解析不到时间时使用最近
+   8–16 个真实 fragment cadence 的中位数。主机磁盘 spool 只允许生产到观看锚点
+   的有界前向窗口，上传队列有字节/条目/磁盘高水位背压，EOF 会先排空最后分片再
+   发布 `ended` 清单。
+6. 放映端使用身份绑定、短期 HMAC 签名把 init、字幕、不可变 segment 和 revision
+   manifest 上传到 `/media/v1/`。服务端验证 room/asset/mediaVersion/rendition/
+   sequence/sha256 和对象路径，支持 Range/CORS；内存 LRU 加磁盘 LRU 默认取可用空间
+   4%、最高 5 GiB，淘汰时保护当前 manifest 及其 init/字幕。
+7. `emby-segment-relay.ts` 在每位观看者本地执行 ABR：Urgent 负责未来 0–15 秒，
+   Warm 负责 15–120 秒，Prefetch 只在 15–30 秒无 rebuffer、吞吐超过当前码率
+   1.5 倍、RTT 稳定、磁盘充足且非计费网络时运行，并最多使用剩余带宽 65%。
+   seek/切档增加 `fetchGeneration` 并取消旧请求；新档位只从对齐的真实关键帧接入。
+8. 三级缓存职责分离：内存只留即将 append 的数据；磁盘可缓存完整后续影片；
+   `SourceBuffer` 只保留播放点前少量和后方几十秒。QuotaExceeded 依次执行历史
+   trim、远未来 trim、abort、降低 buffer、本地 MediaSource 重建，超过每片重试
+   上限后触发 transport resync，不能 trim-and-retry 活锁。
+9. LiveKit/P2P 只发送播放、暂停、seek、房间时钟、媒体版本和清单刷新。控制消息按
+   类型合并，SDP/ICE 按 peer/session/attempt 分队列；Emby 连续媒体字节不再通过
+   可靠 SCTP/DataTrack，因此每位观看者可以独立选档和深缓存。
 
 成员在入房时就上报 MSE/H.264/HEVC/AAC 能力。默认选全员兼容的 H.264/AAC；只有
 所有当前观众都支持时才允许 HEVC，晚加入的不兼容客户端会看到明确错误而不是黑屏。
-当前版本支持最多 8 人。正常情况下 Emby 只向放映端发送一份，放映端再向 SFU
-上传一份；只有 SFU 故障时才恢复逐观看者 P2P 发送。
+当前版本支持最多 8 人。每位观看者独立选择 rendition，弱网端降到 720p/480p
+不会降低其他人的原画/1080p，也不会重启全房间 FFmpeg/MSE。
+
+Windows 观看端另有真实 WebGL2 GPU 空间增强后端：只在远端 Emby 360p–1080p
+放大到接近 2K/4K、SDR、GPU 有余量时启用，使用视频纹理和五采样保守锐化，不做
+CPU 回读；字幕与弹幕在增强后合成。GPU p95 超过 14 ms、丢帧超过 3%、资源压力、
+上下文丢失或同机屏幕共享会自动关闭并冷却 30 秒。能力握手只声明实际后端；
+仓库没有 NVIDIA RTX Video SDK 的授权二进制/运行时，因此当前不会宣称
+`rtx-video`，但协议已为未来真实原生后端保留该枚举。
 
 文本字幕 SRT/VTT/ASS/SSA 独立传输；PGS 等图片字幕不会自动触发不可见的本地视频
 重编码。异常退出、停止放映和离开频道都会结束 FFmpeg、关闭回环代理并上报 Emby
@@ -464,7 +496,7 @@ credential = HMAC-SHA1(TURN_SECRET, username)
 | 腾讯云 | 7881 | TCP | LiveKit ICE/TCP |
 | 腾讯云 | 7882 | UDP | LiveKit ICE/UDP |
 | 腾讯云 | 32768–65535 | UDP | coturn relay |
-| 阿里云 | 80/443 | TCP | 备用信令 TLS/WSS |
+| 阿里云 | 80/443 | TCP | 备用信令 TLS/WSS 与 CMAF HTTPS |
 | 两节点本机 | 8787 | TCP | Node 信令，仅回环 |
 
 阿里云不开放 UDP 443、3478、LiveKit 或 relay 端口。
@@ -483,6 +515,9 @@ credential = HMAC-SHA1(TURN_SECRET, username)
 | `TURN_TCP_ENABLED` | 是否允许向客户端下发 TCP TURN |
 | `SFU_ENABLED` / `SFU_PUBLIC_URL` | 是否签发 LiveKit 凭据及其公网入口 |
 | `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET_FILE` | LiveKit JWT 签发配置 |
+| `SEGMENT_RELAY_SECRET_FILE` | 独立的 CMAF HMAC 签名密钥；不能复用 TURN/LiveKit secret |
+| `SEGMENT_RELAY_CACHE_DIR` | 服务端 CMAF 磁盘 LRU 目录 |
+| `SEGMENT_RELAY_DISK_BYTES` | 可选固定缓存上限；未设置时使用可用空间 4%、最高 5 GiB |
 | `ALLOWED_ORIGINS` | 允许的 Electron/Capacitor/Web 来源 |
 | `ALLOW_NO_ORIGIN` | 是否允许没有 Origin 的原生/测试客户端 |
 | `TRUST_PROXY` | 是否只从受信的本机代理读取真实 IP |
@@ -558,17 +593,22 @@ credential = HMAC-SHA1(TURN_SECRET, username)
 | 文件 | 责任 |
 | --- | --- |
 | `main.ts` | 首页、创建/加入入口、最近频道、深链和启动分流 |
-| `channel-session.ts` | 最大的业务编排文件：频道 UI、放映、观看、全屏、PiP、画质、WebRTC、网络恢复 |
-| `emby-broadcast.ts` | Emby 放映编排、60 秒缓存、每观众队列、补片、同步、跳转与会话上报 |
-| `emby-transport.ts` | DataChannel 二进制协议、48 KiB 分块、CRC32、背压、重组与能力检测 |
-| `emby-player.ts` | fMP4 MSE 播放器、24 秒目标缓存、同步纠偏和文本字幕 |
+| `channel-session.ts` | 最大的业务编排文件：频道 UI、放映、观看、全屏、PiP、逐端画质、故障切换与网络恢复 |
+| `signal-message-scheduler.ts` | SDP/ICE 分片队列、可合并播放状态和不丢生命周期消息 |
+| `sfu.ts` | LiveKit 生命周期、屏幕多层发布、逐观看者订阅、控制 DataTrack 与有界关闭 |
+| `sfu-screen-policy.ts` | 1440p/1080p/720p/480p 的逐订阅端 quality/dimensions/FPS 映射 |
+| `emby-broadcast.ts` | Emby 控制面、目标状态流控 actor、清单同步、跳转与会话上报 |
+| `emby-segment-relay.ts` | 观看端 CMAF 清单校验、独立 ABR、三级缓存、Range 重试与 generation 取消 |
+| `emby-transport.ts` | 控制协议、遗留 P2P 有界二进制传输、固定包头、CRC32 与能力检测 |
+| `emby-player.ts` | fMP4 MSE 播放器、有界 Quota recovery、同步纠偏和文本字幕 |
+| `video-enhancement.ts` | WebGL2 视频纹理空间增强、GPU p95/丢帧压力和自动冷却策略 |
 | `room-companion.ts` | 成员列表、连麦控制、设备设置、聊天记录与时间戳 |
 | `voice.ts` | 语音 Mesh、降噪图、协商、统计、设备/播放/断流恢复 |
 | `rtc.ts` | SignalClient、PeerConnection 工厂、ICE 策略、SDP/Opus 调优、统计读取 |
 | `process-audio.ts` | 把 .NET 助手 PCM 转成电影 Web Audio 音轨 |
 | `deepfilter-noise-suppressor.ts` | DeepFilterNet3 AudioWorklet、本地模型路径和 bypass |
 | `voice-processing.ts` | 麦克风 getUserMedia 约束，避免重复 AGC/降噪 |
-| `adaptive-playback.ts` | 持续丢包/抖动/冻结及解码压力驱动的阶梯画质策略 |
+| `adaptive-playback.ts` | 网络/编码/解码/渲染/传输压力分类，快降慢升与 detail/motion/balanced 阶梯 |
 | `capture-resolution.ts` | Windows 高 DPI 逻辑像素到物理捕获尺寸的恢复计算 |
 | `video-presentation.ts` | 黑边检测、稳定采样、智能居中裁剪和真实源尺寸格式化 |
 | `playback-continuity.ts` | 判断信令重连时是否保留现有观看 PeerConnection |
@@ -591,7 +631,7 @@ credential = HMAC-SHA1(TURN_SECRET, username)
 | `main.cjs` | BrowserWindow、权限、窗口列表、采集绑定、音频助手进程、防火墙、深链、资源协议、弹幕窗口 |
 | `preload.cjs` | 通过 `contextBridge` 只暴露必要 IPC，不给渲染器 Node 权限 |
 | `emby-account-manager.cjs` | 多服务器账户、Windows 加密持久化、账户切换与联合搜索 |
-| `emby-service.cjs` | Emby 认证/媒体库/PlaybackInfo、令牌隔离回环代理、FFmpeg fMP4 管线和 MP4 时间轴解析 |
+| `emby-service.cjs` | Emby 认证/媒体库/PlaybackInfo、正文空闲可取消代理、硬件编码探测、多档 FFmpeg/CMAF spool |
 | `overlay.html` | 透明点击穿透桌面弹幕的动画和 DOM |
 | `overlay-preload.cjs` | 只向弹幕页暴露消息/清空事件 |
 
@@ -614,9 +654,10 @@ Electron 保持 `contextIsolation: true`、`nodeIntegration: false`、`sandbox: 
 
 ### 8.6 `native/server/` 与 `native/deployment/`
 
-- `server/index.mjs`：全部频道协议、临时 TURN 凭证、限流、心跳、恢复和管理操作。
-- `deployment/nginx-synced-signal-location.conf`：腾讯云信令、SFU 和凭据刷新路由。
-- `deployment/nginx-synced-standby.conf`：阿里云仅信令反代，不含媒体路由。
+- `server/index.mjs`：频道协议、临时 TURN/LiveKit/CMAF 凭证、限流、心跳、恢复和管理操作。
+- `server/segment-relay.mjs`：身份绑定 manifest/object 校验、Range/CORS、内存/磁盘 LRU。
+- `deployment/nginx-synced-signal-location.conf`：腾讯云信令、SFU、CMAF 和凭据刷新路由。
+- `deployment/nginx-synced-standby.conf`：阿里云备用信令与 HTTPS CMAF 路由，不含 LiveKit/TURN。
 - `deployment/docker-compose.yml`：腾讯云完整主节点部署。
 - `deployment/synced-signal.service`：两节点共用的 systemd 信令服务。
 - `deployment/synced-signal.env.example`：腾讯云环境变量模板。
@@ -628,7 +669,7 @@ Electron 保持 `contextIsolation: true`、`nodeIntegration: false`、`sandbox: 
 
 单元/协议测试覆盖：
 
-- 自适应画质；
+- 自适应画质分类、快降慢升、逐观看端 SFU 订阅隔离；
 - 最近频道与频道主凭证；
 - 弹幕模式；
 - 健康观看连接保留；
@@ -639,7 +680,10 @@ Electron 保持 `contextIsolation: true`、`nodeIntegration: false`、`sandbox: 
 - 语音采集约束；
 - 依赖兼容与安全。
 - Emby 地址与重定向安全、媒体库/PlaybackInfo、真实 FFmpeg 重封装、MP4 时间轴；
-- DataChannel 分块元数据、CRC、乱序重组、缓存、独立背压和字幕转换；
+- CMAF manifest 路径/身份/哈希校验、最终分片排空、Range/idle retry、独立 ABR 与三级缓存；
+- 遗留 DataChannel 固定包头、CRC、乱序重组、独立背压和 token bucket；
+- MSE QuotaExceeded 终止恢复、信令分队列、流控 generation 与统计失败隔离；
+- WebGL2 GPU 增强策略、p95/丢帧/冷却边界；
 - Emby 能力字段的服务端清洗，确保密码/令牌不会进入房间状态。
 
 重要冒烟脚本：
@@ -648,7 +692,7 @@ Electron 保持 `contextIsolation: true`、`nodeIntegration: false`、`sandbox: 
 | --- | --- |
 | `npm run smoke:voice` | 两人连麦、真实 RTP 音频能量、默认系统降噪、主线程阻塞不断音、DeepFilter 切换与长稳 |
 | `npm run smoke:media` | 放映者到观看者的实际视频帧和 `media:ready` |
-| `npm run smoke:emby` | 一份认证 Emby 流经 FFmpeg、真实 DataChannel、补片、MSE 解码到 1280×720 |
+| `npm run smoke:emby` | 一份认证 Emby 流经 FFmpeg/CMAF、控制通道与 MSE 解码到 1280×720 |
 | `npm run smoke:emby-ui` | 实际主窗口/IPC 登录、媒体库、选片、零屏幕捕获、本地播放、停止和令牌清理 |
 | `npm run smoke:sidebar` | 成员/音量/管理、聊天时间戳、弹幕无时间、桌面播放器控件 |
 | `npm run smoke:overlay` | 弹幕转义、动画和点击穿透 |
@@ -827,8 +871,10 @@ npm test
    转码配置。
 5. HEVC 仅在所有成员上报支持时启用；不兼容成员应改用最新版客户端或 H.264。
 6. PGS 等图片字幕需改选文本字幕，或明确让 Emby 烧录转码。
-7. 运行 `npm run check:ffmpeg`、`npm run smoke:emby` 和
-   `npm run smoke:emby-ui`，分别定位运行时、端到端数据通道和实际 UI/IPC。
+7. 检查 `/media/v1/` manifest、init 和 segment 是否返回 200/206，签名中的
+   room/asset/mediaVersion 是否与当前房间一致，磁盘缓存目录是否可写。
+8. 运行 `npm run check:ffmpeg`、`npm run smoke:emby` 和
+   `npm run smoke:emby-ui`，分别定位运行时、CMAF/MSE 数据面和实际 UI/IPC。
 
 ### 11.3 连麦先正常，随后静音
 
@@ -881,7 +927,9 @@ journalctl -u coturn -f           # 仅腾讯云
 
 ## 12. 修改时必须守住的约束
 
-1. 保持 LiveKit SFU 为电影主链路、P2P/TURN 为故障备用；不要在阿里云部署媒体服务。
+1. 保持 LiveKit SFU 为普通屏幕主链路、P2P/TURN 为有预算的故障备用；Emby 媒体
+   必须走签名 HTTPS CMAF。阿里云只能运行 443 上的备用信令/分片缓存，不能部署
+   LiveKit、TURN 或额外媒体端口。
 2. 不要重新用 Canvas 合成电影画面和弹幕，会重新引入黑屏、HDR 和性能问题。
 3. 不要在渲染器打开 Node 集成；系统能力必须通过窄 IPC/Capacitor API。
 4. 不要把频道主私有凭证、Android 签名文件或 TURN secret 提交到 Git。
@@ -892,8 +940,8 @@ journalctl -u coturn -f           # 仅腾讯云
 9. 每次可交付更新都必须提升版本，同步 `native/package.json`、
    `native/package-lock.json` 和 Android `versionName/versionCode`，并以
    `npm run release:all` 重新生成 EXE、APK、服务 bundle 与 SHA-256 清单。
-10. 部署前分别验证腾讯云 WSS/SFU/STUN/TURN 和阿里云 WSS；阿里云不得出现
-    3478、UDP 443、LiveKit 或 relay 监听。
+10. 部署前分别验证腾讯云 WSS/SFU/STUN/TURN/CMAF 和阿里云 WSS/CMAF；阿里云
+    不得出现 3478、UDP 443、LiveKit 或 relay 监听。
 
 ## 13. 新人建议阅读顺序
 

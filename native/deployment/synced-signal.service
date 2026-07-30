@@ -9,13 +9,15 @@ User=synced
 Group=synced
 WorkingDirectory=/opt/synced
 EnvironmentFile=/etc/synced-signal.env
-Environment=NODE_OPTIONS=--max-old-space-size=160
+Environment=NODE_OPTIONS=--max-old-space-size=384
 ExecStart=/usr/bin/node /opt/synced/synced-signal.mjs
 Restart=on-failure
 RestartSec=2
 TimeoutStartSec=20
 TimeoutStopSec=15
 UMask=0077
+StateDirectory=synced/segment-relay
+StateDirectoryMode=0700
 NoNewPrivileges=yes
 PrivateTmp=yes
 PrivateDevices=yes
@@ -24,10 +26,11 @@ ProtectHome=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
+ReadWritePaths=/var/lib/synced/segment-relay
 RestrictSUIDSGID=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-MemoryMax=256M
-MemoryHigh=192M
+MemoryMax=512M
+MemoryHigh=448M
 TasksMax=64
 
 [Install]
