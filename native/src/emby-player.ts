@@ -36,6 +36,9 @@ const EMBY_REORDER_WAIT_MS = 1_200;
 const EMBY_MAX_REORDER_FRAGMENTS = 64;
 const EMBY_MAX_REORDER_BYTES = 32 * 1024 * 1024;
 const EMBY_TRANSPORT_SILENCE_TIMEOUT_MS = 15_000;
+const EMBY_CATCH_UP_MIN_INTERVAL_MS = 1_200;
+const EMBY_CATCH_UP_MAX_INTERVAL_MS = 8_000;
+const EMBY_CATCH_UP_HEALTHY_RESET_SAMPLES = 12;
 // Keep a generous margin below the three-second product ceiling. Once the
 // desired timestamp is 1.8 s ahead of available media, pause stale playback
 // and request a fresh keyframe window instead of letting drift keep growing.
@@ -640,6 +643,8 @@ export class EmbyMsePlayer extends EventTarget {
   private invalidPacketCount = 0;
   private lastBufferReportAt = 0;
   private lastCatchUpRequestAt = 0;
+  private catchUpCooldownMs = EMBY_CATCH_UP_MIN_INTERVAL_MS;
+  private healthyCatchUpSamples = 0;
   private lastTransportFallbackRequestAt = 0;
   private lastInboundActivityAt = 0;
   private transportFallbackRequested = false;
@@ -759,14 +764,15 @@ export class EmbyMsePlayer extends EventTarget {
     const session = this.session;
     if (!session || this.destroyed) return;
     const now = Date.now();
-    this.lastCatchUpRequestAt = now;
     if (this.recoveryStrategy === "transport-fallback") {
       if (
         this.transportFallbackRequested ||
-        now - this.lastTransportFallbackRequestAt < 1_200
+        now - this.lastTransportFallbackRequestAt <
+          EMBY_CATCH_UP_MIN_INTERVAL_MS
       ) {
         return;
       }
+      this.lastCatchUpRequestAt = now;
       this.lastTransportFallbackRequestAt = now;
       this.transportFallbackRequested = true;
       this.dispatchEvent(
@@ -782,13 +788,29 @@ export class EmbyMsePlayer extends EventTarget {
       );
       return;
     }
-    this.sendControl({
+    if (
+      this.lastCatchUpRequestAt > 0 &&
+      now - this.lastCatchUpRequestAt < this.catchUpCooldownMs
+    ) {
+      return;
+    }
+    const sent = this.sendControl({
       type: "catch-up",
       sessionId: session.sessionId,
       mediaVersion: session.mediaVersion,
       transportEpoch: session.transportEpoch ?? 0,
       targetTime: Math.max(0, finite(targetTime)),
     });
+    if (!sent) return;
+    this.lastCatchUpRequestAt = now;
+    this.healthyCatchUpSamples = 0;
+    this.catchUpCooldownMs = Math.min(
+      EMBY_CATCH_UP_MAX_INTERVAL_MS,
+      Math.max(
+        EMBY_CATCH_UP_MIN_INTERVAL_MS,
+        this.catchUpCooldownMs * 2,
+      ),
+    );
     this.sendClockPing();
   }
 
@@ -804,7 +826,12 @@ export class EmbyMsePlayer extends EventTarget {
     ) {
       return;
     }
-    if (Date.now() - this.lastCatchUpRequestAt < 1_200) return;
+    if (
+      this.lastCatchUpRequestAt > 0 &&
+      Date.now() - this.lastCatchUpRequestAt < this.catchUpCooldownMs
+    ) {
+      return;
+    }
     this.requestCatchUp(
       Math.max(
         0,
@@ -903,6 +930,8 @@ export class EmbyMsePlayer extends EventTarget {
     this.session = normalizedSession;
     this.lastStateVersion = 0;
     this.lastCatchUpRequestAt = 0;
+    this.catchUpCooldownMs = EMBY_CATCH_UP_MIN_INTERVAL_MS;
+    this.healthyCatchUpSamples = 0;
     this.lastInboundActivityAt = Date.now();
     this.transportFallbackRequested = false;
     this.lastHardSeekAt = 0;
@@ -1507,7 +1536,8 @@ export class EmbyMsePlayer extends EventTarget {
         }
         if (
           error > 1 &&
-          now - this.lastCatchUpRequestAt >= 1_200
+          (this.lastCatchUpRequestAt === 0 ||
+            now - this.lastCatchUpRequestAt >= this.catchUpCooldownMs)
         ) {
           this.requestCatchUp(target, "sync-gap");
         }
@@ -2080,7 +2110,7 @@ export class EmbyMsePlayer extends EventTarget {
     this.endBoundaryTimedOut = false;
   }
 
-  private sendControl(message: EmbyControlMessage): void {
+  private sendControl(message: EmbyControlMessage): boolean {
     const channel =
       this.controlChannel?.readyState === "open"
         ? this.controlChannel
@@ -2088,10 +2118,12 @@ export class EmbyMsePlayer extends EventTarget {
     if (channel?.readyState === "open") {
       try {
         channel.send(JSON.stringify(message));
+        return true;
       } catch {
         // Reconnection establishes a new channel and resends session state.
       }
     }
+    return false;
   }
 
   private noteInvalidPacket(): void {
@@ -2294,6 +2326,22 @@ export class EmbyMsePlayer extends EventTarget {
       targetSeconds: this.targetBufferSeconds,
       maxSeconds: this.maxBufferSeconds,
     });
+    if (
+      !this.syncHeld &&
+      this.pendingCatchUpTarget === undefined &&
+      ahead >= Math.max(4, this.initialBufferSeconds)
+    ) {
+      this.healthyCatchUpSamples += 1;
+      if (
+        this.healthyCatchUpSamples >=
+        EMBY_CATCH_UP_HEALTHY_RESET_SAMPLES
+      ) {
+        this.catchUpCooldownMs = EMBY_CATCH_UP_MIN_INTERVAL_MS;
+        this.healthyCatchUpSamples = 0;
+      }
+    } else {
+      this.healthyCatchUpSamples = 0;
+    }
     if (
       !this.started &&
       policy.canStart &&

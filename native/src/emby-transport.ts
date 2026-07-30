@@ -1285,6 +1285,14 @@ export class EmbyFragmentAssembler {
         return;
       }
       if (now - assembly.lastRequestAt < 500) {
+        // A throttled wake-up is still a failed repair observation. Count it
+        // toward the absolute retry budget so repeated re-arming cannot keep
+        // a broken assembly alive indefinitely.
+        assembly.requests += 1;
+        if (assembly.requests >= 6) {
+          this.abandonAssembly(key, "repair-exhausted");
+          return;
+        }
         this.armMissingRequest(key, assembly);
         return;
       }

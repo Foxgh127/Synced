@@ -44,6 +44,8 @@ interface PeerState {
   slowSamples: number;
   recoveries: number;
   lastCatchUpAt: number;
+  recoveryCooldownMs: number;
+  healthyRecoverySamples: number;
   lastPressureReportAt: number;
   observedDroppedFragments: number;
   transportEpoch: number;
@@ -65,6 +67,16 @@ interface PendingStart {
   timer: number;
   attempt: number;
   earlyEvents: EmbyStreamEvent[];
+}
+
+interface RestartIntent {
+  id: number;
+  signature: string;
+  request: EmbyPlaybackRequest;
+  seconds: number;
+  notice?: string;
+  seekRevision?: number;
+  waiters: Array<() => void>;
 }
 
 class EmbyStartupCompatibilityError extends Error {
@@ -118,6 +130,9 @@ const EMBY_FLOW_CONTROL_RESET_TIMEOUT_MS = 2_000;
 const EMBY_PIPELINE_STOP_TIMEOUT_MS = 8_000;
 const EMBY_LOGOUT_TIMEOUT_MS = 8_000;
 const EMBY_PLAYBACK_REPORT_TIMEOUT_MS = 3_000;
+const EMBY_SLOW_PEER_MIN_RECOVERY_COOLDOWN_MS = 5_000;
+const EMBY_SLOW_PEER_MAX_RECOVERY_COOLDOWN_MS = 30_000;
+const EMBY_SLOW_PEER_HEALTHY_RESET_SAMPLES = 12;
 
 export class EmbyBroadcastController {
   readonly sessionId =
@@ -152,6 +167,10 @@ export class EmbyBroadcastController {
   private stopping = false;
   private restarting = false;
   private restartOperation?: Promise<void>;
+  private runningRestart?: RestartIntent;
+  private pendingRestart?: RestartIntent;
+  private restartCancellation?: Promise<void>;
+  private restartRevision = 0;
   private destroyed = false;
   private destroying = false;
   private ignoreSeekUntil = 0;
@@ -160,7 +179,9 @@ export class EmbyBroadcastController {
   private flowControlOperation?: Promise<void>;
   private flowControlGeneration = 0;
   private flowControlRetryTimer?: number;
-  private progressReportInFlight = false;
+  private readonly playbackReportsInFlight = new Set<
+    "start" | "progress" | "stop"
+  >();
   private readonly flowPauseReasons = new Set<"buffer" | "append-queue">();
   private startAttempt = 0;
   private inFlightPipelineStarts = 0;
@@ -242,11 +263,12 @@ export class EmbyBroadcastController {
   }
 
   get playbackQuality(): EmbyPlaybackRequest["quality"] | undefined {
-    return this.activeRequest?.quality;
+    return this.desiredPlaybackRequest()?.quality;
   }
 
   get currentRequest(): EmbyPlaybackRequest | undefined {
-    return this.activeRequest ? { ...this.activeRequest } : undefined;
+    const request = this.desiredPlaybackRequest();
+    return request ? { ...request } : undefined;
   }
 
   get localPlaybackDiagnostics() {
@@ -391,6 +413,9 @@ export class EmbyBroadcastController {
       state.ready = false;
       state.sessionReady = false;
       state.slowSamples = 0;
+      state.recoveryCooldownMs =
+        EMBY_SLOW_PEER_MIN_RECOVERY_COOLDOWN_MS;
+      state.healthyRecoverySamples = 0;
       state.transportEpoch = 0;
       state.repairTokens = 128;
       state.repairTokenUpdatedAt = Date.now();
@@ -502,6 +527,8 @@ export class EmbyBroadcastController {
       slowSamples: 0,
       recoveries: 0,
       lastCatchUpAt: 0,
+      recoveryCooldownMs: EMBY_SLOW_PEER_MIN_RECOVERY_COOLDOWN_MS,
+      healthyRecoverySamples: 0,
       lastPressureReportAt: 0,
       observedDroppedFragments: 0,
       transportEpoch: 0,
@@ -615,6 +642,7 @@ export class EmbyBroadcastController {
   async stop(logout = false): Promise<void> {
     if (this.destroyed && !logout) return;
     this.cancelScheduledSeek();
+    this.cancelQueuedRestarts();
     this.clearAutoRecoveryTimer();
     this.autoRecoveryFailures = 0;
     this.streamReadyAt = 0;
@@ -663,23 +691,23 @@ export class EmbyBroadcastController {
     },
     reason = "共享流设置变化",
   ): Promise<boolean> {
+    const currentRequest = this.desiredPlaybackRequest();
     if (
-      !this.activeRequest ||
-      !this.active ||
-      this.destroyed ||
-      this.restarting
+      !currentRequest ||
+      (!this.active && !this.restarting) ||
+      this.destroyed
     ) {
       return false;
     }
     const nextRequest: EmbyPlaybackRequest = {
-      ...this.activeRequest,
+      ...currentRequest,
       ...(profile.quality ? { quality: profile.quality } : {}),
       ...(profile.frameRate ? { frameRate: profile.frameRate } : {}),
     };
     if (
-      nextRequest.quality === this.activeRequest.quality &&
+      nextRequest.quality === currentRequest.quality &&
       (nextRequest.frameRate || 30) ===
-        (this.activeRequest.frameRate || 30)
+        (currentRequest.frameRate || 30)
     ) {
       return false;
     }
@@ -691,43 +719,51 @@ export class EmbyBroadcastController {
           ? "原画"
           : nextRequest.quality
       } · ${nextRequest.frameRate || 30} 帧媒体流…`,
+      undefined,
+      nextRequest,
     );
     return true;
   }
 
   async setAudioTrack(audioStreamIndex: number): Promise<void> {
+    const currentRequest = this.desiredPlaybackRequest();
     if (
-      !this.activeRequest ||
-      !this.active ||
+      !currentRequest ||
+      (!this.active && !this.restarting) ||
       this.destroyed ||
-      this.restarting ||
-      this.activeRequest.audioStreamIndex === audioStreamIndex
+      currentRequest.audioStreamIndex === audioStreamIndex
     ) {
       return;
     }
-    this.activeRequest = { ...this.activeRequest, audioStreamIndex };
+    const nextRequest = { ...currentRequest, audioStreamIndex };
+    this.activeRequest = nextRequest;
     await this.restartAt(
       this.getRestartTime(),
       "正在切换音轨，重新建立媒体流…",
+      undefined,
+      nextRequest,
     );
   }
 
   async setSubtitleTrack(subtitleStreamIndex: number | undefined): Promise<void> {
+    const currentRequest = this.desiredPlaybackRequest();
     if (
-      !this.activeRequest ||
-      !this.active ||
+      !currentRequest ||
+      (!this.active && !this.restarting) ||
       this.destroyed ||
-      this.restarting ||
-      this.activeRequest.subtitleStreamIndex === subtitleStreamIndex
+      currentRequest.subtitleStreamIndex === subtitleStreamIndex
     ) {
       return;
     }
-    this.activeRequest = { ...this.activeRequest, subtitleStreamIndex };
+    const nextRequest = { ...currentRequest, subtitleStreamIndex };
+    this.activeRequest = nextRequest;
     await this.restartAt(
       this.getRestartTime(),
       subtitleStreamIndex !== undefined
         ? "正在切换字幕轨，重新建立媒体流…"
         : "正在关闭字幕，重新建立媒体流…",
+      undefined,
+      nextRequest,
     );
   }
 
@@ -882,39 +918,131 @@ export class EmbyBroadcastController {
       ? Math.max(0, Number(this.options.video.currentTime) || 0)
       : Math.max(
           0,
-          Number(this.activeRequest?.startTimeTicks || 0) / 10_000_000,
+          Number(this.desiredPlaybackRequest()?.startTimeTicks || 0) /
+            10_000_000,
         );
+  }
+
+  private desiredPlaybackRequest(): EmbyPlaybackRequest | undefined {
+    return (
+      this.pendingRestart?.request ||
+      this.runningRestart?.request ||
+      this.activeRequest
+    );
   }
 
   private restartAt(
     seconds: number,
     notice?: string,
     seekRevision?: number,
+    request: EmbyPlaybackRequest | undefined = this.activeRequest,
   ): Promise<void> {
-    if (this.restartOperation) return this.restartOperation;
-    if (!this.activeRequest || this.destroyed) return Promise.resolve();
-    this.restarting = true;
-    const operation = this.performRestartAt(
-      seconds,
+    if (!request || this.destroyed) return Promise.resolve();
+    const normalizedSeconds = Math.max(0, Number(seconds) || 0);
+    const signature = JSON.stringify({
+      seconds: Math.round(normalizedSeconds * 1_000),
+      request,
+    });
+    let resolveWaiter!: () => void;
+    const waiter = new Promise<void>((resolve) => {
+      resolveWaiter = resolve;
+    });
+    if (this.pendingRestart?.signature === signature) {
+      this.pendingRestart.waiters.push(resolveWaiter);
+      return waiter;
+    }
+    if (
+      !this.pendingRestart &&
+      this.runningRestart?.signature === signature
+    ) {
+      this.runningRestart.waiters.push(resolveWaiter);
+      return waiter;
+    }
+
+    const waiters = [
+      ...(this.pendingRestart?.waiters || []),
+      resolveWaiter,
+    ];
+    if (this.runningRestart) {
+      waiters.unshift(...this.runningRestart.waiters.splice(0));
+    }
+    const intent: RestartIntent = {
+      id: ++this.restartRevision,
+      signature,
+      request: { ...request },
+      seconds: normalizedSeconds,
       notice,
       seekRevision,
-    ).finally(() => {
-      if (this.restartOperation === operation) {
-        this.restartOperation = undefined;
-        this.restarting = false;
+      waiters,
+    };
+    this.pendingRestart = intent;
+
+    if (this.runningRestart && !this.restartCancellation) {
+      // A later quality/audio/subtitle operation owns the desired pipeline.
+      // Reject the stale deferred start immediately, while one bounded
+      // teardown releases any FFmpeg/proxy work before the latest intent runs.
+      this.startAttempt += 1;
+      this.restartCancellation = this.stopPipelineOnly(
+        "restart-superseded",
+      )
+        .catch(() => undefined)
+        .finally(() => {
+          this.restartCancellation = undefined;
+        });
+    }
+    this.startRestartDrain();
+    return waiter;
+  }
+
+  private startRestartDrain(): void {
+    if (this.restartOperation || this.destroyed) return;
+    this.restarting = true;
+    const operation = this.drainRestarts().finally(() => {
+      if (this.restartOperation !== operation) return;
+      this.restartOperation = undefined;
+      this.restarting = false;
+      if (this.pendingRestart && !this.destroyed) {
+        this.startRestartDrain();
       }
     });
     this.restartOperation = operation;
-    return operation;
+  }
+
+  private async drainRestarts(): Promise<void> {
+    while (this.pendingRestart && !this.destroyed) {
+      if (this.restartCancellation) await this.restartCancellation;
+      const intent = this.pendingRestart;
+      this.pendingRestart = undefined;
+      this.runningRestart = intent;
+      try {
+        await this.performRestartAt(intent);
+      } catch (error) {
+        if (intent.id === this.restartRevision && !this.destroyed) {
+          this.options.notify(
+            error instanceof Error
+              ? error.message
+              : "Emby 媒体流重建失败",
+            true,
+          );
+        }
+      } finally {
+        for (const resolve of intent.waiters.splice(0)) resolve();
+        if (this.runningRestart === intent) this.runningRestart = undefined;
+      }
+    }
   }
 
   private async performRestartAt(
-    seconds: number,
-    notice?: string,
-    seekRevision?: number,
+    intent: RestartIntent,
   ): Promise<void> {
-    const activeRequest = this.activeRequest;
-    if (!activeRequest || this.destroyed) return;
+    const {
+      id,
+      request,
+      seconds,
+      notice,
+      seekRevision,
+    } = intent;
+    if (this.destroyed) return;
     // MSE is intentionally paused before the startup buffer barrier and may
     // also auto-pause on decoder failure. Preserve explicit user intent, not
     // that transient media-element state, across a compatibility rebuild.
@@ -946,7 +1074,7 @@ export class EmbyBroadcastController {
     try {
       await this.start(
         {
-          ...activeRequest,
+          ...request,
           startTimeTicks: Math.round(seconds * 10_000_000),
         },
         this.title,
@@ -956,7 +1084,8 @@ export class EmbyBroadcastController {
     } catch (error) {
       this.desiredPausedAfterStart = wasPaused;
       const superseded =
-        seekRevision !== undefined && seekRevision !== this.seekRevision;
+        id !== this.restartRevision ||
+        (seekRevision !== undefined && seekRevision !== this.seekRevision);
       if (!superseded) {
         this.options.notify(
           error instanceof Error ? error.message : "Emby 跳转失败",
@@ -1618,6 +1747,7 @@ export class EmbyBroadcastController {
         this.localPlayer.bufferProfile?.initialSeconds || 10,
       );
       state.slowSamples = 0;
+      state.healthyRecoverySamples = 0;
       this.publishStatus();
       this.maybeStartSynchronizedPlayback();
     }
@@ -1678,10 +1808,28 @@ export class EmbyBroadcastController {
       .catch((error: unknown) => {
         if (mediaVersion !== this.mediaVersion) return;
         this.broadcastPlaybackState(true);
+        const aborted =
+          error instanceof DOMException && error.name === "AbortError";
+        if (
+          aborted &&
+          this.localReady &&
+          this.active &&
+          this.mediaVersion > 1
+        ) {
+          // Replacing an MSE source aborts the stale play() promise. Once the
+          // replacement is locally ready this is not a failed first start;
+          // consume the one-shot room barrier so a late viewer cannot hold
+          // every healthy participant paused forever.
+          this.initialPlaybackStarted = true;
+          if (this.startBarrierTimer !== undefined) {
+            window.clearTimeout(this.startBarrierTimer);
+            this.startBarrierTimer = undefined;
+          }
+        }
         if (
           this.destroyed ||
           this.stopping ||
-          (error instanceof DOMException && error.name === "AbortError")
+          aborted
         ) {
           return;
         }
@@ -1704,22 +1852,49 @@ export class EmbyBroadcastController {
       state.observedDroppedFragments = state.stats.droppedFragments;
       if (!state.sessionReady || !state.ready) {
         state.slowSamples = 0;
+        state.healthyRecoverySamples = 0;
         continue;
       }
       const backlogDelayed =
         state.bufferAhead < 4 &&
         state.stats.totalQueuedDurationMs >= 1_800;
       const delayed = droppedSinceLastSample || backlogDelayed;
+      const recoveryCooldownMs =
+        state.recoveryCooldownMs ||
+        EMBY_SLOW_PEER_MIN_RECOVERY_COOLDOWN_MS;
       state.slowSamples = delayed
         ? Math.min(12, state.slowSamples + 1)
         : Math.max(0, state.slowSamples - 1);
+      if (delayed) {
+        state.healthyRecoverySamples = 0;
+      } else if (
+        state.bufferAhead >= 6 &&
+        state.stats.totalQueuedDurationMs < 1_200
+      ) {
+        state.healthyRecoverySamples =
+          (state.healthyRecoverySamples || 0) + 1;
+        if (
+          state.healthyRecoverySamples >=
+          EMBY_SLOW_PEER_HEALTHY_RESET_SAMPLES
+        ) {
+          state.recoveryCooldownMs =
+            EMBY_SLOW_PEER_MIN_RECOVERY_COOLDOWN_MS;
+          state.healthyRecoverySamples = 0;
+        }
+      } else {
+        state.healthyRecoverySamples = 0;
+      }
       if (
         state.slowSamples < 4 ||
-        now - state.lastCatchUpAt < 5_000
+        now - state.lastCatchUpAt < recoveryCooldownMs
       ) {
         continue;
       }
       state.lastCatchUpAt = now;
+      state.recoveryCooldownMs = Math.min(
+        EMBY_SLOW_PEER_MAX_RECOVERY_COOLDOWN_MS,
+        recoveryCooldownMs * 2,
+      );
       state.slowSamples = 0;
       state.recoveries += 1;
       this.primeMediaForPeer(
@@ -1859,13 +2034,25 @@ export class EmbyBroadcastController {
     }
   }
 
+  private cancelQueuedRestarts(): void {
+    this.restartRevision += 1;
+    const pending = this.pendingRestart;
+    this.pendingRestart = undefined;
+    if (pending) {
+      for (const resolve of pending.waiters.splice(0)) resolve();
+    }
+    if (this.runningRestart) {
+      for (const resolve of this.runningRestart.waiters.splice(0)) resolve();
+    }
+  }
+
   private async reportPlayback(
     action: "start" | "progress" | "stop",
     eventName: string,
   ): Promise<void> {
     if (!this.plan) return;
-    if (action === "progress" && this.progressReportInFlight) return;
-    if (action === "progress") this.progressReportInFlight = true;
+    if (this.playbackReportsInFlight.has(action)) return;
+    this.playbackReportsInFlight.add(action);
     try {
       await withEmbyIpcTimeout(
         this.bridge.embyReportPlayback({
@@ -1892,7 +2079,7 @@ export class EmbyBroadcastController {
             : String(error).slice(0, 300),
       });
     } finally {
-      if (action === "progress") this.progressReportInFlight = false;
+      this.playbackReportsInFlight.delete(action);
     }
   }
 

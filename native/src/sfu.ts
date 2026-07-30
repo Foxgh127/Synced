@@ -776,7 +776,7 @@ export class SfuSession {
       };
       const mediaChannel = new SfuRtcDataChannel(
         SFU_EMBY_MEDIA_TRACK,
-        publishViewerControl,
+        undefined,
         fatal,
       );
       const controlChannel = new SfuRtcDataChannel(

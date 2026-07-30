@@ -548,6 +548,70 @@ test("SFU viewer recovery requests a local transport fallback without broadcasti
   player.destroy();
 });
 
+test("receiver catch-up requests back off under repeated weak-network stalls and reset after healthy buffering", async () => {
+  const { EmbyMsePlayer } = await loadModule();
+  globalThis.window ||= globalThis;
+  globalThis.document ||= { getElementById: () => null };
+  const video = Object.assign(new EventTarget(), {
+    autoplay: false,
+    currentTime: 5,
+    playbackRate: 1,
+    paused: false,
+    buffered: { length: 1, start: () => 0, end: () => 40 },
+    querySelectorAll: () => [],
+    removeAttribute() {},
+    load() {},
+    pause() {
+      this.paused = true;
+    },
+    async play() {
+      this.paused = false;
+    },
+  });
+  const sent = [];
+  const player = new EmbyMsePlayer({ video });
+  player.session = {
+    roomId: "ROOM",
+    sessionId: "session_adaptive_catch_up",
+    mediaVersion: 3,
+    transportEpoch: 0,
+    mimeType: 'video/mp4; codecs="avc1.640028,mp4a.40.2"',
+    plan: { bitrate: 8_000_000 },
+    title: "Fixture",
+  };
+  player.controlChannel = {
+    readyState: "open",
+    send(payload) {
+      sent.push(JSON.parse(payload));
+    },
+  };
+  player.started = true;
+  player.hostWantsPaused = false;
+
+  player.requestCatchUp(18, "first-stall");
+  player.requestCatchUp(19, "immediate-repeat");
+  assert.equal(
+    sent.filter(({ type }) => type === "catch-up").length,
+    1,
+  );
+  assert.equal(player.catchUpCooldownMs, 2_400);
+
+  player.lastCatchUpRequestAt =
+    Date.now() - player.catchUpCooldownMs - 1;
+  player.requestCatchUp(20, "later-stall");
+  assert.equal(
+    sent.filter(({ type }) => type === "catch-up").length,
+    2,
+  );
+  assert.equal(player.catchUpCooldownMs, 4_800);
+
+  for (let sample = 0; sample < 12; sample += 1) {
+    player.inspectBuffer();
+  }
+  assert.equal(player.catchUpCooldownMs, 1_200);
+  player.destroy();
+});
+
 test("a silently frozen SFU Emby transport falls back once without waiting for close", async () => {
   const { EmbyMsePlayer } = await loadModule();
   globalThis.document = {

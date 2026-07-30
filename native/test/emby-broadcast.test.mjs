@@ -348,6 +348,64 @@ test("shared Emby quality and frame rate restart the pipeline once", async () =>
   await controller.destroy();
 });
 
+test("rapid quality and audio changes coalesce into the latest restart request", async (t) => {
+  const { EmbyBroadcastController } = await loadModule();
+  const staleRestart = deferred();
+  const latestRestart = deferred();
+  const harness = createHarness([staleRestart, latestRestart]);
+  const controller = new EmbyBroadcastController({
+    roomId: "ROOM",
+    video: harness.video,
+    notify: () => {},
+    onStatus: () => {},
+    onStreamReady: () => {},
+  });
+  t.after(() => controller.destroy());
+  controller.activeRequest = {
+    itemId: "rapid-profile",
+    quality: "480p-2.5",
+    frameRate: 30,
+    audioStreamIndex: 1,
+    startTimeTicks: 90_000_000,
+  };
+  controller.pipelineId = "pipeline-before-rapid-profile";
+  controller.plan = plan("rapid-profile", 90_000_000);
+  controller.mimeType =
+    'video/mp4; codecs="avc1.640028,mp4a.40.2"';
+
+  const qualityChange = controller.setQuality("1080p-12", "quality change");
+  while (harness.startRequests.length < 1) await nextTurn();
+  const audioChange = controller.setAudioTrack(4);
+  while (harness.startRequests.length < 2) await nextTurn();
+
+  assert.equal(harness.startRequests[0].quality, "1080p-12");
+  assert.equal(harness.startRequests[0].audioStreamIndex, 1);
+  assert.equal(harness.startRequests[1].quality, "1080p-12");
+  assert.equal(harness.startRequests[1].audioStreamIndex, 4);
+  assert.ok(harness.stopped.includes("restart-superseded"));
+
+  harness.emit({
+    type: "init",
+    pipelineId: "pipeline-latest-rapid-profile",
+    plan: plan("rapid-profile", 90_000_000),
+    mimeType: 'video/mp4; codecs="avc1.640028,mp4a.40.2"',
+    data: Uint8Array.of(7),
+  });
+  latestRestart.resolve({
+    pipelineId: "pipeline-latest-rapid-profile",
+    plan: plan("rapid-profile", 90_000_000),
+  });
+  await Promise.all([qualityChange, audioChange]);
+  staleRestart.resolve({
+    pipelineId: "pipeline-stale-rapid-profile",
+    plan: plan("rapid-profile", 90_000_000),
+  });
+  await nextTurn();
+
+  assert.equal(controller.currentRequest?.quality, "1080p-12");
+  assert.equal(controller.currentRequest?.audioStreamIndex, 4);
+});
+
 test("a startup quality request preserves the requested resume position", async () => {
   const { EmbyBroadcastController } = await loadModule();
   const harness = createHarness([]);
@@ -939,6 +997,36 @@ test("playback telemetry is bounded and overlapping progress reports are coalesc
   await controller.destroy();
 });
 
+test("overlapping playback start and stop reports are coalesced per action", async () => {
+  const { EmbyBroadcastController } = await loadModule();
+  const reportGate = deferred();
+  const harness = createHarness([], { reportGate });
+  const controller = new EmbyBroadcastController({
+    roomId: "ROOM",
+    video: harness.video,
+    notify: () => {},
+    onStatus: () => {},
+    onStreamReady: () => {},
+  });
+  controller.plan = plan("lifecycle-telemetry");
+  controller.pipelineId = "pipeline-lifecycle-telemetry";
+
+  const firstStart = controller.reportPlayback("start", "TimeUpdate");
+  await nextTurn();
+  await controller.reportPlayback("start", "TimeUpdate");
+  const firstStop = controller.reportPlayback("stop", "Stop");
+  await nextTurn();
+  await controller.reportPlayback("stop", "Stop");
+  assert.deepEqual(
+    harness.reportCalls.map(({ action }) => action),
+    ["start", "stop"],
+  );
+
+  reportGate.resolve();
+  await Promise.all([firstStart, firstStop]);
+  await controller.destroy();
+});
+
 test("stop and seek teardown cannot wait forever on stalled Electron IPC", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const { EmbyBroadcastController } = await loadModule();
@@ -1330,8 +1418,41 @@ test("a rejected host play promise enters the bounded compatibility recovery pat
   assert.ok(harness.stopped.includes("local-player-error"));
 });
 
+test("an aborted replacement play consumes the initial viewer barrier", async (t) => {
+  const { EmbyBroadcastController } = await loadModule();
+  const harness = createHarness([]);
+  const controller = new EmbyBroadcastController({
+    roomId: "ROOM",
+    video: harness.video,
+    notify: () => {},
+    onStatus: () => {},
+    onStreamReady: () => {},
+  });
+  t.after(() => controller.destroy());
+  controller.pipelineId = "pipeline-aborted-replacement";
+  controller.plan = plan("aborted-replacement");
+  controller.mimeType = 'video/mp4; codecs="avc1.640028,mp4a.40.2"';
+  controller.mediaVersion = 2;
+  controller.localReady = true;
+  controller.initialPlaybackStarted = false;
+  controller.activeRequest = { itemId: "aborted-replacement" };
+  controller.startBarrierTimer = window.setTimeout(() => {}, 30_000);
+  harness.video.playError = new DOMException(
+    "play was replaced",
+    "AbortError",
+  );
+
+  controller.maybeStartSynchronizedPlayback();
+  await nextTurn();
+  assert.equal(controller.initialPlaybackStarted, true);
+  assert.equal(controller.startBarrierTimer, undefined);
+  assert.equal(controller.localFailureHandledForVersion, -1);
+});
+
 test("slow-peer recovery ignores initial and healthy forward cache but reacts to low buffer", async (t) => {
   const { EmbyBroadcastController } = await loadModule();
+  let now = 1_000_000;
+  t.mock.method(Date, "now", () => now);
   const harness = createHarness([]);
   const controller = new EmbyBroadcastController({
     roomId: "ROOM",
@@ -1374,6 +1495,8 @@ test("slow-peer recovery ignores initial and healthy forward cache but reacts to
     slowSamples: 0,
     recoveries: 0,
     lastCatchUpAt: 0,
+    recoveryCooldownMs: 5_000,
+    healthyRecoverySamples: 0,
     lastPressureReportAt: 0,
     observedDroppedFragments: 0,
     transportEpoch: 0,
@@ -1406,6 +1529,29 @@ test("slow-peer recovery ignores initial and healthy forward cache but reacts to
   );
   controller.recoverSlowPeers();
   assert.equal(clears, 1, "the cooldown prevents immediate repeat resync");
+  assert.equal(state.recoveryCooldownMs, 10_000);
+
+  controller.recoverSlowPeers();
+  controller.recoverSlowPeers();
+  controller.recoverSlowPeers();
+  now += 9_999;
+  controller.recoverSlowPeers();
+  assert.equal(clears, 1, "repeated weakness observes the adaptive cooldown");
+  now += 1;
+  controller.recoverSlowPeers();
+  assert.equal(clears, 2);
+  assert.equal(state.recoveryCooldownMs, 20_000);
+
+  state.bufferAhead = 12;
+  state.stats.totalQueuedDurationMs = 0;
+  for (let sample = 0; sample < 12; sample += 1) {
+    controller.recoverSlowPeers();
+  }
+  assert.equal(
+    state.recoveryCooldownMs,
+    5_000,
+    "sustained healthy buffering restores fast recovery",
+  );
 });
 
 test("peer repair controls are deduplicated and token-bucket limited", async (t) => {
