@@ -63,6 +63,7 @@ interface PeerState {
   lastBufferStateAt: number;
   mediaFallbackActive: boolean;
   lastMediaFallbackAt: number;
+  pendingMediaFallbackTarget?: number;
 }
 
 interface PendingStart {
@@ -530,6 +531,8 @@ export class EmbyBroadcastController {
       state.recentRepairRequests.clear();
       state.lastInitRequestAt = 0;
       state.lastBufferStateAt = 0;
+      state.mediaFallbackActive = false;
+      state.pendingMediaFallbackTarget = undefined;
       const { sender } = state;
       sender.cancelVersionsExcept(this.mediaVersion);
     }
@@ -665,6 +668,7 @@ export class EmbyBroadcastController {
       lastBufferStateAt: 0,
       mediaFallbackActive: false,
       lastMediaFallbackAt: 0,
+      pendingMediaFallbackTarget: undefined,
     };
     state.sender = new EmbyPeerSender(
       channel,
@@ -1719,6 +1723,64 @@ export class EmbyBroadcastController {
     sendCachedMedia();
   }
 
+  private validMediaFallbackRequest(
+    viewerId: string,
+    targetTime: number,
+  ): boolean {
+    return (
+      viewerId !== "__sfu__" &&
+      Boolean(this.segmentDescriptor) &&
+      Number.isFinite(targetTime) &&
+      targetTime >= 0 &&
+      targetTime <= 30 * 24 * 60 * 60
+    );
+  }
+
+  private acknowledgeMediaFallback(state: PeerState): void {
+    state.sender.sendControl(
+      {
+        type: "segment-fallback-ack",
+        sessionId: this.sessionId,
+        mediaVersion: this.mediaVersion,
+        transportEpoch: state.transportEpoch,
+      },
+      true,
+    );
+  }
+
+  private activateMediaFallbackForPeer(
+    viewerId: string,
+    state: PeerState,
+    targetTime: number,
+  ): void {
+    if (!state.sessionReady) {
+      state.pendingMediaFallbackTarget = targetTime;
+      return;
+    }
+    state.pendingMediaFallbackTarget = undefined;
+    const now = Date.now();
+    const alreadyPrimed =
+      state.mediaFallbackActive &&
+      now - state.lastMediaFallbackAt < 1_000;
+    state.mediaFallbackActive = true;
+    if (!alreadyPrimed) {
+      state.lastMediaFallbackAt = now;
+      this.primeMediaForPeer(state, targetTime, true);
+      this.bridge.reportDiagnostic(
+        "emby-segment-media-fallback-started",
+        {
+          viewerId,
+          mediaVersion: this.mediaVersion,
+          targetTime,
+          transportEpoch: state.transportEpoch,
+        },
+      );
+    }
+    // ACK every duplicate request. If a previous ACK was lost, throttling the
+    // expensive cache prime must not leave the viewer retrying forever.
+    this.acknowledgeMediaFallback(state);
+  }
+
   private handlePeerControl(
     viewerId: string,
     message: EmbyControlMessage,
@@ -1790,48 +1852,53 @@ export class EmbyBroadcastController {
       if (state.sessionReady) return;
       state.sessionReady = true;
       state.ready = false;
-      this.primeMediaForPeer(state);
+      const pendingFallbackTarget =
+        state.pendingMediaFallbackTarget;
+      if (pendingFallbackTarget !== undefined) {
+        this.activateMediaFallbackForPeer(
+          viewerId,
+          state,
+          pendingFallbackTarget,
+        );
+      } else {
+        this.primeMediaForPeer(state);
+      }
       this.publishStatus();
       return;
     }
-    if (!state.sessionReady) return;
     if (message.type === "segment-fallback-request") {
       if (
-        viewerId === "__sfu__" ||
-        !this.segmentDescriptor ||
-        !Number.isFinite(message.targetTime) ||
-        message.targetTime < 0 ||
-        message.targetTime > 30 * 24 * 60 * 60
+        !this.validMediaFallbackRequest(
+          viewerId,
+          message.targetTime,
+        )
       ) {
         return;
       }
-      const now = Date.now();
-      if (
-        state.mediaFallbackActive &&
-        now - state.lastMediaFallbackAt < 1_000
-      ) {
-        return;
-      }
-      state.mediaFallbackActive = true;
-      state.lastMediaFallbackAt = now;
-      this.primeMediaForPeer(state, message.targetTime, true);
-      this.bridge.reportDiagnostic("emby-segment-media-fallback-started", {
+      this.activateMediaFallbackForPeer(
         viewerId,
-        mediaVersion: this.mediaVersion,
-        targetTime: message.targetTime,
-      });
+        state,
+        message.targetTime,
+      );
       return;
     }
     if (message.type === "segment-fallback-release") {
-      if (!state.mediaFallbackActive) return;
+      const wasActive = state.mediaFallbackActive;
+      state.pendingMediaFallbackTarget = undefined;
       state.mediaFallbackActive = false;
-      state.sender.clearMediaQueue();
-      this.bridge.reportDiagnostic("emby-segment-media-fallback-released", {
-        viewerId,
-        mediaVersion: this.mediaVersion,
-      });
+      if (wasActive) {
+        state.sender.clearMediaQueue();
+        this.bridge.reportDiagnostic(
+          "emby-segment-media-fallback-released",
+          {
+            viewerId,
+            mediaVersion: this.mediaVersion,
+          },
+        );
+      }
       return;
     }
+    if (!state.sessionReady) return;
     if (message.type === "catch-up") {
       if (viewerId === "__sfu__") {
         // The published SFU data track is shared by every subscriber. A

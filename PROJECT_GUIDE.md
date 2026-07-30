@@ -1,6 +1,6 @@
 # “同频”项目完整说明
 
-> - 适用版本：Native `2.9.1`
+> - 适用版本：Native `2.9.2`
 > - 面向读者：第一次接触本项目的产品、设计、测试、运维和开发人员
 > - 最重要的入口：当前 Windows / Android 产品在 [`native/`](./native/)；仓库根目录还保留了一套独立的 VDO.Ninja 网页实现。
 
@@ -253,8 +253,10 @@ Windows 成员打开“开始放映”后可以在普通屏幕共享与 Emby 高
    Range 请求按预算重试；停止时有界关闭现有连接和空闲连接。
 5. `CmafRelayCoordinator` 生成共享时间轴、约 2 秒 GOP 对齐的多档媒体。默认只启动
    1080p8/720p4；桌面高速观看端需要时启动 original，持续弱网端需要时启动 480p18，
-   无订阅 30 秒后暂停可选 producer。所有辅助 FFmpeg 都由 `-readrate` 限速，首次
-   中途启动从当前播放锚点开始；共享上传 token bucket 最多使用测速后剩余上行的 65%。
+   无订阅 30 秒后正常停止可选 FFmpeg 并从服务表删除。再次有需求时使用新的 rendition
+   epoch 从当前播放锚点启动；init 路径按 epoch 隔离，segment 使用跨重启单调递增的
+   全局序号。所有辅助 FFmpeg 都由 `-readrate` 限速；共享上传 token bucket 最多使用
+   测速后剩余上行的 65%。
 6. 同一 rendition 的 init/segment 严格串行上传，不同 rendition 间最多三路并发。
    清单只公布 `contiguousUploadedSequence` 之前的连续前缀；单片三次短重试失败后进入
    独立的 1/2/4/8/15/30 秒抖动退避 actor，网络恢复不依赖令牌轮换。越过播放保留窗的
@@ -263,9 +265,13 @@ Windows 成员打开“开始放映”后可以在普通屏幕共享与 Emby 高
    `/media/v1/rooms/{room}/sessions/{sessionId}/assets/{assetId}/versions/{version}/…`，
    所以同一房间重播相同影片并从版本 1 开始也不会碰撞。服务端验证完整身份、连续序号、
    字节数与 SHA-256；不可变 PUT 使用锁内 exclusive link，竞争写不能覆盖已有对象。
-8. 服务端以信令明确登记 active session，不再用最近访问时间猜当前版本。磁盘 LRU
-   pin 当前/过渡清单、init、字幕及播放点前 60 秒到后 120 秒的 segment；删除仍被
-   清单引用的冷片前先原子裁剪清单，观看端遇到 404 会刷新清单并从下一关键帧恢复。
+8. 服务端以信令明确登记 active session，不再用最近访问时间猜当前版本。manifest
+   同时携带发布端单调 revision、服务端 eviction revision 和逐档前缀 tombstone。
+   活跃会话的 LRU 只允许裁剪播放点 30 秒以前的过期回看前缀，当前与所有未来分片、
+   in-flight 新版本、init 和字幕均保持 pin；空间仍不足时用响应头要求发布端把前向
+   窗口收敛到 120 秒。发布端下次 PUT 若仍引用已裁剪对象会收到结构化 409，先应用
+   tombstone 或从本地 spool 补传缺失对象，再以新 revision 发布锚点和 ended，不能
+   原样永久重试。观看端遇到 404 会刷新清单并从下一关键帧恢复。
 9. `emby-segment-relay.ts` 在每位观看者本地执行 ABR：Urgent 负责未来 0–15 秒，
    Warm 负责 15–120 秒，Prefetch 仅在长期稳定、吞吐有 1.5 倍余量、RTT 稳定且非
    计费网络时运行。原画还必须同时满足前向缓存不少于 20 秒和实测吞吐不低于原画真实
@@ -279,8 +285,11 @@ Windows 成员打开“开始放映”后可以在普通屏幕共享与 Emby 高
     abort、降低 buffer 和本地 MediaSource 重建，不能形成 trim-and-retry 活锁。
 12. LiveKit/P2P 控制链切换只替换 control channel，保留 `EmbyMsePlayer`、ABR actor
     和已缓存媒体。连续三次 manifest/segment 请求失败时，观看端发送
-    `segment-fallback-request`，主播仅为该观看端启用部分可靠媒体 DataChannel，并发送
-    最近 30–60 秒主档缓存；连续三次 HTTPS 探测恢复后释放应急链路并回到原 ABR 缓存。
+    `segment-fallback-request`；即使它早于 `session-ready` 到达，主播也会暂存请求并在
+    会话就绪后执行。主播用包含 session、mediaVersion、transportEpoch 的
+    `segment-fallback-ack` 确认，观看端在 ACK 前按 500 ms/1 s/2 s 有界重发。媒体仅向
+    该观看端启用部分可靠 DataChannel，并发送最近 30–60 秒主档缓存；连续三次 HTTPS
+    探测恢复后释放应急链路并回到原 ABR 缓存。
 
 成员在入房时就上报 MSE/H.264/HEVC/AAC 能力。默认选全员兼容的 H.264/AAC；只有
 所有当前观众都支持时才允许 HEVC，晚加入的不兼容客户端会看到明确错误而不是黑屏。
@@ -290,7 +299,8 @@ Windows 成员打开“开始放映”后可以在普通屏幕共享与 Emby 高
 Windows 观看端另有真实 WebGL2 GPU 空间增强后端：只在远端 Emby 360p–1080p
 放大到接近 2K/4K、SDR、GPU 有余量时启用，使用视频纹理和五采样保守锐化，不做
 CPU 回读；字幕与弹幕在增强后合成。GPU p95 超过 14 ms、丢帧超过 3%、资源压力、
-上下文丢失或同机屏幕共享会自动关闭并冷却 30 秒。能力握手只声明实际后端；
+上下文丢失或同机屏幕共享会自动关闭并冷却 30 秒；频道自适应模块判定的 decoder、
+encoder、render 压力也会直接传入增强器统一让出资源。能力握手只声明实际后端；
 仓库没有 NVIDIA RTX Video SDK 的授权二进制/运行时，因此当前不会宣称
 `rtx-video`，但协议已为未来真实原生后端保留该枚举。
 

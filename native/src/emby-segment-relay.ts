@@ -71,6 +71,7 @@ export interface EmbySegmentManifestEntry {
 
 export interface EmbyRenditionManifest {
   id: string;
+  epoch: number;
   label: string;
   width: number;
   height: number;
@@ -91,6 +92,13 @@ export interface EmbySegmentManifest {
   sessionId: string;
   assetId: string;
   mediaVersion: number;
+  revision: number;
+  evictionRevision: number;
+  tombstones: Array<{
+    renditionId: string;
+    throughSequence: number;
+    evictionRevision: number;
+  }>;
   title: string;
   startTimeTicks: number;
   runtimeTicks?: number;
@@ -296,8 +304,14 @@ export function parseEmbySegmentManifest(
   for (const candidate of input.renditions) {
     const rendition = candidate as Partial<EmbyRenditionManifest>;
     const renditionId = String(rendition.id || "");
+    const epoch =
+      rendition.epoch === undefined ? 1 : Number(rendition.epoch);
     const initPath = String(rendition.initPath || "");
     const renditionRoot = `${versionRoot}renditions/${renditionId}/`;
+    const expectedInitPath =
+      rendition.epoch === undefined
+        ? `${renditionRoot}init.mp4`
+        : `${renditionRoot}epochs/${epoch}/init.mp4`;
     const segments = Array.isArray(rendition.segments)
       ? rendition.segments
           .map((segment) =>
@@ -324,7 +338,10 @@ export function parseEmbySegmentManifest(
     if (
       !/^[a-z0-9][a-z0-9-]{0,31}$/u.test(renditionId) ||
       renditionIds.has(renditionId) ||
-      initPath !== `${renditionRoot}init.mp4` ||
+      !Number.isSafeInteger(epoch) ||
+      epoch < 1 ||
+      epoch > 0xffffffff ||
+      initPath !== expectedInitPath ||
       !String(rendition.mimeType || "").startsWith("video/mp4") ||
       !Number.isFinite(Number(rendition.bitrate)) ||
       Number(rendition.bitrate) <= 0 ||
@@ -357,6 +374,7 @@ export function parseEmbySegmentManifest(
     renditionIds.add(renditionId);
     renditions.push({
       id: renditionId,
+      epoch,
       label: String(rendition.label || rendition.id).slice(0, 80),
       width: Math.max(1, Math.floor(finite(rendition.width, 1))),
       height: Math.max(1, Math.floor(finite(rendition.height, 1))),
@@ -388,6 +406,28 @@ export function parseEmbySegmentManifest(
     sessionId: String(input.sessionId || "").slice(0, 128),
     assetId: expected.assetId,
     mediaVersion: expected.mediaVersion,
+    revision: Math.max(1, Math.floor(finite(input.revision, 1))),
+    evictionRevision: Math.max(
+      0,
+      Math.floor(finite(input.evictionRevision, 0)),
+    ),
+    tombstones: Array.isArray(input.tombstones)
+      ? input.tombstones
+          .map((value) => ({
+            renditionId: String(value?.renditionId || ""),
+            throughSequence: Number(value?.throughSequence),
+            evictionRevision: Number(value?.evictionRevision),
+          }))
+          .filter(
+            (value) =>
+              /^[a-z0-9][a-z0-9-]{0,31}$/u.test(value.renditionId) &&
+              Number.isSafeInteger(value.throughSequence) &&
+              value.throughSequence >= 1 &&
+              Number.isSafeInteger(value.evictionRevision) &&
+              value.evictionRevision >= 1,
+          )
+          .slice(0, 16)
+      : [],
     title: String(input.title || "Emby 影片").slice(0, 300),
     startTimeTicks: Math.max(0, finite(input.startTimeTicks)),
     runtimeTicks:
@@ -1425,6 +1465,7 @@ export class EmbyAbrSegmentClient {
     });
     if (
       selected.id !== this.currentRendition?.id ||
+      selected.epoch !== this.currentRendition?.epoch ||
       this.forceRenditionResync
     ) {
       const upgrading =
@@ -1489,7 +1530,9 @@ export class EmbyAbrSegmentClient {
       (segment) =>
         segment.timelineTimeMs + Math.max(1, segment.durationMs) >=
           this.appendedTimelineEndMs &&
-        !this.appended.has(`${rendition.id}:${segment.sequence}`),
+        !this.appended.has(
+          `${rendition.id}:${rendition.epoch}:${segment.sequence}`,
+        ),
     );
     if (this.requiresKeyframe) {
       const keyframeIndex = candidates.findIndex(
@@ -1573,7 +1616,9 @@ export class EmbyAbrSegmentClient {
     const finalTimelineEndMs = rendition.finalTimelineEndMs;
     const finalAppended =
       finalSequence === undefined ||
-      this.appended.has(`${rendition.id}:${finalSequence}`);
+      this.appended.has(
+        `${rendition.id}:${rendition.epoch}:${finalSequence}`,
+      );
     const timelineComplete =
       finalTimelineEndMs === undefined ||
       this.appendedTimelineEndMs + 50 >= finalTimelineEndMs;
@@ -1666,7 +1711,7 @@ export class EmbyAbrSegmentClient {
     signal: AbortSignal,
     fetchGeneration: number,
   ): Promise<void> {
-    const key = `${rendition.id}:${segment.sequence}`;
+    const key = `${rendition.id}:${rendition.epoch}:${segment.sequence}`;
     const url = mediaUrl(this.baseUrl, segment.path);
     const data = await this.fetchMediaBytes(
       url,
@@ -1678,7 +1723,8 @@ export class EmbyAbrSegmentClient {
       signal.aborted ||
       fetchGeneration !== this.fetchGeneration ||
       !this.session ||
-      this.currentRendition?.id !== rendition.id
+      this.currentRendition?.id !== rendition.id ||
+      this.currentRendition?.epoch !== rendition.epoch
     ) {
       return;
     }
@@ -1731,7 +1777,7 @@ export class EmbyAbrSegmentClient {
       (this.recoveryTargetTime ?? this.options.player.currentTime) * 1_000;
     const warmEndMs = currentMs + WARM_WINDOW_SECONDS * 1_000;
     const segmentKey = (segment: EmbySegmentManifestEntry): string =>
-      `${rendition.id}:${segment.sequence}`;
+      `${rendition.id}:${rendition.epoch}:${segment.sequence}`;
     const warmStartMs =
       currentMs +
       Math.max(15, this.options.player.bufferProfile.targetSeconds) *

@@ -428,7 +428,7 @@ test("session namespaces isolate reused asset versions and conflicting concurren
   }
 });
 
-test("active-session LRU pins the hot window and atomically trims a cold manifest suffix", async () => {
+test("active-session LRU trims only expired history and exposes a coordinated tombstone", async () => {
   const rootDir = await mkdtemp(path.join(tmpdir(), "synced-relay-lru-"));
   const relay = createSegmentRelay({
     rootDir,
@@ -452,9 +452,9 @@ test("active-session LRU pins the hot window and atomically trims a cold manifes
       `${ROOT}/renditions/720p4/segments/${sequence}.m4s`;
     const objects = [
       [initPath, Buffer.from("init")],
-      [segmentPath(1), Buffer.from("hot-one")],
+      [segmentPath(1), Buffer.from("cold-one")],
       [segmentPath(2), Buffer.from("hot-two")],
-      [segmentPath(3), Buffer.from("cold-three")],
+      [segmentPath(3), Buffer.from("future-three")],
     ];
     for (const [url, body] of objects) {
       const response = await fetch(`${server.baseUrl}${url}`, {
@@ -474,9 +474,13 @@ test("active-session LRU pins the hot window and atomically trims a cold manifes
       sessionId: SESSION,
       assetId: ASSET,
       mediaVersion: VERSION,
+      revision: 1,
+      evictionRevision: 0,
+      acknowledgedEvictionRevision: 0,
+      tombstones: [],
       title: "LRU fixture",
       startTimeTicks: 0,
-      playbackTimeMs: 0,
+      playbackTimeMs: 100_000,
       updatedAt: Date.now(),
       renditions: [
         {
@@ -485,9 +489,9 @@ test("active-session LRU pins the hot window and atomically trims a cold manifes
           mimeType: 'video/mp4; codecs="avc1.64001f,mp4a.40.2"',
           initPath,
           segments: [
-            [1, 0, 0, 2_000, 1, 7],
-            [2, 2_000, 2_000, 2_000, 1, 7],
-            [3, 200_000, 200_000, 2_000, 1, 10],
+            [1, 0, 0, 2_000, 1, 8],
+            [2, 80_000, 80_000, 2_000, 1, 7],
+            [3, 200_000, 200_000, 2_000, 1, 12],
           ],
         },
       ],
@@ -513,14 +517,18 @@ test("active-session LRU pins the hot window and atomically trims a cold manifes
     );
     relay.store.evict();
 
+    const cold = await fetch(`${server.baseUrl}${segmentPath(1)}`, {
+      headers: authorization(read.token),
+    });
+    assert.equal(cold.status, 404);
     const hot = await fetch(`${server.baseUrl}${segmentPath(2)}`, {
       headers: authorization(read.token),
     });
     assert.equal(hot.status, 200);
-    const cold = await fetch(`${server.baseUrl}${segmentPath(3)}`, {
+    const future = await fetch(`${server.baseUrl}${segmentPath(3)}`, {
       headers: authorization(read.token),
     });
-    assert.equal(cold.status, 404);
+    assert.equal(future.status, 200);
     const manifestResponse = await fetch(
       `${server.baseUrl}${ROOT}/manifest.json`,
       { headers: authorization(read.token) },
@@ -530,8 +538,72 @@ test("active-session LRU pins the hot window and atomically trims a cold manifes
     const trimmed = await manifestResponse.json();
     assert.deepEqual(
       trimmed.renditions[0].segments.map((segment) => segment[0]),
-      [1, 2],
+      [2, 3],
     );
+    assert.equal(trimmed.evictionRevision, 1);
+    assert.equal(trimmed.revision, 2);
+    assert.deepEqual(trimmed.tombstones, [
+      {
+        renditionId: "720p4",
+        throughSequence: 1,
+        evictionRevision: 1,
+      },
+    ]);
+
+    const staleManifest = {
+      ...manifest,
+      revision: 2,
+      playbackTimeMs: 102_000,
+      updatedAt: Date.now(),
+    };
+    const staleBody = Buffer.from(JSON.stringify(staleManifest));
+    const rejected = await fetch(
+      `${server.baseUrl}${ROOT}/manifest.json`,
+      {
+        method: "PUT",
+        headers: {
+          ...authorization(publish.token),
+          "content-length": String(staleBody.length),
+        },
+        body: staleBody,
+      },
+    );
+    assert.equal(rejected.status, 409);
+    const conflict = await rejected.json();
+    assert.equal(conflict.code, "manifest-revision-conflict");
+    assert.equal(conflict.evictionRevision, 1);
+    assert.deepEqual(conflict.tombstones, trimmed.tombstones);
+
+    const coordinatedManifest = {
+      ...trimmed,
+      revision: 3,
+      acknowledgedEvictionRevision: 1,
+      playbackTimeMs: 102_000,
+      ended: true,
+      updatedAt: Date.now(),
+    };
+    const coordinatedBody = Buffer.from(
+      JSON.stringify(coordinatedManifest),
+    );
+    const resumed = await fetch(
+      `${server.baseUrl}${ROOT}/manifest.json`,
+      {
+        method: "PUT",
+        headers: {
+          ...authorization(publish.token),
+          "content-length": String(coordinatedBody.length),
+        },
+        body: coordinatedBody,
+      },
+    );
+    assert.equal(resumed.status, 201);
+    const finalManifest = await (
+      await fetch(`${server.baseUrl}${ROOT}/manifest.json`, {
+        headers: authorization(read.token),
+      })
+    ).json();
+    assert.equal(finalManifest.playbackTimeMs, 102_000);
+    assert.equal(finalManifest.ended, true);
   } finally {
     await server.close();
     await relay.close();

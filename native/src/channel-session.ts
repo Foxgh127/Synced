@@ -3,6 +3,7 @@ import type { PluginListenerHandle } from "@capacitor/core";
 import QRCode from "qrcode";
 import {
   AdaptivePlaybackController,
+  type AdaptivePressure,
   type ScreenContentMode,
 } from "./adaptive-playback";
 import {
@@ -622,6 +623,7 @@ export async function openChannelSession(
   let embyAbrViewer: EmbyAbrSegmentClient | undefined;
   let embyFallbackMediaChannel: RTCDataChannel | undefined;
   let embySegmentFallbackActive = false;
+  let embySegmentFallbackRequested = false;
   let embySegmentFallbackTargetTime = 0;
   let embyLogin: EmbyAccount | undefined;
   let embyAccounts: EmbyAccount[] = [];
@@ -1409,6 +1411,11 @@ export async function openChannelSession(
   const danmakuSurface = stageDanmakuElement;
   const stageDanmaku = new DanmakuOverlay(danmakuSurface);
   let videoEnhancement: VideoEnhancementController | undefined;
+  let videoEnhancementAdaptivePressure:
+    | "healthy"
+    | "decoder-limited"
+    | "render-limited"
+    | "encoder-limited" = "healthy";
   if (
     desktop &&
     video &&
@@ -2335,7 +2342,25 @@ export async function openChannelSession(
     videoEnhancement.setPlaybackMode(
       remoteEmbyVisible ? "emby-viewer" : "off",
     );
+    videoEnhancement.setPressure(
+      remoteEmbyVisible
+        ? videoEnhancementAdaptivePressure
+        : "healthy",
+    );
     videoEnhancement.refresh();
+  }
+
+  function syncVideoEnhancementPressure(
+    pressure: AdaptivePressure,
+  ): void {
+    const next =
+      pressure === "decoder-limited" ||
+      pressure === "render-limited" ||
+      pressure === "encoder-limited"
+        ? pressure
+        : "healthy";
+    videoEnhancementAdaptivePressure = next;
+    videoEnhancement?.setPressure(next);
   }
 
   function sampleEmbeddedBars():
@@ -3490,6 +3515,16 @@ export async function openChannelSession(
       );
     }
     embyFrameSnapshot = frameSnapshot;
+    const decodedOrDroppedFrames = Math.max(
+      framesDecodedDelta,
+      droppedFrames,
+    );
+    syncVideoEnhancementPressure(
+      decodedOrDroppedFrames > 0 &&
+        droppedFrames / decodedOrDroppedFrames >= 0.06
+        ? "decoder-limited"
+        : "healthy",
+    );
     const recoveryAction = monitorViewerMediaLiveness("emby");
     if (recoveryAction === "replace") return;
     const abrDiagnostics = embyAbrViewer?.diagnostics;
@@ -3834,6 +3869,7 @@ export async function openChannelSession(
       currentRoundTripTime: stats.currentRoundTripTime,
       transportProgressAgeMs: Date.now() - viewerTransportProgressAt,
     });
+    syncVideoEnhancementPressure(decision.pressure);
     if (decision.changed) {
       sendViewerQualityPreference(false);
       const preference = currentSfuScreenPreference();
@@ -4138,6 +4174,7 @@ export async function openChannelSession(
         averageDecodeTime: stats.averageDecodeTime,
         frameRate: stats.framesPerSecond,
       });
+      syncVideoEnhancementPressure(adaptation.pressure);
       if (adaptation.changed) {
         sendViewerQualityPreference(false);
         const target = adaptation.requestedHeight
@@ -5095,19 +5132,20 @@ export async function openChannelSession(
     ) {
       return false;
     }
-    embySegmentFallbackActive =
+    if (embySegmentFallbackRequested) return true;
+    embySegmentFallbackRequested =
       player.enableDataChannelSegmentFallback(
         channel,
         embySegmentFallbackTargetTime ||
           Math.max(0, player.currentTime),
       );
-    if (embySegmentFallbackActive) {
+    if (embySegmentFallbackRequested) {
       setStatus(
-        "HTTPS 分片服务波动 · P2P 媒体应急链路已接管",
+        "HTTPS 分片服务波动 · 正在确认 P2P 媒体应急链路",
         "neutral",
       );
     }
-    return embySegmentFallbackActive;
+    return embySegmentFallbackRequested;
   }
 
   function attachSegmentRelayViewer(
@@ -5115,6 +5153,26 @@ export async function openChannelSession(
     isActive: () => boolean,
   ): void {
     let observedAbrMediaProgress = 0;
+    player.addEventListener("segmentfallbackack", (event) => {
+      if (!isActive() || embyViewer !== player) return;
+      const detail = (
+        event as CustomEvent<{
+          sessionId: string;
+          mediaVersion: number;
+          transportEpoch: number;
+        }>
+      ).detail;
+      embySegmentFallbackRequested = true;
+      embySegmentFallbackActive = true;
+      setStatus(
+        "HTTPS 分片服务波动 · P2P 媒体应急链路已接管",
+        "neutral",
+      );
+      reportPlaybackDiagnostic("emby-segment-fallback-acknowledged", {
+        mediaVersion: detail.mediaVersion,
+        transportEpoch: detail.transportEpoch,
+      });
+    });
     player.addEventListener("segmentrelay", (event) => {
       if (
         !isActive() ||
@@ -5172,11 +5230,12 @@ export async function openChannelSession(
           ) {
             return;
           }
-          if (embySegmentFallbackActive) {
+          if (embySegmentFallbackRequested) {
             player.releaseDataChannelSegmentFallback();
           }
           player.enableExternalSegmentTransport();
           embySegmentFallbackActive = false;
+          embySegmentFallbackRequested = false;
           abr.resumeHttps();
           resetViewerMediaLiveness();
           setStatus("HTTPS 独立 ABR 已稳定恢复", "ready");
@@ -5365,6 +5424,7 @@ export async function openChannelSession(
       !sfuAccess ||
       (broadcastCapabilities?.mode === "emby" &&
         (embySegmentFallbackActive ||
+          embySegmentFallbackRequested ||
           embyAbrViewer?.diagnostics.relayFallbackActive))
     ) {
       return false;
@@ -5787,6 +5847,7 @@ export async function openChannelSession(
       remoteStream = new MediaStream();
       embyFallbackMediaChannel = undefined;
       embySegmentFallbackActive = false;
+      embySegmentFallbackRequested = false;
       if (broadcastCapabilities?.mode !== "emby") {
         embyAbrViewer?.destroy();
         embyAbrViewer = undefined;
@@ -5828,6 +5889,7 @@ export async function openChannelSession(
                 if (embyFallbackMediaChannel === event.channel) {
                   embyFallbackMediaChannel = undefined;
                   embySegmentFallbackActive = false;
+                  embySegmentFallbackRequested = false;
                 }
               },
               { once: true },
@@ -6294,6 +6356,7 @@ export async function openChannelSession(
     embyViewer = undefined;
     embyFallbackMediaChannel = undefined;
     embySegmentFallbackActive = false;
+    embySegmentFallbackRequested = false;
     embySegmentFallbackTargetTime = 0;
     watcherPc?.close();
     watcherPc = undefined;
@@ -11799,6 +11862,7 @@ export async function openChannelSession(
         embyAbrViewer?.destroy();
         embyAbrViewer = undefined;
         embySegmentFallbackActive = false;
+        embySegmentFallbackRequested = false;
         embySegmentFallbackTargetTime = 0;
       }
       reportedSfuPublisherActive = undefined;

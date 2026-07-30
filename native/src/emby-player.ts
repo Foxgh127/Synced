@@ -634,6 +634,14 @@ export class EmbyMsePlayer extends EventTarget {
   private syncTimer?: number;
   private syncRampTimer?: number;
   private initRequestTimer?: number;
+  private segmentFallbackRetryTimer?: number;
+  private segmentFallbackRequest?: {
+    sessionId: string;
+    mediaVersion: number;
+    transportEpoch: number;
+    targetTime: number;
+    retryIndex: number;
+  };
   private mediaSourceOpenTimer?: number;
   private appendWatchdogTimer?: number;
   private mediaSourceGeneration = 0;
@@ -771,6 +779,7 @@ export class EmbyMsePlayer extends EventTarget {
 
   enableExternalSegmentTransport(): void {
     this.externalSegmentTransport = true;
+    this.clearSegmentFallbackRequest();
     this.detachChannel();
     this.assembler?.reset();
     this.assembler = undefined;
@@ -790,22 +799,64 @@ export class EmbyMsePlayer extends EventTarget {
     this.pendingCatchUpTarget = Math.max(0, finite(targetTime));
     this.syncHeld = true;
     this.video.pause();
-    return this.sendControl({
-      type: "segment-fallback-request",
+    this.segmentFallbackRequest = {
       sessionId: session.sessionId,
       mediaVersion: session.mediaVersion,
+      transportEpoch: session.transportEpoch ?? 0,
       targetTime: this.pendingCatchUpTarget,
-    });
+      retryIndex: 0,
+    };
+    return this.sendSegmentFallbackRequest();
   }
 
   releaseDataChannelSegmentFallback(): boolean {
     const session = this.session;
     if (!session || this.destroyed) return false;
+    this.clearSegmentFallbackRequest();
     return this.sendControl({
       type: "segment-fallback-release",
       sessionId: session.sessionId,
       mediaVersion: session.mediaVersion,
     });
+  }
+
+  private clearSegmentFallbackRequest(): void {
+    if (this.segmentFallbackRetryTimer !== undefined) {
+      window.clearTimeout(this.segmentFallbackRetryTimer);
+      this.segmentFallbackRetryTimer = undefined;
+    }
+    this.segmentFallbackRequest = undefined;
+  }
+
+  private sendSegmentFallbackRequest(): boolean {
+    const request = this.segmentFallbackRequest;
+    const session = this.session;
+    if (
+      !request ||
+      !session ||
+      this.destroyed ||
+      request.sessionId !== session.sessionId ||
+      request.mediaVersion !== session.mediaVersion
+    ) {
+      this.clearSegmentFallbackRequest();
+      return false;
+    }
+    const sent = this.sendControl({
+      type: "segment-fallback-request",
+      sessionId: request.sessionId,
+      mediaVersion: request.mediaVersion,
+      targetTime: request.targetTime,
+    });
+    const retryDelays = [500, 1_000, 2_000] as const;
+    if (request.retryIndex < retryDelays.length) {
+      const delay = retryDelays[request.retryIndex];
+      request.retryIndex += 1;
+      this.segmentFallbackRetryTimer = window.setTimeout(() => {
+        this.segmentFallbackRetryTimer = undefined;
+        this.sendSegmentFallbackRequest();
+      }, delay);
+    }
+    return sent;
   }
 
   private installFragmentAssembler(session: EmbyPlayerSession): void {
@@ -1018,6 +1069,10 @@ export class EmbyMsePlayer extends EventTarget {
       this.session!.mediaVersion === normalizedSession.mediaVersion &&
       (this.session!.transportEpoch ?? 0) !==
         normalizedSession.transportEpoch;
+    const fallbackIdentityChanged =
+      Boolean(this.session) &&
+      (this.session!.sessionId !== normalizedSession.sessionId ||
+        this.session!.mediaVersion !== normalizedSession.mediaVersion);
     const changed =
       !this.session ||
       this.session.sessionId !== normalizedSession.sessionId ||
@@ -1029,6 +1084,7 @@ export class EmbyMsePlayer extends EventTarget {
       this.session.plan.startTimeTicks !==
         normalizedSession.plan.startTimeTicks;
     this.session = normalizedSession;
+    if (fallbackIdentityChanged) this.clearSegmentFallbackRequest();
     this.lastStateVersion = 0;
     this.lastCatchUpRequestAt = 0;
     this.catchUpCooldownMs = EMBY_CATCH_UP_MIN_INTERVAL_MS;
@@ -1748,6 +1804,32 @@ export class EmbyMsePlayer extends EventTarget {
       return;
     }
     const message = parsed as EmbyControlMessage;
+    if (message.type === "segment-fallback-ack") {
+      const request = this.segmentFallbackRequest;
+      const session = this.session;
+      if (
+        !request ||
+        !session ||
+        message.sessionId !== request.sessionId ||
+        message.mediaVersion !== request.mediaVersion ||
+        !Number.isSafeInteger(message.transportEpoch) ||
+        message.transportEpoch <= request.transportEpoch ||
+        message.transportEpoch > 1_000_000_000
+      ) {
+        return;
+      }
+      this.clearSegmentFallbackRequest();
+      this.dispatchEvent(
+        new CustomEvent("segmentfallbackack", {
+          detail: {
+            sessionId: message.sessionId,
+            mediaVersion: message.mediaVersion,
+            transportEpoch: message.transportEpoch,
+          },
+        }),
+      );
+      return;
+    }
     if (message.type === "session") {
       const plan = message.plan;
       const planFrameRate = Number(plan?.frameRate ?? 30);
@@ -2901,6 +2983,7 @@ export class EmbyMsePlayer extends EventTarget {
   }
 
   private detachChannel(): void {
+    this.clearSegmentFallbackRequest();
     const channel = this.channel as
       | (RTCDataChannel & {
           __syncedEmbyMessage?: (event: MessageEvent) => void;
@@ -3056,6 +3139,7 @@ export class EmbyMsePlayer extends EventTarget {
   destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;
+    this.clearSegmentFallbackRequest();
     this.detachChannel();
     this.detachControlChannel();
     if (this.bufferTimer !== undefined) window.clearInterval(this.bufferTimer);

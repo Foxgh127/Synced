@@ -290,6 +290,12 @@ export type EmbyControlMessage =
       targetTime: number;
     }
   | {
+      type: "segment-fallback-ack";
+      sessionId: string;
+      mediaVersion: number;
+      transportEpoch: number;
+    }
+  | {
       type: "segment-fallback-release";
       sessionId: string;
       mediaVersion: number;

@@ -31,19 +31,25 @@ WebRTC P2P，严格 NAT 下再使用腾讯云 TURN。Emby 则生成多档 GOP �
   首次协商或启动失败时会自动改用 MPEG-TS 兼容档并关闭视频流拷贝重试；需要兼容
   或限码时只让 Emby 服务器统一转码一次。
 - Emby 媒体由本机 FFmpeg 生成共享时间轴、约 2 秒 GOP 对齐的 CMAF 分片。默认启动
-  1080p8/720p4，original 与 480p18 根据观看端实际需求启停；所有辅助 producer 限速，
+  1080p8/720p4，original 与 480p18 根据观看端实际需求启停；空闲档位会真正停止，
+  再次需要时从当前锚点以新 init epoch 和单调全局 segment 序号重建。所有辅助 producer 限速，
   共享上传最多使用测速后剩余上行的 65%。放映端磁盘 spool 按随机 `sessionId` 隔离，
   同档严格串行上传且清单只公开连续分片前缀；独立退避 actor 会在中继恢复后自动补传。
+  清单使用 publisher/eviction revision 与前缀 tombstone 协调服务端 LRU；结构化 409
+  会触发裁剪同步或本地补传，活跃会话的当前/未来分片不会在磁盘压力下被打洞。
   观看端以 Urgent/Warm/Prefetch 三队列独立 ABR 拉取，清单使用 ETag/304，Range/正文
   空闲超时会真正中止并重试，时间洞和 404 会刷新清单并从关键帧恢复。一级内存只保存即将追加的片段，
   二级磁盘缓存默认按可用空间 4%、最高 5 GiB，三级 SourceBuffer 只保留播放点附近；
   seek 和画质切换使用 generation/AbortController，且只从真实关键帧开始。正常情况下
   LiveKit/P2P 只承载控制面；HTTPS 连续失败三次时，仅故障观看端临时接收主播最近
-  30–60 秒的部分可靠 P2P 媒体缓存，三次恢复探测成功后热切回原 HTTPS ABR/MSE。
+  30–60 秒的部分可靠 P2P 媒体缓存；请求早于 `session-ready` 时由主播暂存，观看端在
+  收到带 transport epoch 的 ACK 前按 500 ms/1 s/2 s 有界重发，三次恢复探测成功后
+  热切回原 HTTPS ABR/MSE。
 - Windows 观看端可启用实际的 WebGL2 GPU 空间增强（视频纹理缩放与保守锐化，
   无 GPU→CPU→GPU 回读）。它只用于远端 Emby 360p–1080p 放大到接近 2K/4K，
   字幕和弹幕在增强后合成；SR p95 超过 14 ms、解码丢帧、资源压力、上下文丢失或
-  同机屏幕共享时自动关闭并冷却。能力握手只声明真实可用后端；仓库未捆绑需要
+  同机屏幕共享时自动关闭并冷却，频道自适应判定的 decoder/encoder/render 压力也会
+  直接关闭增强并统一让出资源。能力握手只声明真实可用后端；仓库未捆绑需要
   NVIDIA 授权 SDK/运行时的 RTX Video 原生后端，也不会把普通锐化伪装成 RTX/DLSS。
 - 成员入房即上报 MSE、H.264、HEVC 和 AAC 解码能力。默认统一使用兼容性最高的
   H.264/AAC；“允许 HEVC 直传”会显示本机与当前观众的检测结果，只有全员支持才可

@@ -2432,6 +2432,15 @@ function appendH264EncoderArguments(
   );
 }
 
+class SegmentRelayHttpError extends Error {
+  constructor(status, details, message) {
+    super(message || `HTTPS 分片上传失败（${status}）`);
+    this.name = "SegmentRelayHttpError";
+    this.status = status;
+    this.details = details;
+  }
+}
+
 class CmafRelayCoordinator {
   constructor(config, options = {}) {
     this.config = config;
@@ -2466,6 +2475,10 @@ class CmafRelayCoordinator {
     this.manifestUploading = false;
     this.manifestRetryTimer = undefined;
     this.manifestRetryAttempts = 0;
+    this.manifestRevision = 0;
+    this.acknowledgedEvictionRevision = 0;
+    this.serverTombstones = new Map();
+    this.serverPressureUntil = 0;
     this.manifestEnded = false;
     this.manifestSubtitle = undefined;
     this.playbackAnchorTimeMs = undefined;
@@ -2489,6 +2502,44 @@ class CmafRelayCoordinator {
 
   registerProducer(renditionId, controls = {}) {
     const state = this.ensureRendition(renditionId);
+    state.producerEpoch = Math.min(
+      0xffffffff,
+      Math.max(0, Number(state.producerEpoch) || 0) + 1,
+    );
+    state.sourceSequenceOffset = Math.max(
+      0,
+      Number(state.nextGlobalSequence) - 1,
+    );
+    state.lastSourceSequence = 0;
+    state.previousRawTimeMs = undefined;
+    state.previousTimelineTimeMs = undefined;
+    state.timestampOffsetMs = 0;
+    state.recentCadenceMs = [];
+    state.initUploaded = false;
+    state.initPath = "";
+    state.initData = undefined;
+    state.initRecoveryPending = false;
+    state.ended = false;
+    state.dormant = false;
+    state.firstSegmentSequence = state.nextGlobalSequence;
+    state.contiguousUploadedSequence = undefined;
+    state.segments.clear();
+    state.uploadedDescriptors.clear();
+    state.descriptors.clear();
+    for (const [key, record] of this.records) {
+      if (
+        record.renditionId !== state.id ||
+        Number(record.epoch) >= state.producerEpoch
+      ) {
+        continue;
+      }
+      record.retired = true;
+      record.failed = false;
+      this.failedRecords.delete(record);
+      this.records.delete(key);
+      this.diskBytes = Math.max(0, this.diskBytes - record.bytes);
+      void fsp.unlink(record.filePath).catch(() => undefined);
+    }
     state.pause = typeof controls.pause === "function" ? controls.pause : () => {};
     state.resume =
       typeof controls.resume === "function" ? controls.resume : () => {};
@@ -2501,6 +2552,15 @@ class CmafRelayCoordinator {
     if (!state) return;
     state.pause = () => {};
     state.resume = () => {};
+  }
+
+  deactivateProducer(renditionId) {
+    const state = this.renditions.get(renditionId);
+    if (!state) return;
+    state.dormant = true;
+    state.initUploaded = false;
+    state.ended = false;
+    this.scheduleManifest();
   }
 
   setRenditionDemandActive(renditionId, active) {
@@ -2582,10 +2642,13 @@ class CmafRelayCoordinator {
     // small volume, urgent playback wins over a nominal two-minute prefetch
     // floor; larger volumes naturally expand toward the two-hour ceiling.
     const forwardBudgetedMs = totalBudgetedMs - 60_000;
-    return Math.min(
+    const budgetedWindowMs = Math.min(
       2 * 60 * 60_000,
       Math.max(15_000, forwardBudgetedMs),
     );
+    return Date.now() < this.serverPressureUntil
+      ? Math.min(120_000, budgetedWindowMs)
+      : budgetedWindowMs;
   }
 
   ensureRendition(renditionId) {
@@ -2599,7 +2662,13 @@ class CmafRelayCoordinator {
         plan: undefined,
         mimeType: "",
         switchGroup: "",
+        producerEpoch: 0,
+        sourceSequenceOffset: 0,
+        lastSourceSequence: 0,
+        nextGlobalSequence: 1,
         initPath: "",
+        initData: undefined,
+        initRecoveryPending: false,
         initUploaded: false,
         segments: new Map(),
         uploadedDescriptors: new Map(),
@@ -2611,6 +2680,7 @@ class CmafRelayCoordinator {
         spooling: false,
         uploadQueue: [],
         uploadHead: 0,
+        recoveryQueue: [],
         uploadActive: false,
         recentCadenceMs: [],
         previousRawTimeMs: undefined,
@@ -2623,6 +2693,7 @@ class CmafRelayCoordinator {
         budgetPaused: this.uploadBudgetBps === 0,
         producerPaused: false,
         ended: false,
+        dormant: false,
       };
       this.renditions.set(id, state);
     }
@@ -2632,6 +2703,13 @@ class CmafRelayCoordinator {
   publishInit(renditionId, plan, mimeType, data, title) {
     if (this.closed) return;
     const state = this.ensureRendition(renditionId);
+    if (state.producerEpoch < 1) {
+      state.producerEpoch = 1;
+      state.sourceSequenceOffset = Math.max(
+        0,
+        Number(state.nextGlobalSequence) - 1,
+      );
+    }
     state.plan = plan;
     state.mimeType = cleanText(mimeType, 180);
     state.switchGroup = `${state.mimeType
@@ -2643,10 +2721,17 @@ class CmafRelayCoordinator {
           : "source-gop"
       }`;
     state.title = cleanText(title, 300) || "Emby 影片";
-    state.initPath = this.relativeMediaPath(state.id, "init.mp4");
+    state.initData = Buffer.isBuffer(data)
+      ? Buffer.from(data)
+      : Buffer.from(data);
+    state.initPath = this.relativeMediaPath(
+      state.id,
+      `epochs/${state.producerEpoch}/init.mp4`,
+    );
     this.enqueueSpool(state, {
       kind: "init",
       sequence: 0,
+      epoch: state.producerEpoch,
       data,
       relativePath: state.initPath,
       contentType: "video/mp4",
@@ -2658,6 +2743,32 @@ class CmafRelayCoordinator {
     if (this.closed) return;
     const state = this.ensureRendition(renditionId);
     if (!state.plan || !state.mimeType) return;
+    const sourceSequence = Number(fragment.sequence);
+    if (
+      !Number.isSafeInteger(sourceSequence) ||
+      sourceSequence < 1 ||
+      sourceSequence <= state.lastSourceSequence
+    ) {
+      return;
+    }
+    const sequence = state.sourceSequenceOffset + sourceSequence;
+    if (
+      !Number.isSafeInteger(sequence) ||
+      sequence < 1 ||
+      sequence > 0xffffffff
+    ) {
+      this.sendEvent({
+        type: "warning",
+        code: "segment-sequence-exhausted",
+        message: `${state.id} 档位的全局分片序号已耗尽`,
+      });
+      return;
+    }
+    state.lastSourceSequence = sourceSequence;
+    state.nextGlobalSequence = Math.max(
+      state.nextGlobalSequence,
+      sequence + 1,
+    );
     const rawTimeMs = Number(fragment.mediaTimeMs);
     let timelineTimeMs;
     if (
@@ -2683,9 +2794,7 @@ class CmafRelayCoordinator {
         timelineTimeMs = state.previousTimelineTimeMs + cadence;
         state.timestampOffsetMs = timelineTimeMs - rawTimeMs;
       }
-      const previous = state.descriptors.get(
-        Number(fragment.sequence) - 1,
-      );
+      const previous = state.descriptors.get(sequence - 1);
       if (previous) {
         previous.durationMs = Math.max(
           1,
@@ -2696,7 +2805,6 @@ class CmafRelayCoordinator {
     }
     state.previousRawTimeMs = rawTimeMs;
     state.previousTimelineTimeMs = timelineTimeMs;
-    const sequence = Number(fragment.sequence);
     state.firstSegmentSequence =
       state.firstSegmentSequence === undefined
         ? sequence
@@ -2721,6 +2829,7 @@ class CmafRelayCoordinator {
     this.enqueueSpool(state, {
       kind: "segment",
       sequence,
+      epoch: state.producerEpoch,
       data: fragment.data,
       relativePath,
       contentType: "video/iso.segment",
@@ -2862,11 +2971,26 @@ class CmafRelayCoordinator {
       ) {
         const item = state.pending[state.pendingHead++];
         const fileName =
-          item.kind === "init" ? "init.mp4" : `${item.sequence}.m4s`;
-        const directory = path.join(this.rootDir, state.id);
+          item.kind === "init"
+            ? `init-${item.epoch}.mp4`
+            : `${item.sequence}.m4s`;
+        const directory =
+          item.kind === "init"
+            ? path.join(
+                this.rootDir,
+                state.id,
+                "epochs",
+                String(item.epoch),
+              )
+            : path.join(this.rootDir, state.id);
         const filePath = path.join(directory, fileName);
         const temporaryPath = `${filePath}.${randomUUID()}.tmp`;
         try {
+          if (
+            Number(item.epoch) !== Number(state.producerEpoch)
+          ) {
+            continue;
+          }
           await fsp.mkdir(directory, { recursive: true });
           await fsp.writeFile(temporaryPath, item.data, { mode: 0o600 });
           await fsp.rename(temporaryPath, filePath).catch(async (error) => {
@@ -2876,7 +3000,10 @@ class CmafRelayCoordinator {
             await fsp.unlink(filePath).catch(() => undefined);
             await fsp.rename(temporaryPath, filePath);
           });
-          const key = `${state.id}:${item.kind}:${item.sequence}`;
+          const key =
+            item.kind === "init"
+              ? `${state.id}:init:${item.epoch}`
+              : `${state.id}:${item.kind}:${item.sequence}`;
           const previous = this.records.get(key);
           if (previous) this.diskBytes -= previous.bytes;
           const record = {
@@ -2896,8 +3023,20 @@ class CmafRelayCoordinator {
           this.records.set(key, record);
           this.diskBytes += record.bytes;
           state.uploadQueue.push(record);
+          if (
+            item.kind === "init" &&
+            Number(item.epoch) === Number(state.producerEpoch)
+          ) {
+            state.initRecoveryPending = false;
+          }
           this.pumpUploads();
         } catch (error) {
+          if (
+            item.kind === "init" &&
+            Number(item.epoch) === Number(state.producerEpoch)
+          ) {
+            state.initRecoveryPending = false;
+          }
           await fsp.unlink(temporaryPath).catch(() => undefined);
           this.sendEvent({
             type: "warning",
@@ -2934,8 +3073,29 @@ class CmafRelayCoordinator {
       const now = Date.now();
       let selectedState;
       let record;
+      let selectedFromRecovery = false;
       for (const state of this.renditions.values()) {
         if (state.uploadActive) continue;
+        while (
+          state.recoveryQueue.length &&
+          (state.recoveryQueue[0].uploaded ||
+            state.recoveryQueue[0].retired)
+        ) {
+          const completed = state.recoveryQueue.shift();
+          if (completed) completed.recoveryQueued = false;
+        }
+        const recovery = state.recoveryQueue[0];
+        if (recovery) {
+          if (recovery.failed && recovery.nextRetryAt > now) continue;
+          if (recovery.failed) {
+            recovery.failed = false;
+            this.failedRecords.delete(recovery);
+          }
+          selectedState = state;
+          record = recovery;
+          selectedFromRecovery = true;
+          break;
+        }
         while (state.uploadHead < state.uploadQueue.length) {
           const candidate = state.uploadQueue[state.uploadHead];
           if (candidate.uploaded || candidate.retired) {
@@ -2964,7 +3124,14 @@ class CmafRelayCoordinator {
         .then(() => {
           record.retryAttempts = 0;
           record.nextRetryAt = 0;
-          selectedState.uploadHead += 1;
+          if (selectedFromRecovery) {
+            if (selectedState.recoveryQueue[0] === record) {
+              selectedState.recoveryQueue.shift();
+            }
+            record.recoveryQueued = false;
+          } else {
+            selectedState.uploadHead += 1;
+          }
           if (recoveryProbe) this.retryFailedRecords(true);
         })
         .catch((error) => {
@@ -3145,8 +3312,13 @@ class CmafRelayCoordinator {
     const state = this.renditions.get(record.renditionId);
     if (!state) return;
     if (record.kind === "init") {
-      state.initUploaded = true;
-    } else if (record.descriptor) {
+      if (record.epoch === state.producerEpoch) {
+        state.initUploaded = true;
+      }
+    } else if (
+      record.descriptor &&
+      record.epoch === state.producerEpoch
+    ) {
       state.uploadedDescriptors.set(record.sequence, record.descriptor);
       this.publishContiguousSegments(state);
     }
@@ -3240,13 +3412,61 @@ class CmafRelayCoordinator {
           signal: controller.signal,
         });
         if (!response.ok) {
-          throw new Error(`HTTPS 分片上传失败（${response.status}）`);
+          let details;
+          try {
+            const contentType = String(
+              response.headers.get("content-type") || "",
+            );
+            if (contentType.includes("application/json")) {
+              details = await response.json();
+            } else {
+              await response.body?.cancel().catch(() => undefined);
+            }
+          } catch {
+            details = undefined;
+          }
+          throw new SegmentRelayHttpError(
+            response.status,
+            details,
+          );
         }
+        if (
+          response.headers.get("x-synced-storage-pressure") === "true"
+        ) {
+          const wasPressured = Date.now() < this.serverPressureUntil;
+          this.serverPressureUntil = Date.now() + 60_000;
+          if (!wasPressured) {
+            this.sendEvent({
+              type: "warning",
+              code: "segment-relay-storage-pressure",
+              message:
+                "HTTPS 分片缓存空间紧张，已把发布前向窗口收敛到 120 秒",
+            });
+          }
+          this.updatePressure();
+        }
+        const result = {
+          etag: response.headers.get("etag") || undefined,
+          manifestRevision: Number(
+            response.headers.get("x-synced-manifest-revision"),
+          ),
+          evictionRevision: Number(
+            response.headers.get("x-synced-eviction-revision"),
+          ),
+        };
         await response.body?.cancel().catch(() => undefined);
-        return;
+        return result;
       } catch (error) {
         lastError = error;
         stream.destroy();
+        if (
+          error instanceof SegmentRelayHttpError &&
+          error.status >= 400 &&
+          error.status < 500 &&
+          ![408, 425, 429].includes(error.status)
+        ) {
+          break;
+        }
         if (attempt < RELAY_UPLOAD_MAX_ATTEMPTS) {
           await new Promise((resolve) =>
             setTimeout(resolve, 250 * 2 ** (attempt - 1)),
@@ -3258,6 +3478,241 @@ class CmafRelayCoordinator {
       }
     }
     throw lastError || new Error("HTTPS 分片上传失败");
+  }
+
+  retireLocalPrefix(state, throughSequence) {
+    const through = Number(throughSequence);
+    if (!Number.isSafeInteger(through) || through < 1) return false;
+    let changed = false;
+    for (const collection of [
+      state.descriptors,
+      state.uploadedDescriptors,
+      state.segments,
+    ]) {
+      for (const sequence of [...collection.keys()]) {
+        if (sequence > through) continue;
+        collection.delete(sequence);
+        changed = true;
+      }
+    }
+    state.firstSegmentSequence = Math.max(
+      Number(state.firstSegmentSequence) || 1,
+      through + 1,
+    );
+    if (
+      state.contiguousUploadedSequence !== undefined &&
+      state.contiguousUploadedSequence <= through
+    ) {
+      state.contiguousUploadedSequence = undefined;
+    }
+    for (const [key, record] of this.records) {
+      if (
+        record.renditionId !== state.id ||
+        record.kind !== "segment" ||
+        Number(record.sequence) > through
+      ) {
+        continue;
+      }
+      record.retired = true;
+      record.failed = false;
+      record.recoveryQueued = false;
+      this.failedRecords.delete(record);
+      this.records.delete(key);
+      this.diskBytes = Math.max(0, this.diskBytes - record.bytes);
+      void fsp.unlink(record.filePath).catch(() => undefined);
+      changed = true;
+    }
+    return changed;
+  }
+
+  queueMissingRecord(state, record) {
+    if (
+      !record ||
+      record.retired ||
+      record.recoveryQueued ||
+      !fs.existsSync(record.filePath)
+    ) {
+      return false;
+    }
+    record.uploaded = false;
+    record.failed = false;
+    record.retryAttempts = 0;
+    record.nextRetryAt = 0;
+    record.recoveryQueued = true;
+    this.failedRecords.delete(record);
+    state.recoveryQueue.push(record);
+    state.recoveryQueue.sort(
+      (left, right) =>
+        Number(left.sequence) - Number(right.sequence),
+    );
+    return true;
+  }
+
+  reopenContiguousPrefixAt(state, missingSequence) {
+    const sequence = Number(missingSequence);
+    if (!Number.isSafeInteger(sequence) || sequence < 1) return;
+    for (const [candidate, descriptor] of [...state.segments]) {
+      if (candidate < sequence) continue;
+      state.segments.delete(candidate);
+      if (candidate !== sequence) {
+        state.uploadedDescriptors.set(candidate, descriptor);
+      }
+    }
+    state.uploadedDescriptors.delete(sequence);
+    state.contiguousUploadedSequence =
+      sequence > (Number(state.firstSegmentSequence) || sequence)
+        ? sequence - 1
+        : undefined;
+  }
+
+  reconcileManifestConflict(error) {
+    if (
+      !(error instanceof SegmentRelayHttpError) ||
+      error.status !== 409 ||
+      !error.details ||
+      typeof error.details !== "object"
+    ) {
+      return false;
+    }
+    const details = error.details;
+    const evictionRevision = Number(details.evictionRevision);
+    const revision = Number(details.revision);
+    if (Number.isSafeInteger(revision) && revision >= 0) {
+      this.manifestRevision = Math.max(this.manifestRevision, revision);
+    }
+    let changed = false;
+    const previousAcknowledgedEvictionRevision =
+      this.acknowledgedEvictionRevision;
+    if (
+      Number.isSafeInteger(evictionRevision) &&
+      evictionRevision >= this.acknowledgedEvictionRevision
+    ) {
+      this.acknowledgedEvictionRevision = evictionRevision;
+      changed =
+        evictionRevision > previousAcknowledgedEvictionRevision ||
+        changed;
+      for (const value of Array.isArray(details.tombstones)
+        ? details.tombstones
+        : []) {
+        const renditionId = cleanText(
+          value?.renditionId,
+          32,
+        ).toLowerCase();
+        const throughSequence = Number(value?.throughSequence);
+        if (
+          !/^[a-z0-9][a-z0-9-]{0,31}$/.test(renditionId) ||
+          !Number.isSafeInteger(throughSequence) ||
+          throughSequence < 1
+        ) {
+          continue;
+        }
+        const prior = this.serverTombstones.get(renditionId);
+        const next = {
+          renditionId,
+          throughSequence: Math.max(
+            Number(prior?.throughSequence) || 0,
+            throughSequence,
+          ),
+          evictionRevision: Math.max(
+            Number(value?.evictionRevision) || evictionRevision,
+            Number(prior?.evictionRevision) || 0,
+          ),
+        };
+        this.serverTombstones.set(renditionId, next);
+        changed =
+          !prior ||
+          next.throughSequence >
+            Number(prior.throughSequence) ||
+          next.evictionRevision >
+            Number(prior.evictionRevision) ||
+          changed;
+        const state = this.renditions.get(renditionId);
+        if (state) {
+          changed =
+            this.retireLocalPrefix(state, next.throughSequence) ||
+            changed;
+        }
+      }
+    }
+    const missing = (Array.isArray(details.missing)
+      ? details.missing
+      : []
+    ).sort(
+      (left, right) =>
+        Number(left?.sequence || 0) - Number(right?.sequence || 0),
+    );
+    for (const item of missing) {
+      if (item.kind === "subtitle") {
+        if (this.manifestSubtitle) {
+          this.manifestSubtitle = undefined;
+          changed = true;
+        }
+        continue;
+      }
+      const state = this.renditions.get(
+        cleanText(item?.renditionId, 32).toLowerCase(),
+      );
+      if (!state) continue;
+      if (item.kind === "init") {
+        const epoch = Number(item.epoch || state.producerEpoch);
+        const record = this.records.get(`${state.id}:init:${epoch}`);
+        if (this.queueMissingRecord(state, record)) {
+          state.initUploaded = false;
+          changed = true;
+        } else if (
+          epoch === state.producerEpoch &&
+          Buffer.isBuffer(state.initData) &&
+          state.initData.length > 0 &&
+          state.initPath &&
+          !state.initRecoveryPending
+        ) {
+          state.initUploaded = false;
+          state.initRecoveryPending = true;
+          this.enqueueSpool(state, {
+            kind: "init",
+            sequence: 0,
+            epoch,
+            data: Buffer.from(state.initData),
+            relativePath: state.initPath,
+            contentType: "video/mp4",
+            headers: {},
+          });
+          changed = true;
+        }
+        continue;
+      }
+      if (item.kind !== "segment") continue;
+      const sequence = Number(item.sequence);
+      if (!Number.isSafeInteger(sequence) || sequence < 1) continue;
+      const record = this.records.get(
+        `${state.id}:segment:${sequence}`,
+      );
+      if (record && fs.existsSync(record.filePath)) {
+        this.reopenContiguousPrefixAt(state, sequence);
+        changed = this.queueMissingRecord(state, record) || changed;
+      } else {
+        // If the local spool has already retired the missing historical
+        // object, advance the advertised prefix. This sacrifices only the
+        // unavailable rewind tail and guarantees that anchor/ended updates
+        // cannot remain wedged behind a permanent 409.
+        changed = this.retireLocalPrefix(state, sequence) || changed;
+      }
+    }
+    if (!changed && details.code === "manifest-revision-conflict") {
+      changed = true;
+    }
+    if (!changed) return false;
+    this.serverPressureUntil = Date.now() + 60_000;
+    this.sendEvent({
+      type: "warning",
+      code: "segment-manifest-reconciled",
+      message:
+        "已与 HTTPS 中继的淘汰版本重新同步，后续播放锚点将继续发布",
+      evictionRevision: this.acknowledgedEvictionRevision,
+    });
+    this.pumpUploads();
+    this.updatePressure();
+    return true;
   }
 
   scheduleManifest() {
@@ -3314,10 +3769,15 @@ class CmafRelayCoordinator {
     while (this.manifestDirty && !this.closed) {
       this.manifestDirty = false;
       const ready = [...this.renditions.values()].filter(
-        (state) => state.initUploaded && state.plan,
+        (state) => state.initUploaded && state.plan && !state.dormant,
       );
       if (!ready.length) continue;
       const primary = ready[0];
+      const revision = Math.min(
+        Number.MAX_SAFE_INTEGER,
+        this.manifestRevision + 1,
+      );
+      this.manifestRevision = revision;
       const anchorTimeMs =
         this.playbackAnchorTimeMs ??
         Number(primary.plan.startTimeTicks || 0) / 10_000;
@@ -3335,6 +3795,14 @@ class CmafRelayCoordinator {
         sessionId: this.config.sessionId,
         assetId: this.config.assetId,
         mediaVersion: this.config.mediaVersion,
+        revision,
+        evictionRevision: this.acknowledgedEvictionRevision,
+        acknowledgedEvictionRevision:
+          this.acknowledgedEvictionRevision,
+        tombstones: [...this.serverTombstones.values()].sort(
+          (left, right) =>
+            left.renditionId.localeCompare(right.renditionId),
+        ),
         title: primary.title || "Emby 影片",
         startTimeTicks: Number(primary.plan.startTimeTicks) || 0,
         runtimeTicks: Number(primary.plan.runtimeTicks) || undefined,
@@ -3345,6 +3813,7 @@ class CmafRelayCoordinator {
         renditions: ready
           .map((state) => ({
             id: state.id,
+            epoch: state.producerEpoch,
             label: cleanText(state.plan.quality?.label || state.id, 80),
             width: Number(state.plan.width) || 1,
             height: Number(state.plan.height) || 1,
@@ -3358,6 +3827,7 @@ class CmafRelayCoordinator {
               !state.spooling &&
               state.pendingHead >= state.pending.length &&
               !state.uploadActive &&
+              state.recoveryQueue.length === 0 &&
               state.uploadHead >= state.uploadQueue.length,
             finalSequence:
               state.contiguousUploadedSequence === undefined
@@ -3410,7 +3880,7 @@ class CmafRelayCoordinator {
       const filePath = path.join(this.rootDir, "manifest.json");
       await fsp.writeFile(filePath, body, { mode: 0o600 });
       try {
-        await this.uploadFile(
+        const result = await this.uploadFile(
           new URL(this.manifestPath(), this.config.baseUrl),
           filePath,
           body.length,
@@ -3421,8 +3891,15 @@ class CmafRelayCoordinator {
               .digest("hex"),
           },
         );
+        if (
+          Number.isSafeInteger(result?.evictionRevision) &&
+          result.evictionRevision > this.acknowledgedEvictionRevision
+        ) {
+          this.manifestDirty = true;
+        }
       } catch (error) {
         this.manifestDirty = true;
+        if (this.reconcileManifestConflict(error)) continue;
         throw error;
       }
     }
@@ -3490,6 +3967,7 @@ class CmafRelayCoordinator {
         (state) =>
           !state.spooling &&
           state.pendingHead >= state.pending.length &&
+          state.recoveryQueue.length === 0 &&
           state.uploadHead >= state.uploadQueue.length,
       )
     );
@@ -3578,7 +4056,7 @@ class CmafRelayCoordinator {
 
 class EmbyService {
   constructor(options = {}) {
-    this.version = cleanText(options.version || "2.9.1", 32);
+    this.version = cleanText(options.version || "2.9.2", 32);
     this.deviceId = cleanText(options.deviceId || randomUUID(), 128);
     this.ffmpegPath = resolveFfmpegPath(options);
     this.spawnProcess =
@@ -3595,6 +4073,11 @@ class EmbyService {
     this.ownsRelayCoordinator = false;
     this.auxiliary = options.auxiliary === true;
     this.auxiliaryServices = new Map();
+    this.auxiliaryStopPromises = new Map();
+    this.auxiliaryServiceFactory =
+      typeof options.auxiliaryServiceFactory === "function"
+        ? options.auxiliaryServiceFactory
+        : (serviceOptions) => new EmbyService(serviceOptions);
     this.auxiliaryIdleTimers = new Map();
     this.auxiliaryDemand = new Set(
       CMAF_AUXILIARY_RENDITIONS.filter(
@@ -5006,14 +5489,21 @@ class EmbyService {
       }
       const timer = setTimeout(() => {
         this.auxiliaryIdleTimers.delete(rendition.id);
+        const service = this.auxiliaryServices.get(rendition.id);
         if (
           this.auxiliaryDemand.has(rendition.id) ||
-          !this.auxiliaryServices.has(rendition.id) ||
+          !service ||
           this.relayCoordinator !== coordinator
         ) {
           return;
         }
         coordinator.setRenditionDemandActive(rendition.id, false);
+        coordinator.deactivateProducer(rendition.id);
+        void this.stopAuxiliaryRendition(
+          rendition.id,
+          service,
+          "rendition-idle",
+        );
       }, this.auxiliaryIdleMs);
       timer.unref?.();
       this.auxiliaryIdleTimers.set(rendition.id, timer);
@@ -5032,6 +5522,27 @@ class EmbyService {
     };
   }
 
+  async stopAuxiliaryRendition(renditionId, service, reason) {
+    if (this.auxiliaryServices.get(renditionId) === service) {
+      this.auxiliaryServices.delete(renditionId);
+    }
+    const existing = this.auxiliaryStopPromises.get(renditionId);
+    if (existing) {
+      await existing;
+      return;
+    }
+    const stopping = service
+      .stopStream(reason, { preserveGeneration: true })
+      .catch(() => undefined)
+      .finally(() => {
+        if (this.auxiliaryStopPromises.get(renditionId) === stopping) {
+          this.auxiliaryStopPromises.delete(renditionId);
+        }
+      });
+    this.auxiliaryStopPromises.set(renditionId, stopping);
+    await stopping;
+  }
+
   async startAuxiliaryRenditions(input, requestedRenditions) {
     const coordinator = this.relayCoordinator;
     if (!coordinator || this.auxiliary || this.pipeline?.stopping) return;
@@ -5043,18 +5554,50 @@ class EmbyService {
       (rendition) => desired.has(rendition.id),
     );
     for (const specification of specifications) {
+      const pendingStop = this.auxiliaryStopPromises.get(
+        specification.id,
+      );
+      if (pendingStop) await pendingStop;
       if (!this.pipeline || this.pipeline.stopping || this.relayCoordinator !== coordinator) {
         return;
       }
+      if (!this.auxiliaryDemand.has(specification.id)) continue;
       if (this.auxiliaryServices.has(specification.id)) {
         coordinator.setRenditionDemandActive(specification.id, true);
         continue;
       }
-      const service = new EmbyService({
+      const service = this.auxiliaryServiceFactory({
         ...this.childServiceOptions,
         relayCoordinator: coordinator,
         auxiliary: true,
         sendEvent: (event) => {
+          if (
+            event.type === "stopped" &&
+            this.auxiliaryServices.get(specification.id) === service
+          ) {
+            this.auxiliaryServices.delete(specification.id);
+            coordinator.deactivateProducer(specification.id);
+            if (
+              this.auxiliaryDemand.has(specification.id) &&
+              this.auxiliarySourceInput &&
+              this.pipeline &&
+              !this.pipeline.stopping &&
+              this.relayCoordinator === coordinator
+            ) {
+              const timer = setTimeout(() => {
+                if (
+                  this.auxiliaryDemand.has(specification.id) &&
+                  this.auxiliarySourceInput
+                ) {
+                  void this.startAuxiliaryRenditions(
+                    this.auxiliarySourceInput,
+                    new Set([specification.id]),
+                  );
+                }
+              }, 500);
+              timer.unref?.();
+            }
+          }
           if (
             event.type === "init" ||
             event.type === "fragment" ||
@@ -5076,7 +5619,7 @@ class EmbyService {
         coordinator.playbackAnchorTimeMs,
       )
         ? Math.max(
-            Number(input.startTimeTicks) || 0,
+            0,
             Math.round(coordinator.playbackAnchorTimeMs * 10_000),
           )
         : Number(input.startTimeTicks) || 0;
@@ -5097,6 +5640,7 @@ class EmbyService {
           if (this.auxiliaryServices.get(specification.id) === service) {
             this.auxiliaryServices.delete(specification.id);
           }
+          coordinator.deactivateProducer(specification.id);
           this.sendEvent({
             type: "warning",
             pipelineId: this.pipeline?.id || "",
@@ -5236,10 +5780,14 @@ class EmbyService {
     const auxiliaryServices = [...this.auxiliaryServices.values()];
     this.auxiliaryServices.clear();
     const stoppingAuxiliaries = Promise.allSettled(
-      auxiliaryServices.map((service) =>
-        service.stopStream(reason, { preserveGeneration: true }),
-      ),
+      [
+        ...auxiliaryServices.map((service) =>
+          service.stopStream(reason, { preserveGeneration: true }),
+        ),
+        ...this.auxiliaryStopPromises.values(),
+      ],
     );
+    this.auxiliaryStopPromises.clear();
     const pipeline = this.pipeline;
     if (!pipeline) {
       await stoppingAuxiliaries;

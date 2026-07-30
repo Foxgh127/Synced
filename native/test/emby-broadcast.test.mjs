@@ -1390,23 +1390,6 @@ test("CMAF viewers keep media idle until a viewer-scoped partial-reliability fal
   control.dispatchEvent(
     new MessageEvent("message", {
       data: JSON.stringify({
-        type: "session-ready",
-        sessionId: controller.sessionId,
-        mediaVersion: 1,
-        transportEpoch: 0,
-      }),
-    }),
-  );
-  await nextTurn();
-  assert.equal(
-    media.sent.length,
-    0,
-    "normal HTTPS CMAF playback carries only control over RTC",
-  );
-
-  control.dispatchEvent(
-    new MessageEvent("message", {
-      data: JSON.stringify({
         type: "segment-fallback-request",
         sessionId: controller.sessionId,
         mediaVersion: 1,
@@ -1414,7 +1397,34 @@ test("CMAF viewers keep media idle until a viewer-scoped partial-reliability fal
       }),
     }),
   );
+  assert.equal(
+    controller.peers.get("viewer-segment-fallback")
+      .pendingMediaFallbackTarget,
+    0,
+    "a request that races ahead of session-ready is retained",
+  );
+  assert.equal(media.sent.length, 0);
+  control.dispatchEvent(
+    new MessageEvent("message", {
+      data: JSON.stringify({
+        type: "session-ready",
+        sessionId: controller.sessionId,
+        mediaVersion: 1,
+        transportEpoch: 0,
+      }),
+    }),
+  );
   await new Promise((resolve) => setTimeout(resolve, 60));
+  const fallbackAck = control.sent
+    .filter((value) => typeof value === "string")
+    .map((value) => JSON.parse(value))
+    .find((message) => message.type === "segment-fallback-ack");
+  assert.deepEqual(fallbackAck, {
+    type: "segment-fallback-ack",
+    sessionId: controller.sessionId,
+    mediaVersion: 1,
+    transportEpoch: 1,
+  });
   assert.ok(
     control.sent.some(
       (value) =>

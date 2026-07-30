@@ -790,6 +790,97 @@ test("control parsing rejects null, arrays, and primitives without throwing", as
   assert.equal(player.invalidPacketCount, 4);
 });
 
+test("segment fallback retries until an epoch-scoped ACK arrives", async () => {
+  const { EmbyMsePlayer } = await loadModule();
+  globalThis.window ||= globalThis;
+  const video = Object.assign(new EventTarget(), {
+    currentTime: 12,
+    playbackRate: 1,
+    buffered: { length: 0, start: () => 0, end: () => 0 },
+    pause() {},
+    play: async () => {},
+  });
+  class FakeChannel extends EventTarget {
+    readyState = "open";
+    binaryType = "arraybuffer";
+    sent = [];
+    send(value) {
+      this.sent.push(JSON.parse(value));
+    }
+  }
+  const channel = new FakeChannel();
+  const player = new EmbyMsePlayer({ video });
+  player.session = {
+    roomId: "ROOM",
+    sessionId: "session_fallback_ack",
+    mediaVersion: 6,
+    transportEpoch: 0,
+    mimeType: 'video/mp4; codecs="avc1.640028,mp4a.40.2"',
+    plan: {},
+    title: "Fixture",
+  };
+  let acknowledged;
+  player.addEventListener("segmentfallbackack", (event) => {
+    acknowledged = event.detail;
+  });
+  assert.equal(
+    player.enableDataChannelSegmentFallback(channel, 12),
+    true,
+  );
+  assert.equal(
+    channel.sent.filter(
+      (message) => message.type === "segment-fallback-request",
+    ).length,
+    1,
+  );
+  await new Promise((resolve) => setTimeout(resolve, 550));
+  assert.equal(
+    channel.sent.filter(
+      (message) => message.type === "segment-fallback-request",
+    ).length,
+    2,
+    "the first unacknowledged request is retried after 500 ms",
+  );
+  channel.dispatchEvent(
+    new MessageEvent("message", {
+      data: JSON.stringify({
+        type: "segment-fallback-ack",
+        sessionId: "session_fallback_ack",
+        mediaVersion: 6,
+        transportEpoch: 0,
+      }),
+    }),
+  );
+  assert.equal(
+    acknowledged,
+    undefined,
+    "an ACK from the pre-fallback transport epoch is ignored",
+  );
+  channel.dispatchEvent(
+    new MessageEvent("message", {
+      data: JSON.stringify({
+        type: "segment-fallback-ack",
+        sessionId: "session_fallback_ack",
+        mediaVersion: 6,
+        transportEpoch: 1,
+      }),
+    }),
+  );
+  assert.deepEqual(acknowledged, {
+    sessionId: "session_fallback_ack",
+    mediaVersion: 6,
+    transportEpoch: 1,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 1_100));
+  assert.equal(
+    channel.sent.filter(
+      (message) => message.type === "segment-fallback-request",
+    ).length,
+    2,
+    "ACK cancels the remaining one- and two-second retries",
+  );
+});
+
 test("seq2 before init still waits for a repaired seq1 before flushing", async () => {
   const { EmbyMsePlayer } = await loadModule();
   globalThis.window ||= globalThis;

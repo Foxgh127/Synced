@@ -43,6 +43,7 @@ const DEFAULT_MEMORY_BYTES = 192 * 1024 * 1024;
 const MIN_DISK_BYTES = 64 * 1024 * 1024;
 const MAX_DISK_BYTES = 5 * 1024 * 1024 * 1024;
 const INDEX_WRITE_DELAY_MS = 250;
+const ACTIVE_REWIND_PIN_MS = 30_000;
 const ROOM_PATTERN = /^[23456789A-HJ-NP-Z]{8}$/;
 const SESSION_PATTERN = /^[a-z0-9-]{8,128}$/i;
 const ASSET_PATTERN = /^[a-f0-9]{24,64}$/;
@@ -116,7 +117,12 @@ function indexedRecordKey(value) {
   if (!RENDITION_PATTERN.test(String(value.rendition || ""))) {
     return undefined;
   }
-  if (value.kind === "init") return `${root}/${value.rendition}/init`;
+  if (value.kind === "init") {
+    const epoch = Number(value.epoch);
+    return Number.isSafeInteger(epoch) && epoch >= 1
+      ? `${root}/${value.rendition}/epoch/${epoch}/init`
+      : `${root}/${value.rendition}/init`;
+  }
   if (
     value.kind !== "segment" ||
     !Number.isSafeInteger(value.sequence) ||
@@ -212,6 +218,25 @@ function relayRoute(pathname) {
       key: `${keyRoot}/${rendition}/init`,
     };
   }
+  const initEpoch =
+    parts.length === 15 &&
+    parts[12] === "epochs" &&
+    parts[14] === "init.mp4"
+      ? Number(parts[13])
+      : undefined;
+  if (
+    Number.isSafeInteger(initEpoch) &&
+    initEpoch >= 1 &&
+    initEpoch <= 0xffffffff
+  ) {
+    return {
+      ...root,
+      rendition,
+      epoch: initEpoch,
+      kind: "init",
+      key: `${keyRoot}/${rendition}/epoch/${initEpoch}/init`,
+    };
+  }
   const sequenceMatch =
     parts.length === 14 &&
     parts[12] === "segments" &&
@@ -252,11 +277,57 @@ function validateManifest(bytes, route) {
         Number(manifest.playbackTimeMs) < 0)) ||
     (manifest.ended !== undefined &&
       typeof manifest.ended !== "boolean") ||
+    (manifest.revision !== undefined &&
+      (!Number.isSafeInteger(Number(manifest.revision)) ||
+        Number(manifest.revision) < 1)) ||
+    (manifest.evictionRevision !== undefined &&
+      (!Number.isSafeInteger(Number(manifest.evictionRevision)) ||
+        Number(manifest.evictionRevision) < 0)) ||
+    (manifest.acknowledgedEvictionRevision !== undefined &&
+      (!Number.isSafeInteger(
+        Number(manifest.acknowledgedEvictionRevision),
+      ) ||
+        Number(manifest.acknowledgedEvictionRevision) < 0)) ||
+    (manifest.tombstones !== undefined &&
+      (!Array.isArray(manifest.tombstones) ||
+        manifest.tombstones.length > 16)) ||
     !Array.isArray(manifest.renditions) ||
     manifest.renditions.length < 1 ||
     manifest.renditions.length > 8
   ) {
     throw Object.assign(new Error("manifest-schema"), { statusCode: 400 });
+  }
+  manifest.revision = Number(manifest.revision) || 1;
+  manifest.evictionRevision =
+    Number(manifest.evictionRevision) || 0;
+  manifest.acknowledgedEvictionRevision =
+    Number(manifest.acknowledgedEvictionRevision) || 0;
+  manifest.tombstones = Array.isArray(manifest.tombstones)
+    ? manifest.tombstones
+    : [];
+  const tombstoneRenditions = new Set();
+  for (const tombstone of manifest.tombstones) {
+    const throughSequence = Number(tombstone?.throughSequence);
+    const fromSequence = Number(tombstone?.fromSequence);
+    const hasThrough = Number.isSafeInteger(throughSequence);
+    const hasFrom = Number.isSafeInteger(fromSequence);
+    if (
+      !tombstone ||
+      typeof tombstone !== "object" ||
+      !RENDITION_PATTERN.test(String(tombstone.renditionId || "")) ||
+      tombstoneRenditions.has(tombstone.renditionId) ||
+      hasThrough === hasFrom ||
+      (hasThrough && (throughSequence < 1 || throughSequence > 0xffffffff)) ||
+      (hasFrom && (fromSequence < 1 || fromSequence > 0xffffffff)) ||
+      !Number.isSafeInteger(Number(tombstone.evictionRevision)) ||
+      Number(tombstone.evictionRevision) < 1 ||
+      Number(tombstone.evictionRevision) > manifest.evictionRevision
+    ) {
+      throw Object.assign(new Error("manifest-tombstone"), {
+        statusCode: 400,
+      });
+    }
+    tombstoneRenditions.add(tombstone.renditionId);
   }
   const versionRoot =
     `${SEGMENT_RELAY_BASE_PATH}/rooms/${route.room}/sessions/` +
@@ -282,10 +353,20 @@ function validateManifest(bytes, route) {
   for (const rendition of manifest.renditions) {
     const renditionRoot =
       `${versionRoot}renditions/${String(rendition?.id || "")}/`;
+    const epoch =
+      rendition?.epoch === undefined ? undefined : Number(rendition.epoch);
+    const expectedInitPath =
+      epoch === undefined
+        ? `${renditionRoot}init.mp4`
+        : `${renditionRoot}epochs/${epoch}/init.mp4`;
     if (
       !RENDITION_PATTERN.test(String(rendition?.id || "")) ||
       renditionIds.has(rendition.id) ||
-      rendition?.initPath !== `${renditionRoot}init.mp4` ||
+      (epoch !== undefined &&
+        (!Number.isSafeInteger(epoch) ||
+          epoch < 1 ||
+          epoch > 0xffffffff)) ||
+      rendition?.initPath !== expectedInitPath ||
       typeof rendition?.mimeType !== "string" ||
       !rendition.mimeType.startsWith("video/mp4") ||
       !Number.isFinite(Number(rendition?.bitrate)) ||
@@ -507,10 +588,18 @@ export class SegmentRelayStore {
 
   async commitLocked(route, temporaryPath, bytes, metadata) {
     if (this.closed) throw new Error("segment-store-closed");
+    const existing = this.records.get(route.key);
     if (route.kind === "manifest") {
+      if (existing && existing.sha256 === metadata.sha256) {
+        await unlink(temporaryPath).catch(() => undefined);
+        existing.lastAccess = Date.now();
+        this.records.delete(route.key);
+        this.records.set(route.key, existing);
+        return existing;
+      }
+      this.validateManifestRevision(route, metadata.manifest, existing);
       this.validateManifestObjects(route, metadata.manifest);
     }
-    const existing = this.records.get(route.key);
     if (existing && route.kind !== "manifest") {
       await unlink(temporaryPath).catch(() => undefined);
       if (
@@ -565,6 +654,7 @@ export class SegmentRelayStore {
       assetId: route.assetId,
       mediaVersion: route.mediaVersion,
       rendition: route.rendition,
+      epoch: route.epoch,
       sequence: route.sequence,
       kind: route.kind,
       bytes,
@@ -600,14 +690,98 @@ export class SegmentRelayStore {
     return record;
   }
 
+  manifestCoordination(route, code, missing = []) {
+    const key =
+      `${route.room}/${route.sessionId}/${route.assetId}/` +
+      `${route.mediaVersion}/manifest`;
+    const current = this.records.get(key);
+    const manifest = current?.manifest;
+    return {
+      code,
+      revision: Math.max(0, Number(manifest?.revision) || 0),
+      evictionRevision: Math.max(
+        0,
+        Number(manifest?.evictionRevision) || 0,
+      ),
+      tombstones: Array.isArray(manifest?.tombstones)
+        ? manifest.tombstones
+        : [],
+      etag: current?.etag,
+      missing,
+    };
+  }
+
+  conflict(route, code, missing = []) {
+    return Object.assign(new Error(code), {
+      statusCode: 409,
+      relayBody: this.manifestCoordination(route, code, missing),
+    });
+  }
+
+  validateManifestRevision(route, manifest, existing) {
+    if (!existing?.manifest) return;
+    const current = existing.manifest;
+    const currentRevision = Math.max(1, Number(current.revision) || 1);
+    const currentEvictionRevision = Math.max(
+      0,
+      Number(current.evictionRevision) || 0,
+    );
+    const nextRevision = Math.max(1, Number(manifest.revision) || 1);
+    const acknowledgedEvictionRevision = Math.max(
+      0,
+      Number(manifest.acknowledgedEvictionRevision) || 0,
+    );
+    const suppliedEvictionRevision = Math.max(
+      0,
+      Number(manifest.evictionRevision) || 0,
+    );
+    if (
+      nextRevision <= currentRevision ||
+      acknowledgedEvictionRevision !== currentEvictionRevision ||
+      suppliedEvictionRevision !== currentEvictionRevision
+    ) {
+      throw this.conflict(route, "manifest-revision-conflict");
+    }
+    const suppliedTombstones = new Map(
+      manifest.tombstones.map((item) => [item.renditionId, item]),
+    );
+    for (const currentTombstone of current.tombstones || []) {
+      const supplied = suppliedTombstones.get(
+        currentTombstone.renditionId,
+      );
+      if (
+        !supplied ||
+        (currentTombstone.throughSequence !== undefined &&
+          Number(supplied.throughSequence) <
+            Number(currentTombstone.throughSequence)) ||
+        (currentTombstone.fromSequence !== undefined &&
+          Number(supplied.fromSequence) >
+            Number(currentTombstone.fromSequence)) ||
+        Number(supplied.evictionRevision) <
+          Number(currentTombstone.evictionRevision)
+      ) {
+        throw this.conflict(route, "manifest-tombstone-conflict");
+      }
+    }
+  }
+
   validateManifestObjects(route, manifest) {
     const root =
       `${route.room}/${route.sessionId}/${route.assetId}/` +
       `${route.mediaVersion}`;
+    const missing = [];
     for (const rendition of manifest.renditions) {
-      if (!this.records.has(`${root}/${rendition.id}/init`)) {
-        throw Object.assign(new Error("manifest-init-missing"), {
-          statusCode: 409,
+      const initKey =
+        rendition.epoch === undefined
+          ? `${root}/${rendition.id}/init`
+          : `${root}/${rendition.id}/epoch/${rendition.epoch}/init`;
+      if (!this.records.has(initKey)) {
+        missing.push({
+          kind: "init",
+          renditionId: rendition.id,
+          ...(rendition.epoch === undefined
+            ? {}
+            : { epoch: Number(rendition.epoch) }),
         });
       }
       for (const segment of rendition.segments) {
@@ -629,8 +803,15 @@ export class SegmentRelayStore {
           record.bytes !== bytes ||
           (sha256 !== undefined && record.sha256 !== sha256)
         ) {
-          throw Object.assign(new Error("manifest-segment-missing"), {
-            statusCode: 409,
+          missing.push({
+            kind: "segment",
+            renditionId: rendition.id,
+            sequence,
+            timelineTimeMs: Number(
+              Array.isArray(segment)
+                ? segment[2]
+                : segment.timelineTimeMs,
+            ),
           });
         }
       }
@@ -639,9 +820,10 @@ export class SegmentRelayStore {
       manifest.subtitle &&
       !this.records.has(`${root}/subtitle`)
     ) {
-      throw Object.assign(new Error("manifest-subtitle-missing"), {
-        statusCode: 409,
-      });
+      missing.push({ kind: "subtitle" });
+    }
+    if (missing.length) {
+      throw this.conflict(route, "manifest-object-missing", missing);
     }
   }
 
@@ -731,6 +913,20 @@ export class SegmentRelayStore {
       if (Number.isSafeInteger(entry.mediaVersion)) {
         versions.add(entry.mediaVersion);
       }
+      let newestInFlightVersion;
+      for (const record of this.records.values()) {
+        if (
+          record.room === entry.room &&
+          record.sessionId === entry.sessionId &&
+          (!Number.isSafeInteger(newestInFlightVersion) ||
+            record.mediaVersion > newestInFlightVersion)
+        ) {
+          newestInFlightVersion = record.mediaVersion;
+        }
+      }
+      if (Number.isSafeInteger(newestInFlightVersion)) {
+        versions.add(newestInFlightVersion);
+      }
       const matchingManifests = [];
       for (const [key, record] of this.records) {
         if (
@@ -758,6 +954,19 @@ export class SegmentRelayStore {
         }
         continue;
       }
+      const manifestedVersions = new Set(
+        matchingManifests.map((record) => record.mediaVersion),
+      );
+      for (const [key, record] of this.records) {
+        if (
+          record.room === entry.room &&
+          record.sessionId === entry.sessionId &&
+          versions.has(record.mediaVersion) &&
+          !manifestedVersions.has(record.mediaVersion)
+        ) {
+          protectedKeys.add(key);
+        }
+      }
       for (const manifestRecord of matchingManifests) {
         let manifest = manifestRecord.manifest;
         if (!manifest) {
@@ -779,7 +988,11 @@ export class SegmentRelayStore {
             ? Number(manifest.playbackTimeMs)
             : Math.max(0, Number(manifest.startTimeTicks) || 0) / 10_000;
         for (const rendition of manifest.renditions) {
-          protectedKeys.add(`${root}/${rendition.id}/init`);
+          protectedKeys.add(
+            rendition.epoch === undefined
+              ? `${root}/${rendition.id}/init`
+              : `${root}/${rendition.id}/epoch/${rendition.epoch}/init`,
+          );
           for (const segment of rendition.segments) {
             const sequence = Number(
               Array.isArray(segment) ? segment[0] : segment.sequence,
@@ -796,11 +1009,37 @@ export class SegmentRelayStore {
               ) || 1,
             );
             if (
-              timelineTimeMs + durationMs >= playbackTimeMs - 60_000 &&
-              timelineTimeMs <= playbackTimeMs + 120_000
+              timelineTimeMs + durationMs >=
+              playbackTimeMs - ACTIVE_REWIND_PIN_MS
             ) {
               protectedKeys.add(`${root}/${rendition.id}/${sequence}`);
             }
+          }
+        }
+        // A segment can finish uploading immediately before the next
+        // manifest. Protect every in-flight/current-or-future object in the
+        // active version as well; otherwise eviction between the segment PUT
+        // and manifest PUT creates a missing-object race.
+        for (const [key, record] of this.records) {
+          if (
+            record.room !== manifestRecord.room ||
+            record.sessionId !== manifestRecord.sessionId ||
+            record.assetId !== manifestRecord.assetId ||
+            record.mediaVersion !== manifestRecord.mediaVersion
+          ) {
+            continue;
+          }
+          if (record.kind === "init" || record.kind === "subtitle") {
+            protectedKeys.add(key);
+            continue;
+          }
+          if (
+            record.kind === "segment" &&
+            Number(record.timelineTimeMs) +
+              Math.max(1, Number(record.durationMs) || 1) >=
+              playbackTimeMs - ACTIVE_REWIND_PIN_MS
+          ) {
+            protectedKeys.add(key);
           }
         }
       }
@@ -830,40 +1069,83 @@ export class SegmentRelayStore {
       Number.isFinite(Number(manifest.playbackTimeMs))
         ? Number(manifest.playbackTimeMs)
         : Math.max(0, Number(manifest.startTimeTicks) || 0) / 10_000;
-    const trimPrefix =
-      Number(segment.timelineTimeMs) < playbackTimeMs;
     const targetRendition = manifest.renditions.find(
       (rendition) => rendition.id === segment.rendition,
     );
+    const targetEntry = targetRendition?.segments.find(
+      (entry) =>
+        Number(Array.isArray(entry) ? entry[0] : entry.sequence) ===
+        segment.sequence,
+    );
+    const segmentTimelineTimeMs = Number.isFinite(
+      Number(segment.timelineTimeMs),
+    )
+      ? Number(segment.timelineTimeMs)
+      : Number(
+          Array.isArray(targetEntry)
+            ? targetEntry[2]
+            : targetEntry?.timelineTimeMs,
+        );
+    const segmentDurationMs = Number.isFinite(Number(segment.durationMs))
+      ? Number(segment.durationMs)
+      : Number(
+          Array.isArray(targetEntry)
+            ? targetEntry[3]
+            : targetEntry?.durationMs,
+        );
+    const trimPrefix =
+      segmentTimelineTimeMs +
+        Math.max(1, segmentDurationMs || 1) <
+      playbackTimeMs - ACTIVE_REWIND_PIN_MS;
+    // An active publisher can safely acknowledge removal of expired rewind
+    // history. Never punch a hole in current or future media: if storage
+    // remains pressured, producers receive an explicit pressure signal and
+    // reduce their forward window instead.
+    if (!trimPrefix) return false;
     const targetReferenced = targetRendition?.segments.some(
       (entry) =>
         Number(Array.isArray(entry) ? entry[0] : entry.sequence) ===
         segment.sequence,
     );
     if (!targetReferenced) return true;
+    const evictionRevision =
+      Math.max(0, Number(manifest.evictionRevision) || 0) + 1;
+    const priorTombstone = (manifest.tombstones || []).find(
+      (item) => item.renditionId === segment.rendition,
+    );
+    const tombstone = {
+      renditionId: segment.rendition,
+      throughSequence: Math.max(
+        Number(priorTombstone?.throughSequence) || 0,
+        segment.sequence,
+      ),
+      evictionRevision,
+    };
     const nextManifest = {
       ...manifest,
       updatedAt: Date.now(),
+      revision: Math.min(
+        Number.MAX_SAFE_INTEGER,
+        Math.max(1, Number(manifest.revision) || 1) + 1,
+      ),
+      evictionRevision,
+      tombstones: [
+        ...(manifest.tombstones || []).filter(
+          (item) => item.renditionId !== segment.rendition,
+        ),
+        tombstone,
+      ],
       renditions: manifest.renditions.map((rendition) => {
         if (rendition.id !== segment.rendition) return rendition;
         const segments = rendition.segments.filter((entry) => {
           const sequence = Number(Array.isArray(entry) ? entry[0] : entry.sequence);
-          const discard = trimPrefix
-            ? sequence <= segment.sequence
-            : sequence >= segment.sequence;
+          const discard = sequence <= segment.sequence;
           if (discard) removed = true;
           return !discard;
         });
         return {
           ...rendition,
           segments,
-          ...(!trimPrefix
-            ? {
-                ended: false,
-                finalSequence: undefined,
-                finalTimelineEndMs: undefined,
-              }
-            : {}),
         };
       }),
     };
@@ -1005,7 +1287,12 @@ export class SegmentRelayStore {
       maxDiskBytes: this.maxDiskBytes,
       maxMemoryBytes: this.maxMemoryBytes,
       activeSessions: this.activeSessions.size,
+      storagePressure: this.isStoragePressured(),
     };
+  }
+
+  isStoragePressured() {
+    return this.diskBytes > this.maxDiskBytes;
   }
 
   async close() {
@@ -1114,7 +1401,7 @@ function responseHeaders(origin) {
       "authorization, content-type, if-none-match, range, x-content-sha256, x-synced-media-time-ms, x-synced-timeline-time-ms, x-synced-duration-ms, x-synced-keyframe, x-synced-bitrate",
     "access-control-allow-methods": "GET, HEAD, PUT, OPTIONS",
     "access-control-expose-headers":
-      "accept-ranges, content-length, content-range, etag, x-synced-media-time-ms, x-synced-timeline-time-ms, x-synced-duration-ms, x-synced-keyframe, x-synced-bitrate",
+      "accept-ranges, content-length, content-range, etag, x-synced-media-time-ms, x-synced-timeline-time-ms, x-synced-duration-ms, x-synced-keyframe, x-synced-bitrate, x-synced-manifest-revision, x-synced-eviction-revision, x-synced-storage-pressure",
     vary: "Origin",
     "x-content-type-options": "nosniff",
   };
@@ -1126,6 +1413,16 @@ function sendEmpty(response, statusCode, headers = {}) {
     "content-length": "0",
   });
   response.end();
+}
+
+function sendJson(response, statusCode, value, headers = {}) {
+  const body = Buffer.from(JSON.stringify(value));
+  response.writeHead(statusCode, {
+    ...headers,
+    "content-type": "application/json; charset=utf-8",
+    "content-length": String(body.length),
+  });
+  response.end(body);
 }
 
 export function createSegmentRelay(options = {}) {
@@ -1296,6 +1593,22 @@ export function createSegmentRelay(options = {}) {
         response.writeHead(201, {
           ...corsHeaders,
           etag: record.etag,
+          ...(record.kind === "manifest"
+            ? {
+                "x-synced-manifest-revision": String(
+                  Math.max(1, Number(record.manifest?.revision) || 1),
+                ),
+                "x-synced-eviction-revision": String(
+                  Math.max(
+                    0,
+                    Number(record.manifest?.evictionRevision) || 0,
+                  ),
+                ),
+              }
+            : {}),
+          "x-synced-storage-pressure": String(
+            store.isStoragePressured(),
+          ),
           "content-length": "0",
         });
         response.end();
@@ -1303,11 +1616,34 @@ export function createSegmentRelay(options = {}) {
         if (upload?.temporaryPath) {
           await unlink(upload.temporaryPath).catch(() => undefined);
         }
-        sendEmpty(
-          response,
-          boundedInteger(error?.statusCode, 500, 400, 599),
-          corsHeaders,
+        const statusCode = boundedInteger(
+          error?.statusCode,
+          500,
+          400,
+          599,
         );
+        if (error?.relayBody) {
+          sendJson(response, statusCode, error.relayBody, {
+            ...corsHeaders,
+            ...(error.relayBody.etag
+              ? { etag: error.relayBody.etag }
+              : {}),
+            "x-synced-manifest-revision": String(
+              Math.max(0, Number(error.relayBody.revision) || 0),
+            ),
+            "x-synced-eviction-revision": String(
+              Math.max(
+                0,
+                Number(error.relayBody.evictionRevision) || 0,
+              ),
+            ),
+            "x-synced-storage-pressure": String(
+              store.isStoragePressured(),
+            ),
+          });
+        } else {
+          sendEmpty(response, statusCode, corsHeaders);
+        }
       }
       return true;
     }
@@ -1352,6 +1688,22 @@ export function createSegmentRelay(options = {}) {
       "content-type": record.contentType,
       "content-length": String(contentLength),
       etag: record.etag,
+      ...(route.kind === "manifest"
+        ? {
+            "x-synced-manifest-revision": String(
+              Math.max(1, Number(record.manifest?.revision) || 1),
+            ),
+            "x-synced-eviction-revision": String(
+              Math.max(
+                0,
+                Number(record.manifest?.evictionRevision) || 0,
+              ),
+            ),
+          }
+        : {}),
+      "x-synced-storage-pressure": String(
+        store.isStoragePressured(),
+      ),
       ...(range
         ? { "content-range": `bytes ${start}-${end}/${record.bytes}` }
         : {}),

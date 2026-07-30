@@ -142,6 +142,63 @@ test("tuple manifests infer immutable segment paths and treat unknown keys as no
   );
 });
 
+test("manifest parser preserves eviction revisions and rendition init epochs", async () => {
+  const { parseEmbySegmentManifest } = await loadModule();
+  const expected = {
+    roomId: "23456789",
+    sessionId: "session-epoch-parser",
+    assetId: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    mediaVersion: 9,
+  };
+  const root =
+    `/media/v1/rooms/${expected.roomId}/sessions/${expected.sessionId}/` +
+    `assets/${expected.assetId}/versions/${expected.mediaVersion}`;
+  const parsed = parseEmbySegmentManifest(
+    {
+      protocol: "synced-cmaf-v1",
+      ...expected,
+      revision: 12,
+      evictionRevision: 3,
+      acknowledgedEvictionRevision: 3,
+      tombstones: [
+        {
+          renditionId: "original",
+          throughSequence: 41,
+          evictionRevision: 3,
+        },
+      ],
+      title: "Epoch fixture",
+      startTimeTicks: 0,
+      updatedAt: Date.now(),
+      renditions: [
+        {
+          ...rendition("original", 1_080, 15_000_000),
+          epoch: 2,
+          initPath: `${root}/renditions/original/epochs/2/init.mp4`,
+          segments: [
+            [42, 90_000, 90_000, 2_000, 1, 16],
+          ],
+        },
+      ],
+    },
+    expected,
+  );
+  assert.equal(parsed.revision, 12);
+  assert.equal(parsed.evictionRevision, 3);
+  assert.deepEqual(parsed.tombstones, [
+    {
+      renditionId: "original",
+      throughSequence: 41,
+      evictionRevision: 3,
+    },
+  ]);
+  assert.equal(parsed.renditions[0].epoch, 2);
+  assert.equal(
+    parsed.renditions[0].initPath,
+    `${root}/renditions/original/epochs/2/init.mp4`,
+  );
+});
+
 test("timeline lookup uses a spanning binary window on long manifests", async () => {
   const { embySegmentTimelineWindow } = await loadModule();
   const segments = Array.from({ length: 20_000 }, (_unused, index) => ({
