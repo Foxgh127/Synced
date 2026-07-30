@@ -7,7 +7,7 @@ const HIGH_WATER_FRAMES = Math.round(SAMPLE_RATE_HZ * 0.08);
 const CLOCK_REANCHOR_SECONDS = 0.25;
 const CLOCK_NUDGE_LIMIT_SECONDS = 0.0005;
 
-class YiQiKanPcmProcessor extends AudioWorkletProcessor {
+class SyncedPcmProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
     this.left = new Float32Array(CAPACITY_FRAMES);
@@ -308,7 +308,7 @@ class YiQiKanPcmProcessor extends AudioWorkletProcessor {
     return true;
   }
 }
-registerProcessor("yiqikan-pcm-source", YiQiKanPcmProcessor);
+registerProcessor("synced-pcm-source", SyncedPcmProcessor);
 `;
 
 interface ProcessAudioClockSample {
@@ -509,7 +509,7 @@ export class ProcessAudioCapture extends EventTarget {
       throw new DOMException("窗口声音启动已取消", "AbortError");
     }
 
-    const node = new AudioWorkletNode(context, "yiqikan-pcm-source", {
+    const node = new AudioWorkletNode(context, "synced-pcm-source", {
       numberOfInputs: 0,
       numberOfOutputs: 1,
       outputChannelCount: [2],

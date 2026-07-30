@@ -5,12 +5,12 @@ export interface RecentChannel {
   lastJoinedAt: number;
 }
 
-const RECENT_KEY = "yiqikan:recent-channels";
-const HOST_CHANNEL_KEY = "yiqikan:host-channel";
-const HOST_CHANNEL_OWNER_KEY = "yiqikan:host-channel-owner-v3";
-const LEGACY_HOST_CHANNEL_OWNER_KEY = "yiqikan:host-channel-owner-v2";
-const NICKNAME_KEY = "yiqikan:nickname";
-const CHANNEL_NAME_KEY = "yiqikan:channel-name";
+const RECENT_KEY = "synced:recent-channels";
+const HOST_CHANNEL_KEY = "synced:host-channel";
+const HOST_CHANNEL_OWNER_KEY = "synced:host-channel-owner-v3";
+const LEGACY_HOST_CHANNEL_OWNER_KEY = "synced:host-channel-owner-v2";
+const NICKNAME_KEY = "synced:nickname";
+const CHANNEL_NAME_KEY = "synced:channel-name";
 const ROOM_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
 
 export interface HostChannelOwnership {
@@ -178,11 +178,11 @@ export function saveNickname(value: string): string {
 }
 
 export function getChannelName(): string {
-  return clean(localStorage.getItem(CHANNEL_NAME_KEY) || "", 24) || "今晚一起看";
+  return clean(localStorage.getItem(CHANNEL_NAME_KEY) || "", 24) || "今晚同频";
 }
 
 export function saveChannelName(value: string): string {
-  const channelName = clean(value, 24) || "今晚一起看";
+  const channelName = clean(value, 24) || "今晚同频";
   localStorage.setItem(CHANNEL_NAME_KEY, channelName);
   return channelName;
 }

@@ -1,4 +1,4 @@
-package com.yiqikan.room;
+package com.synced.room;
 
 import android.app.Notification;
 import android.app.NotificationChannel;
@@ -12,7 +12,7 @@ import android.os.IBinder;
 
 public class PlaybackForegroundService extends Service {
     public static final String EXTRA_TITLE = "title";
-    private static final String CHANNEL_ID = "yiqikan_playback";
+    private static final String CHANNEL_ID = "synced_playback";
     private static final int NOTIFICATION_ID = 1107;
 
     @Override

@@ -64,7 +64,7 @@ const artifacts = [
     "android",
     `Synced-${version}-security.txt`,
   ),
-  path.join(projectRoot, "release", "server", "yiqikan-signal.mjs"),
+  path.join(projectRoot, "release", "server", "synced-signal.mjs"),
 ];
 for (const artifact of artifacts) {
   if (!existsSync(artifact) || statSync(artifact).size < 1) {

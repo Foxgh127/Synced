@@ -377,7 +377,7 @@ export function createPeerConnection(
     iceCandidatePoolSize: shouldDisableIceCandidatePool() ? 0 : 2,
   });
   const debugGlobal = globalThis as typeof globalThis & {
-    __yiqikanRtcPeers?: Array<{
+    __syncedRtcPeers?: Array<{
       id: number;
       createdAt: number;
       directOnly: boolean;
@@ -401,7 +401,7 @@ export function createPeerConnection(
       pc: RTCPeerConnection;
     }>;
   };
-  const peers = (debugGlobal.__yiqikanRtcPeers ||= []);
+  const peers = (debugGlobal.__syncedRtcPeers ||= []);
   const debugPeer = {
     id: (peers.at(-1)?.id || 0) + 1,
     createdAt: Date.now(),

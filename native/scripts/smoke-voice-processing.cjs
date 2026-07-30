@@ -13,7 +13,7 @@ const { pathToFileURL } = require("node:url");
 
 protocol.registerSchemesAsPrivileged([
   {
-    scheme: "yiqikan-resource",
+    scheme: "synced-resource",
     privileges: {
       standard: true,
       secure: true,
@@ -27,7 +27,7 @@ app.commandLine.appendSwitch("use-fake-device-for-media-stream");
 app.commandLine.appendSwitch("use-fake-ui-for-media-stream");
 
 const temporaryUserData = fs.mkdtempSync(
-  path.join(os.tmpdir(), "yiqikan-voice-smoke-"),
+  path.join(os.tmpdir(), "synced-voice-smoke-"),
 );
 app.setPath("userData", temporaryUserData);
 
@@ -58,7 +58,7 @@ async function waitFor(window, expression, label, timeoutMs = 15_000) {
 
 async function main() {
   let signalServer;
-  let signalUrl = process.env.YIQIKAN_SMOKE_SIGNAL_URL;
+  let signalUrl = process.env.SYNCED_SMOKE_SIGNAL_URL;
   if (!signalUrl) {
     const serverModuleUrl = pathToFileURL(
       path.join(__dirname, "..", "server", "index.mjs"),
@@ -72,7 +72,7 @@ async function main() {
   }
 
   await app.whenReady();
-  protocol.handle("yiqikan-resource", (request) => {
+  protocol.handle("synced-resource", (request) => {
     const url = new URL(request.url);
     const relativePath = decodeURIComponent(url.pathname)
       .replace(/^\/+/, "")
@@ -264,7 +264,7 @@ async function main() {
 
     const mediaExpression = `(async () => {
       const audio = document.querySelector("audio[data-voice-peer]");
-      const peer = [...(window.__yiqikanRtcPeers || [])]
+      const peer = [...(window.__syncedRtcPeers || [])]
         .reverse()
         .find((entry) => entry.pc.connectionState === "connected");
       if (!audio || !peer || audio.paused) return undefined;
@@ -464,7 +464,7 @@ async function main() {
     } catch (error) {
       const diagnostics = {
         host: await window.webContents.executeJavaScript(`(async () => {
-          const peer = [...(window.__yiqikanRtcPeers || [])]
+          const peer = [...(window.__syncedRtcPeers || [])]
             .reverse()
             .find((entry) => entry.pc.connectionState === "connected");
           const rows = [];
@@ -488,7 +488,7 @@ async function main() {
           };
         })()`),
         viewer: await viewerWindow.webContents.executeJavaScript(`(async () => {
-          const peer = [...(window.__yiqikanRtcPeers || [])]
+          const peer = [...(window.__syncedRtcPeers || [])]
             .reverse()
             .find((entry) => entry.pc.connectionState === "connected");
           const rows = [];

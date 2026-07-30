@@ -1,0 +1,8 @@
+[Unit]
+Description=Renew the short-lived Synced public-IP TLS certificate
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/synced-certbot/bin/certbot renew --quiet --deploy-hook "systemctl reload nginx"

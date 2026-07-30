@@ -28,11 +28,11 @@ def build_wave(path: str) -> None:
         output.writeframes(frames)
 
 
-wave_path = os.path.join(tempfile.gettempdir(), "yiqikan-process-audio-smoke.wav")
+wave_path = os.path.join(tempfile.gettempdir(), "synced-process-audio-smoke.wav")
 build_wave(wave_path)
 
 root = tk.Tk()
-root.title("YiQiKan Native Process Audio Smoke")
+root.title("Synced Native Process Audio Smoke")
 root.geometry("640x360")
 label = tk.Label(
     root,

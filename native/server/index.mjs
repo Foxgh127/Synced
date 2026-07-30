@@ -216,7 +216,7 @@ function buildSfuAccess(room, state, env = process.env) {
     24 * 60 * 60,
   );
   const expiresAt = (nowSeconds + ttlSeconds) * 1_000;
-  const sfuRoom = `yiqikan-${String(room).toLowerCase()}`;
+  const sfuRoom = `synced-${String(room).toLowerCase()}`;
   const header = base64UrlJson({ alg: "HS256", typ: "JWT" });
   const payload = base64UrlJson({
     iss: cleanText(env.LIVEKIT_API_KEY, 128),
@@ -1149,7 +1149,7 @@ function originAllowed(origin, env) {
 function send(socket, payload) {
   if (socket.readyState === WebSocket.OPEN) {
     const configuredMaximum =
-      socket.yiqikanMaxBufferedBytes || SIGNAL_MAX_BUFFERED_BYTES;
+      socket.syncedMaxBufferedBytes || SIGNAL_MAX_BUFFERED_BYTES;
     const maximumBufferedBytes =
       payload?.type === "network:probe-result"
         ? Math.max(
@@ -1158,8 +1158,8 @@ function send(socket, payload) {
           )
         : configuredMaximum;
     if (socket.bufferedAmount > maximumBufferedBytes) {
-      if (socket.yiqikanMetrics) {
-        socket.yiqikanMetrics.slowClientDropsTotal += 1;
+      if (socket.syncedMetrics) {
+        socket.syncedMetrics.slowClientDropsTotal += 1;
       }
       try {
         socket.close(1013, "signaling backpressure");
@@ -1170,8 +1170,8 @@ function send(socket, payload) {
     }
     try {
       socket.send(JSON.stringify(payload));
-      if (socket.yiqikanMetrics) {
-        socket.yiqikanMetrics.messagesSentTotal += 1;
+      if (socket.syncedMetrics) {
+        socket.syncedMetrics.messagesSentTotal += 1;
       }
       return true;
     } catch {
@@ -1361,7 +1361,7 @@ export function createSignalServer(options = {}) {
 
   function serverCapabilities() {
     return {
-      name: "yiqikan-signal",
+      name: "synced-signal",
       status: "ready",
       ...signalCompatibility(),
       ...nodeIdentity,
@@ -1448,21 +1448,21 @@ export function createSignalServer(options = {}) {
   function metricsText() {
     const snapshot = runtimeSnapshot();
     const gauges = {
-      yiqikan_signal_up: 1,
-      yiqikan_signal_rooms: snapshot.rooms,
-      yiqikan_signal_clients: snapshot.clients,
-      yiqikan_signal_broadcasters: snapshot.broadcasters,
-      yiqikan_signal_voice_participants: snapshot.voiceParticipants,
-      yiqikan_signal_active_relay_sessions:
+      synced_signal_up: 1,
+      synced_signal_rooms: snapshot.rooms,
+      synced_signal_clients: snapshot.clients,
+      synced_signal_broadcasters: snapshot.broadcasters,
+      synced_signal_voice_participants: snapshot.voiceParticipants,
+      synced_signal_active_relay_sessions:
         snapshot.activeRelaySessions,
-      yiqikan_signal_uptime_seconds: snapshot.uptimeSeconds,
-      yiqikan_signal_memory_rss_bytes: snapshot.memory.rssBytes,
-      yiqikan_signal_memory_heap_used_bytes:
+      synced_signal_uptime_seconds: snapshot.uptimeSeconds,
+      synced_signal_memory_rss_bytes: snapshot.memory.rssBytes,
+      synced_signal_memory_heap_used_bytes:
         snapshot.memory.heapUsedBytes,
     };
     const counters = Object.fromEntries(
       Object.entries(metrics).map(([key, value]) => [
-        `yiqikan_signal_${key
+        `synced_signal_${key
           .replace(/Total$/u, "_total")
           .replace(/[A-Z]/g, (character) => `_${character.toLowerCase()}`)}`,
         value,
@@ -2173,7 +2173,7 @@ export function createSignalServer(options = {}) {
     }
     if (pathname === "/") {
       sendJson(200, {
-        name: "yiqikan-signal",
+        name: "synced-signal",
         status: "ready",
         websocket: "/signal",
         protocolVersion: SIGNAL_PROTOCOL_VERSION,
@@ -2299,8 +2299,8 @@ export function createSignalServer(options = {}) {
     const ip = requestIp(request, env);
     const ipLimitKey = rateLimitKey(ip);
     socket.isAlive = true;
-    socket.yiqikanMetrics = metrics;
-    socket.yiqikanMaxBufferedBytes = maxBufferedBytes;
+    socket.syncedMetrics = metrics;
+    socket.syncedMaxBufferedBytes = maxBufferedBytes;
     metrics.websocketConnectionsTotal += 1;
     const state = {
       id: clientId,
@@ -3754,5 +3754,5 @@ if (isEntrypoint) {
   const host = process.env.HOST || "0.0.0.0";
   const server = createSignalServer();
   await server.listen(port, host);
-  console.log(`yiqikan-signal listening on ${host}:${port}`);
+  console.log(`synced-signal listening on ${host}:${port}`);
 }

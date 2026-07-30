@@ -8,7 +8,7 @@ const result = spawnSync(
   dotnet,
   [
     "publish",
-    "audio-helper/YiQiKan.AudioCapture.csproj",
+    "audio-helper/Synced.AudioCapture.csproj",
     "-c",
     "Release",
     "-r",

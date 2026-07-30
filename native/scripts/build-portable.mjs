@@ -95,7 +95,7 @@ for (const entry of readdirSync(outputDirectory, { withFileTypes: true })) {
   if (
     entry.name === "win-unpacked" ||
     entry.name === "builder-debug.yml" ||
-    /^(?:YiQiKan|Synced)-.*\.(?:exe|blockmap)$/i.test(entry.name)
+    /^Synced-.*\.(?:exe|blockmap)$/i.test(entry.name)
   ) {
     try {
       rmSync(candidate, {

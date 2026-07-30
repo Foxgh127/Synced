@@ -65,13 +65,13 @@ services:
     network_mode: host
     entrypoint:
       - /bin/sh
-      - /opt/yiqikan/coturn-entrypoint.sh
+      - /opt/synced/coturn-entrypoint.sh
     environment:
       TURN_SECRET_FILE: "/run/secrets/turn_secret"
     secrets:
       - turn_secret
     volumes:
-      - ./coturn-entrypoint.sh:/opt/yiqikan/coturn-entrypoint.sh:ro
+      - ./coturn-entrypoint.sh:/opt/synced/coturn-entrypoint.sh:ro
     tmpfs:
       - /tmp:size=16m,mode=1777
     security_opt:
@@ -124,7 +124,7 @@ services:
     read_only: true
     entrypoint:
       - /bin/sh
-      - /opt/yiqikan/livekit-entrypoint.sh
+      - /opt/synced/livekit-entrypoint.sh
     environment:
       LIVEKIT_API_KEY: "${LIVEKIT_API_KEY}"
       LIVEKIT_API_SECRET_FILE: "/run/secrets/livekit_api_secret"
@@ -136,7 +136,7 @@ services:
       - livekit_api_secret
       - turn_secret
     volumes:
-      - ./livekit-entrypoint.sh:/opt/yiqikan/livekit-entrypoint.sh:ro
+      - ./livekit-entrypoint.sh:/opt/synced/livekit-entrypoint.sh:ro
     tmpfs:
       - /tmp:size=32m,mode=1777
     security_opt:

@@ -5,23 +5,23 @@ const {
   roomForOwnerToken,
 } = require("./channel-owner.cjs");
 
-const SOURCE_TITLE = "YiQiKan Phone E2E Source";
+const SOURCE_TITLE = "Synced Phone E2E Source";
 const signalUrl =
-  process.env.YIQIKAN_PHONE_SIGNAL || "wss://synced.com.cn/signal";
+  process.env.SYNCED_PHONE_SIGNAL || "wss://synced.com.cn/signal";
 const generatedOwner = createChannelOwner();
 const ownerToken =
-  process.env.YIQIKAN_PHONE_OWNER_TOKEN || generatedOwner.ownerToken;
+  process.env.SYNCED_PHONE_OWNER_TOKEN || generatedOwner.ownerToken;
 const room = roomForOwnerToken(ownerToken);
-const requestedRoom = process.env.YIQIKAN_PHONE_ROOM?.trim().toUpperCase();
+const requestedRoom = process.env.SYNCED_PHONE_ROOM?.trim().toUpperCase();
 if (requestedRoom && requestedRoom !== room) {
   throw new Error(
-    "YIQIKAN_PHONE_ROOM 与 YIQIKAN_PHONE_OWNER_TOKEN 不匹配；安全频道码必须由频道主凭证派生",
+    "SYNCED_PHONE_ROOM 与 SYNCED_PHONE_OWNER_TOKEN 不匹配；安全频道码必须由频道主凭证派生",
   );
 }
-const syntheticVideo = process.env.YIQIKAN_PHONE_SYNTHETIC === "1";
-const voiceEnabled = process.env.YIQIKAN_PHONE_VOICE === "1";
+const syntheticVideo = process.env.SYNCED_PHONE_SYNTHETIC === "1";
+const voiceEnabled = process.env.SYNCED_PHONE_VOICE === "1";
 const holdMilliseconds = Number(
-  process.env.YIQIKAN_PHONE_HOLD_MS || "20000",
+  process.env.SYNCED_PHONE_HOLD_MS || "20000",
 );
 
 async function main() {
@@ -143,7 +143,7 @@ async function main() {
           context.fillRect(phase - 160, 250, 160, 160);
           context.fillStyle = "#ffffff";
           context.font = "700 64px sans-serif";
-          context.fillText("一起看 TURN 真机测试", 220, 150);
+          context.fillText("同频 TURN 真机测试", 220, 150);
           context.font = "36px sans-serif";
           context.fillText(new Date().toLocaleTimeString(), 500, 580);
         };

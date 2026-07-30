@@ -50,7 +50,7 @@
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data
                     android:host="join"
-                    android:scheme="yiqikan" />
+                    android:scheme="synced" />
             </intent-filter>
 
             <intent-filter android:autoVerify="false">

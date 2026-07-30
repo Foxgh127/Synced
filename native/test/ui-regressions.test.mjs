@@ -1120,7 +1120,7 @@ test("Bluff opens from the channel-only game center in a sandboxed application v
   assert.match(session, /embeddedGameRailButtonMarkup\(\)/);
   assert.doesNotMatch(game, /window\.open|<iframe|<webview/);
   assert.match(electronMain, /new WebContentsView\(/);
-  assert.match(electronMain, /partition:\s*"persist:yiqikan-bluff"/);
+  assert.match(electronMain, /partition:\s*"persist:synced-bluff"/);
   assert.match(electronMain, /contextIsolation:\s*true/);
   assert.match(electronMain, /nodeIntegration:\s*false/);
   assert.match(electronMain, /sandbox:\s*true/);

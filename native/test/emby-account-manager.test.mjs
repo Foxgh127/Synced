@@ -165,7 +165,7 @@ function createHarness(storagePath) {
 
 test("persists multiple encrypted Emby accounts and searches every server", async () => {
   const temporary = fs.mkdtempSync(
-    path.join(os.tmpdir(), "yiqikan-emby-accounts-"),
+    path.join(os.tmpdir(), "synced-emby-accounts-"),
   );
   const storagePath = path.join(temporary, "accounts.json");
   try {
@@ -240,7 +240,7 @@ test("persists multiple encrypted Emby accounts and searches every server", asyn
 
 test("activation verifies the saved token before changing the active account", async () => {
   const temporary = fs.mkdtempSync(
-    path.join(os.tmpdir(), "yiqikan-emby-activation-"),
+    path.join(os.tmpdir(), "synced-emby-activation-"),
   );
   try {
     const { manager, audit } = createHarness(
@@ -293,7 +293,7 @@ test("falls back to process-only accounts when OS encryption is unavailable", as
 
 test("media operations stay bound to the selected account across active-account races", async () => {
   const temporary = fs.mkdtempSync(
-    path.join(os.tmpdir(), "yiqikan-emby-account-routing-"),
+    path.join(os.tmpdir(), "synced-emby-account-routing-"),
   );
   try {
     const { manager, audit } = createHarness(
@@ -364,7 +364,7 @@ test("media operations stay bound to the selected account across active-account 
 
 test("upgrading a legacy account to Server Id routes migrates its account id", async () => {
   const temporary = fs.mkdtempSync(
-    path.join(os.tmpdir(), "yiqikan-emby-route-migration-"),
+    path.join(os.tmpdir(), "synced-emby-route-migration-"),
   );
   const storagePath = path.join(temporary, "accounts.json");
   try {
@@ -399,7 +399,7 @@ test("upgrading a legacy account to Server Id routes migrates its account id", a
 
 test("loads and rewrites a v1 encrypted account whose Server Id changes its identity", async () => {
   const temporary = fs.mkdtempSync(
-    path.join(os.tmpdir(), "yiqikan-emby-v1-identity-"),
+    path.join(os.tmpdir(), "synced-emby-v1-identity-"),
   );
   const storagePath = path.join(temporary, "accounts.json");
   try {

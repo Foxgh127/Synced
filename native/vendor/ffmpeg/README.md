@@ -1,6 +1,6 @@
 # FFmpeg runtime
 
-YiQiKan uses this separate FFmpeg executable for Emby stream demuxing and
+Synced uses this separate FFmpeg executable for Emby stream demuxing and
 fragmented-MP4 remuxing. It is not linked into the application.
 
 - Build: `n8.1.2-31-g8c9502e9b0-20260724`, Windows x86-64, LGPL static variant

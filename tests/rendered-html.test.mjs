@@ -8,11 +8,11 @@ async function render() {
   const { default: worker } = await import(workerUrl.href);
 
   return worker.fetch(
-    new Request("https://yiqikan.test/", {
+    new Request("https://synced.test/", {
       headers: {
         accept: "text/html",
-        host: "yiqikan.test",
-        "x-forwarded-host": "yiqikan.test",
+        host: "synced.test",
+        "x-forwarded-host": "synced.test",
         "x-forwarded-proto": "https",
       },
     }),
@@ -35,10 +35,10 @@ test("server-renders the branded entry page and metadata", async () => {
 
   const html = await response.text();
   assert.match(html, /<html[^>]*lang="zh-CN"/i);
-  assert.match(html, /<title>一起看｜一键分享，一起看电影<\/title>/i);
-  assert.match(html, /一起看/);
-  assert.match(html, /一键分享，一起看电影/);
-  assert.match(html, /https:\/\/yiqikan\.test\/og\.png/);
+  assert.match(html, /<title>同频｜一键分享，同频观影<\/title>/i);
+  assert.match(html, /同频/);
+  assert.match(html, /一键分享，同频观影/);
+  assert.match(html, /https:\/\/synced\.test\/og\.png/);
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape/i);
 });
 

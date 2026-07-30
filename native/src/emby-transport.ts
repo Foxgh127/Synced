@@ -1,5 +1,5 @@
-export const EMBY_DATA_CHANNEL_LABEL = "yiqikan-emby-v1";
-export const EMBY_CONTROL_CHANNEL_LABEL = "yiqikan-emby-control-v1";
+export const EMBY_DATA_CHANNEL_LABEL = "synced-emby-v1";
+export const EMBY_CONTROL_CHANNEL_LABEL = "synced-emby-control-v1";
 export const EMBY_PROTOCOL_VERSION = 1;
 // Smaller SCTP messages recover much faster on lossy mobile/TURN routes and
 // avoid monopolizing the association behind one large fragment.

@@ -2016,7 +2016,7 @@ test("retries image subtitles with forced Emby video transcoding", async () => {
 });
 
 test("logs in, browses, remuxes one authenticated stream, and never exposes the token", async () => {
-  const temporary = mkdtempSync(path.join(os.tmpdir(), "yiqikan-emby-"));
+  const temporary = mkdtempSync(path.join(os.tmpdir(), "synced-emby-"));
   const source = path.join(temporary, "source.mp4");
   const token = "host-only-secret-token";
   execFileSync(

@@ -317,7 +317,7 @@ function installSmokeClient() {
       context.fillRect(0, 0, canvas.width, canvas.height);
       context.fillStyle = "#ffffff";
       context.font = "28px sans-serif";
-      context.fillText(`YiQiKan ${frame}`, 24, 70);
+      context.fillText(`Synced ${frame}`, 24, 70);
     };
     draw();
     state.drawTimer = window.setInterval(draw, 80);
@@ -444,7 +444,7 @@ async function main() {
   app.commandLine.appendSwitch("autoplay-policy", "no-user-gesture-required");
   await app.whenReady();
 
-  const externalSignalUrl = process.env.YIQIKAN_SMOKE_SIGNAL_URL;
+  const externalSignalUrl = process.env.SYNCED_SMOKE_SIGNAL_URL;
   let signalServer;
   let signalUrl = externalSignalUrl;
   if (!signalUrl) {

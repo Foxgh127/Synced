@@ -119,7 +119,7 @@ test("measures Emby DataChannel bitrate and selected P2P RTT", async () => {
       {
         id: "data",
         type: "data-channel",
-        label: "yiqikan-emby-v1",
+        label: "synced-emby-v1",
         bytesReceived: 501_000,
         messagesReceived: 18,
         timestamp: 2_000,
@@ -158,7 +158,7 @@ test("measures Emby DataChannel bitrate and selected P2P RTT", async () => {
   ]);
   const stats = await rtc.readDataChannelStats(
     { getStats: async () => report },
-    "yiqikan-emby-v1",
+    "synced-emby-v1",
     { bytes: 1_000, timestamp: 1_000 },
   );
   assert.equal(stats.bitrate, 4_000_000);

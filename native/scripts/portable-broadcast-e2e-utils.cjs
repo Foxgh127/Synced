@@ -50,17 +50,17 @@ function bitrateFromEnvironment(environment, prefix, fallback) {
 function buildHealthConfig(environment = process.env) {
   const maxVideoBitrateBps = bitrateFromEnvironment(
     environment,
-    "YIQIKAN_E2E_MAX_VIDEO_BITRATE",
+    "SYNCED_E2E_MAX_VIDEO_BITRATE",
     DEFAULT_MAX_VIDEO_BITRATE_BPS,
   );
   const minVideoBitrateBps = bitrateFromEnvironment(
     environment,
-    "YIQIKAN_E2E_MIN_VIDEO_BITRATE",
+    "SYNCED_E2E_MIN_VIDEO_BITRATE",
     1_500_000,
   );
   if (minVideoBitrateBps > maxVideoBitrateBps) {
     throw new Error(
-      "YIQIKAN_E2E_MIN_VIDEO_BITRATE 不能大于 YIQIKAN_E2E_MAX_VIDEO_BITRATE",
+      "SYNCED_E2E_MIN_VIDEO_BITRATE 不能大于 SYNCED_E2E_MAX_VIDEO_BITRATE",
     );
   }
   return {
@@ -68,8 +68,8 @@ function buildHealthConfig(environment = process.env) {
     minVideoBitrateBps,
     observationMs: Math.round(
       finiteNumber(
-        "YIQIKAN_E2E_OBSERVATION_MS",
-        environment.YIQIKAN_E2E_OBSERVATION_MS,
+        "SYNCED_E2E_OBSERVATION_MS",
+        environment.SYNCED_E2E_OBSERVATION_MS,
         12_000,
         4_000,
         60_000,
@@ -77,8 +77,8 @@ function buildHealthConfig(environment = process.env) {
     ),
     reconnectObservationMs: Math.round(
       finiteNumber(
-        "YIQIKAN_E2E_RECONNECT_OBSERVATION_MS",
-        environment.YIQIKAN_E2E_RECONNECT_OBSERVATION_MS,
+        "SYNCED_E2E_RECONNECT_OBSERVATION_MS",
+        environment.SYNCED_E2E_RECONNECT_OBSERVATION_MS,
         8_000,
         4_000,
         60_000,
@@ -86,70 +86,70 @@ function buildHealthConfig(environment = process.env) {
     ),
     sampleIntervalMs: Math.round(
       finiteNumber(
-        "YIQIKAN_E2E_SAMPLE_INTERVAL_MS",
-        environment.YIQIKAN_E2E_SAMPLE_INTERVAL_MS,
+        "SYNCED_E2E_SAMPLE_INTERVAL_MS",
+        environment.SYNCED_E2E_SAMPLE_INTERVAL_MS,
         1_000,
         250,
         5_000,
       ),
     ),
     maxAvSkewMs: finiteNumber(
-      "YIQIKAN_E2E_MAX_AV_SKEW_MS",
-      environment.YIQIKAN_E2E_MAX_AV_SKEW_MS,
+      "SYNCED_E2E_MAX_AV_SKEW_MS",
+      environment.SYNCED_E2E_MAX_AV_SKEW_MS,
       3_000,
       100,
       10_000,
     ),
     maxRttMs: finiteNumber(
-      "YIQIKAN_E2E_MAX_RTT_MS",
-      environment.YIQIKAN_E2E_MAX_RTT_MS,
+      "SYNCED_E2E_MAX_RTT_MS",
+      environment.SYNCED_E2E_MAX_RTT_MS,
       3_000,
       50,
       10_000,
     ),
     maxPacketLossRatio:
       finiteNumber(
-        "YIQIKAN_E2E_MAX_PACKET_LOSS_PERCENT",
-        environment.YIQIKAN_E2E_MAX_PACKET_LOSS_PERCENT,
+        "SYNCED_E2E_MAX_PACKET_LOSS_PERCENT",
+        environment.SYNCED_E2E_MAX_PACKET_LOSS_PERCENT,
         8,
         0,
         50,
       ) / 100,
     maxBlackRatio:
       finiteNumber(
-        "YIQIKAN_E2E_MAX_BLACK_PERCENT",
-        environment.YIQIKAN_E2E_MAX_BLACK_PERCENT,
+        "SYNCED_E2E_MAX_BLACK_PERCENT",
+        environment.SYNCED_E2E_MAX_BLACK_PERCENT,
         60,
         0,
         100,
       ) / 100,
     maxFrameStallMs: finiteNumber(
-      "YIQIKAN_E2E_MAX_FRAME_STALL_MS",
-      environment.YIQIKAN_E2E_MAX_FRAME_STALL_MS,
+      "SYNCED_E2E_MAX_FRAME_STALL_MS",
+      environment.SYNCED_E2E_MAX_FRAME_STALL_MS,
       3_000,
       500,
       15_000,
     ),
     maxFreezeRatio:
       finiteNumber(
-        "YIQIKAN_E2E_MAX_FREEZE_PERCENT",
-        environment.YIQIKAN_E2E_MAX_FREEZE_PERCENT,
+        "SYNCED_E2E_MAX_FREEZE_PERCENT",
+        environment.SYNCED_E2E_MAX_FREEZE_PERCENT,
         25,
         0,
         100,
       ) / 100,
     minDecodedFps: finiteNumber(
-      "YIQIKAN_E2E_MIN_DECODED_FPS",
-      environment.YIQIKAN_E2E_MIN_DECODED_FPS,
+      "SYNCED_E2E_MIN_DECODED_FPS",
+      environment.SYNCED_E2E_MIN_DECODED_FPS,
       5,
       0.1,
       120,
     ),
-    requireAudibleAudio: environment.YIQIKAN_E2E_REQUIRE_AUDIO !== "0",
+    requireAudibleAudio: environment.SYNCED_E2E_REQUIRE_AUDIO !== "0",
     hardTimeoutMs: Math.round(
       finiteNumber(
-        "YIQIKAN_E2E_HARD_TIMEOUT_MS",
-        environment.YIQIKAN_E2E_HARD_TIMEOUT_MS,
+        "SYNCED_E2E_HARD_TIMEOUT_MS",
+        environment.SYNCED_E2E_HARD_TIMEOUT_MS,
         240_000,
         60_000,
         900_000,
@@ -158,7 +158,7 @@ function buildHealthConfig(environment = process.env) {
   };
 }
 
-function buildAndroidDeepLinkArgs(invite, packageName = "com.yiqikan.room") {
+function buildAndroidDeepLinkArgs(invite, packageName = "com.synced.room") {
   if (typeof invite !== "string" || !invite.trim()) {
     throw new Error("Android 深链不能为空");
   }
@@ -583,8 +583,8 @@ function receiverObservationExpression({
       };
     };
     const entries = [
-      ...(window.__yiqikanRtcPeers || []),
-      ...(window.__yiqikanE2eRtcPeers || [])
+      ...(window.__syncedRtcPeers || []),
+      ...(window.__syncedE2eRtcPeers || [])
     ];
     const seen = new Set();
     const peers = entries
@@ -800,8 +800,8 @@ function senderObservationExpression({
     const durationMs = ${JSON.stringify(durationMs)};
     const sampleIntervalMs = ${JSON.stringify(sampleIntervalMs)};
     const entries = [
-      ...(window.__yiqikanRtcPeers || []),
-      ...(window.__yiqikanE2eRtcPeers || [])
+      ...(window.__syncedRtcPeers || []),
+      ...(window.__syncedE2eRtcPeers || [])
     ];
     const seen = new Set();
     const pc = entries

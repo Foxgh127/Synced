@@ -1,18 +1,18 @@
 #!/bin/sh
 set -eu
 
-source_bundle="${1:-/tmp/yiqikan-signal.mjs}"
-install_root="/opt/yiqikan"
-live_bundle="${install_root}/yiqikan-signal.mjs"
+source_bundle="${1:-/tmp/synced-signal.mjs}"
+install_root="/opt/synced"
+live_bundle="${install_root}/synced-signal.mjs"
 release_root="${install_root}/releases"
-candidate="${install_root}/.yiqikan-signal.mjs.next"
+candidate="${install_root}/.synced-signal.mjs.next"
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
-backup="${release_root}/yiqikan-signal.${timestamp}.mjs"
+backup="${release_root}/synced-signal.${timestamp}.mjs"
 install_uid=0
 install_gid=0
 install_mode=0644
 
-# Existing deployments predate the dedicated yiqikan account on some hosts.
+# Existing deployments predate the dedicated synced account on some hosts.
 # Some also use systemd DynamicUser, for which there is intentionally no
 # persistent account to chown files to. Preserve the live bundle's numeric
 # ownership and readable mode instead of assuming a local account exists.
@@ -21,7 +21,7 @@ if [ -e "$live_bundle" ]; then
   install_gid="$(stat -c %g "$live_bundle")"
   install_mode="$(stat -c %a "$live_bundle")"
 elif command -v getent >/dev/null 2>&1 &&
-  account_entry="$(getent passwd yiqikan 2>/dev/null)"; then
+  account_entry="$(getent passwd synced 2>/dev/null)"; then
   install_uid="$(printf '%s' "$account_entry" | cut -d: -f3)"
   install_gid="$(printf '%s' "$account_entry" | cut -d: -f4)"
   install_mode=0640
@@ -59,7 +59,7 @@ rollback() {
   echo "$reason; rolling back" >&2
   if [ -f "$backup" ]; then
     install -o "$install_uid" -g "$install_gid" -m "$install_mode" "$backup" "$live_bundle"
-    if systemctl restart yiqikan-signal.service &&
+    if systemctl restart synced-signal.service &&
       wait_for_health "health"; then
       echo "Previous signal bundle restored and healthy" >&2
     else
@@ -69,11 +69,11 @@ rollback() {
     # A first-time deployment has no known-good bundle to restore. Do not
     # leave the rejected candidate at the live path.
     rm -f "$live_bundle"
-    systemctl stop yiqikan-signal.service >/dev/null 2>&1 || true
+    systemctl stop synced-signal.service >/dev/null 2>&1 || true
     echo "No previous signal bundle was available; service left stopped" >&2
   fi
-  systemctl --no-pager --full status yiqikan-signal.service >&2 || true
-  journalctl -u yiqikan-signal.service -n 80 --no-pager >&2 || true
+  systemctl --no-pager --full status synced-signal.service >&2 || true
+  journalctl -u synced-signal.service -n 80 --no-pager >&2 || true
   exit 1
 }
 
@@ -104,7 +104,7 @@ fi
 
 # mv is atomic because candidate and live bundle share the same filesystem.
 mv -f "$candidate" "$live_bundle"
-if ! systemctl restart yiqikan-signal.service; then
+if ! systemctl restart synced-signal.service; then
   rollback "v3 service restart failed"
 fi
 
@@ -117,6 +117,6 @@ if [ "$healthy" != true ]; then
   rollback "v3 health check failed"
 fi
 
-systemctl is-active --quiet yiqikan-signal.service
+systemctl is-active --quiet synced-signal.service
 curl --fail --silent --show-error http://127.0.0.1:8787/healthz
 printf '\nDeployed signal protocol v3; backup: %s\n' "$backup"

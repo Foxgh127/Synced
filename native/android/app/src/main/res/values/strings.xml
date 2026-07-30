@@ -2,6 +2,6 @@
 <resources>
     <string name="app_name">同频</string>
     <string name="title_activity_main">同频</string>
-    <string name="package_name">com.yiqikan.room</string>
-    <string name="custom_url_scheme">com.yiqikan.room</string>
+    <string name="package_name">com.synced.room</string>
+    <string name="custom_url_scheme">com.synced.room</string>
 </resources>

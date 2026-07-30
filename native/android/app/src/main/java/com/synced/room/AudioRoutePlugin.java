@@ -1,4 +1,4 @@
-package com.yiqikan.room;
+package com.synced.room;
 
 import android.Manifest;
 import android.content.Context;

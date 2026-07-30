@@ -78,8 +78,8 @@ test("portable E2E bitrate ceiling is configurable but never exceeds 100 Mbps", 
   assert.equal(defaults.maxAvSkewMs, 3_000);
 
   const configured = buildHealthConfig({
-    YIQIKAN_E2E_MAX_VIDEO_BITRATE_MBPS: "24",
-    YIQIKAN_E2E_MIN_VIDEO_BITRATE_BPS: "3000000",
+    SYNCED_E2E_MAX_VIDEO_BITRATE_MBPS: "24",
+    SYNCED_E2E_MIN_VIDEO_BITRATE_BPS: "3000000",
   });
   assert.equal(configured.maxVideoBitrateBps, 24_000_000);
   assert.equal(configured.minVideoBitrateBps, 3_000_000);
@@ -87,7 +87,7 @@ test("portable E2E bitrate ceiling is configurable but never exceeds 100 Mbps", 
   assert.throws(
     () =>
       buildHealthConfig({
-        YIQIKAN_E2E_MAX_VIDEO_BITRATE_BPS: String(
+        SYNCED_E2E_MAX_VIDEO_BITRATE_BPS: String(
           SAFE_MAX_VIDEO_BITRATE_BPS + 1,
         ),
       }),
@@ -96,8 +96,8 @@ test("portable E2E bitrate ceiling is configurable but never exceeds 100 Mbps", 
   assert.throws(
     () =>
       buildHealthConfig({
-        YIQIKAN_E2E_MAX_VIDEO_BITRATE_MBPS: "20",
-        YIQIKAN_E2E_MIN_VIDEO_BITRATE_MBPS: "24",
+        SYNCED_E2E_MAX_VIDEO_BITRATE_MBPS: "20",
+        SYNCED_E2E_MIN_VIDEO_BITRATE_MBPS: "24",
       }),
     /不能大于/,
   );
@@ -108,7 +108,7 @@ test("Android deep link protects its query string from the remote adb shell", ()
     "synced://join?room=23456789&signal=wss%3A%2F%2Fsynced.com.cn%2Fsignal";
   const args = buildAndroidDeepLinkArgs(invite);
   assert.equal(args.at(-2), `'${invite}'`);
-  assert.equal(args.at(-1), "com.yiqikan.room");
+  assert.equal(args.at(-1), "com.synced.room");
 });
 
 test("receiver health summary covers video, audible audio, loss, A/V skew and ICE", () => {

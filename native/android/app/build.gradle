@@ -1,27 +1,27 @@
 apply plugin: 'com.android.application'
 
-def yiqikanSigningFile = new File(
+def syncedSigningFile = new File(
     System.getProperty("user.home"),
-    ".yiqikan/signing/keystore.properties"
+    ".synced/signing/keystore.properties"
 )
-def yiqikanSigning = new Properties()
-if (yiqikanSigningFile.exists()) {
-    yiqikanSigningFile.withInputStream { stream ->
-        yiqikanSigning.load(stream)
+def syncedSigning = new Properties()
+if (syncedSigningFile.exists()) {
+    syncedSigningFile.withInputStream { stream ->
+        syncedSigning.load(stream)
     }
 }
-def yiqikanSigningReady = [
+def syncedSigningReady = [
     "storeFile",
     "storePassword",
     "keyAlias",
     "keyPassword"
-].every { key -> yiqikanSigning.getProperty(key) }
+].every { key -> syncedSigning.getProperty(key) }
 
 android {
-    namespace "com.yiqikan.room"
+    namespace "com.synced.room"
     compileSdk rootProject.ext.compileSdkVersion
     defaultConfig {
-        applicationId "com.yiqikan.room"
+        applicationId "com.synced.room"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 281
@@ -35,11 +35,11 @@ android {
     }
     signingConfigs {
         release {
-            if (yiqikanSigningReady) {
-                storeFile file(yiqikanSigning.getProperty("storeFile"))
-                storePassword yiqikanSigning.getProperty("storePassword")
-                keyAlias yiqikanSigning.getProperty("keyAlias")
-                keyPassword yiqikanSigning.getProperty("keyPassword")
+            if (syncedSigningReady) {
+                storeFile file(syncedSigning.getProperty("storeFile"))
+                storePassword syncedSigning.getProperty("storePassword")
+                keyAlias syncedSigning.getProperty("keyAlias")
+                keyPassword syncedSigning.getProperty("keyPassword")
                 enableV1Signing false
                 enableV2Signing true
                 enableV3Signing true
@@ -53,7 +53,7 @@ android {
             minifyEnabled true
             shrinkResources true
             zipAlignEnabled true
-            if (yiqikanSigningReady) {
+            if (syncedSigningReady) {
                 signingConfig signingConfigs.release
             }
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'

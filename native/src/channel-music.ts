@@ -85,7 +85,7 @@ function musicSourceIdentity(source: CaptureSource): string {
 }
 
 function storedMusicVolume(): number {
-  const stored = localStorage.getItem("yiqikan:music-volume");
+  const stored = localStorage.getItem("synced:music-volume");
   if (stored === null) return 0.7;
   const value = Number(stored);
   return Number.isFinite(value) && value >= 0 && value <= 1 ? value : 0.7;
@@ -417,7 +417,7 @@ export class ChannelMusicController {
       ?.addEventListener("input", (event) => {
         const input = event.currentTarget as HTMLInputElement;
         this.volume = Math.min(1, Math.max(0, Number(input.value) / 100));
-        localStorage.setItem("yiqikan:music-volume", String(this.volume));
+        localStorage.setItem("synced:music-volume", String(this.volume));
         this.options
           .getCompanion()
           ?.setAccompanimentVolume(this.volume);

@@ -2,7 +2,7 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <title>YiQiKan Window Capture Smoke Source</title>
+    <title>Synced Window Capture Smoke Source</title>
     <style>
       html,
       body,
@@ -55,7 +55,7 @@
           context.fillRect(0, 0, canvas.width, canvas.height);
           context.fillStyle = "#ffffff";
           context.font = "700 64px Segoe UI";
-          context.fillText("YiQiKan GPU VIDEO", 90, 285);
+          context.fillText("Synced GPU VIDEO", 90, 285);
         }, 33);
         recorder.addEventListener("dataavailable", (event) => {
           if (event.data.size) chunks.push(event.data);

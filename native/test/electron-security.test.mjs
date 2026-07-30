@@ -68,7 +68,7 @@ test("idle app and hidden game are not globally forced to render at full speed",
   assert.doesNotMatch(mainSource, /disable-backgrounding-occluded-windows/);
   assert.match(
     mainSource,
-    /partition:\s*"persist:yiqikan-bluff",[\s\S]{0,360}?backgroundThrottling:\s*true/,
+    /partition:\s*"persist:synced-bluff",[\s\S]{0,360}?backgroundThrottling:\s*true/,
   );
   assert.match(
     mainSource,
@@ -87,7 +87,7 @@ test("music capture accepts only enumerated known process ids", () => {
 
 test("desktop clients cannot start or package a local signal server", () => {
   assert.doesNotMatch(mainSource, /startLocalSignalServer/);
-  assert.doesNotMatch(mainSource, /YIQIKAN_ENABLE_LOCAL_SIGNAL/);
+  assert.doesNotMatch(mainSource, /SYNCED_ENABLE_LOCAL_SIGNAL/);
   assert.doesNotMatch(mainSource, /createSignalServer/);
   assert.doesNotMatch(mainSource, /\.listen\(8787,\s*"0\.0\.0\.0"\)/);
   assert.ok(!packageJson.build.files.includes("server/**/*"));

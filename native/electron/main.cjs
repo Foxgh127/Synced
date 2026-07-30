@@ -60,21 +60,21 @@ const KNOWN_MUSIC_PROCESS_NAMES = [
   "qishui",
   "luna",
   ...(
-    process.env.YIQIKAN_E2E === "1" &&
+    process.env.SYNCED_E2E === "1" &&
     /^[a-z0-9._-]{1,64}$/i.test(
-      process.env.YIQIKAN_E2E_MUSIC_PROCESS || "",
+      process.env.SYNCED_E2E_MUSIC_PROCESS || "",
     )
-      ? [process.env.YIQIKAN_E2E_MUSIC_PROCESS.toLowerCase()]
+      ? [process.env.SYNCED_E2E_MUSIC_PROCESS.toLowerCase()]
       : []
   ),
 ];
 const hardenedGameSessions = new WeakSet();
-const smokeTest = process.env.YIQIKAN_SMOKE_TEST === "1";
-const e2eTest = process.env.YIQIKAN_E2E === "1";
-const e2eVisible = process.env.YIQIKAN_E2E_VISIBLE === "1";
+const smokeTest = process.env.SYNCED_SMOKE_TEST === "1";
+const e2eTest = process.env.SYNCED_E2E === "1";
+const e2eVisible = process.env.SYNCED_E2E_VISIBLE === "1";
 const isInviteUrl = (argument) =>
   typeof argument === "string" &&
-  (argument.startsWith("synced://") || argument.startsWith("yiqikan://"));
+  argument.startsWith("synced://");
 let pendingOpenUrl = process.argv.find(isInviteUrl);
 let diagnosticLogPath;
 let diagnosticBuffer = [];
@@ -90,7 +90,7 @@ let portableFirewallInFlight;
 
 protocol.registerSchemesAsPrivileged([
   {
-    scheme: "yiqikan-resource",
+    scheme: "synced-resource",
     privileges: {
       standard: true,
       secure: true,
@@ -280,7 +280,7 @@ function ensureGameView() {
       sandbox: true,
       webSecurity: true,
       spellcheck: false,
-      partition: "persist:yiqikan-bluff",
+      partition: "persist:synced-bluff",
       // A hidden game view is retained for fast return, but it must be allowed
       // to sleep while detached or it can keep rendering at full speed after
       // the user returns to the channel.
@@ -451,7 +451,7 @@ function createWindow() {
           title: document.title
         };
       })()`);
-      const smokeView = process.env.YIQIKAN_SMOKE_VIEW;
+      const smokeView = process.env.SYNCED_SMOKE_VIEW;
       if (smokeView === "host" || smokeView === "channel") {
         await mainWindow.webContents.executeJavaScript(
           `document.querySelector("#choose-host")?.click()`,
@@ -485,11 +485,11 @@ function createWindow() {
           document.querySelector(".participant-row")
         )`);
       }
-      if (process.env.YIQIKAN_SMOKE_SCREENSHOT) {
+      if (process.env.SYNCED_SMOKE_SCREENSHOT) {
         const image = await mainWindow.webContents.capturePage();
-        fs.writeFileSync(process.env.YIQIKAN_SMOKE_SCREENSHOT, image.toPNG());
+        fs.writeFileSync(process.env.SYNCED_SMOKE_SCREENSHOT, image.toPNG());
       }
-      console.log(`YIQIKAN_SMOKE ${JSON.stringify(result)}`);
+      console.log(`SYNCED_SMOKE ${JSON.stringify(result)}`);
       const channelPassed = smokeView !== "channel" || result.channelReady;
       app.exit(
         result.desktopBridge &&
@@ -499,7 +499,7 @@ function createWindow() {
           : 1,
       );
     } catch (error) {
-      console.error("YIQIKAN_SMOKE_FAILED", error);
+      console.error("SYNCED_SMOKE_FAILED", error);
       app.exit(1);
     }
   });
@@ -541,7 +541,7 @@ function createWindow() {
     const windowToMinimize = mainWindow;
     void windowToMinimize.webContents
       .executeJavaScript(
-        "Promise.resolve(globalThis.__yiqikanEnterMiniWindowForMinimize?.() ?? false)",
+        "Promise.resolve(globalThis.__syncedEnterMiniWindowForMinimize?.() ?? false)",
         true,
       )
       .then((entered) => {
@@ -591,7 +591,7 @@ function createWindow() {
     overlayWindow = undefined;
   });
 
-  const devUrl = process.env.YIQIKAN_DEV_URL;
+  const devUrl = process.env.SYNCED_DEV_URL;
   let trustedDevUrl = false;
   if (!app.isPackaged && devUrl) {
     try {
@@ -742,9 +742,9 @@ function sourceVisualActivity(source) {
 
 function audioHelperPath() {
   if (app.isPackaged) {
-    return path.join(process.resourcesPath, "audio-helper", "YiQiKan.AudioCapture.exe");
+    return path.join(process.resourcesPath, "audio-helper", "Synced.AudioCapture.exe");
   }
-  return path.join(__dirname, "..", "audio-helper", "publish", "win-x64", "YiQiKan.AudioCapture.exe");
+  return path.join(__dirname, "..", "audio-helper", "publish", "win-x64", "Synced.AudioCapture.exe");
 }
 
 async function inspectWindowProcesses(sourceIds) {
@@ -907,7 +907,7 @@ async function inspectAndRepairPortableFirewallRules(executable) {
     diagnostic("firewall-ready", { executable });
     return { portable: true, configured: true, repaired: false };
   }
-  if (process.env.YIQIKAN_SKIP_FIREWALL_REPAIR === "1") {
+  if (process.env.SYNCED_SKIP_FIREWALL_REPAIR === "1") {
     diagnostic("firewall-repair-skipped-for-test", { executable });
     return { portable: true, configured: false, repaired: false };
   }
@@ -915,10 +915,10 @@ async function inspectAndRepairPortableFirewallRules(executable) {
   const netsh = path.join(systemRoot, "System32", "netsh.exe");
   const commands = [];
   for (const legacyRuleName of [
-    "YiQiKan P2P UDP",
-    "YiQiKan P2P TCP",
-    "YiQiKan P2P UDP v2",
-    "YiQiKan P2P TCP v2",
+    "Synced P2P UDP",
+    "Synced P2P TCP",
+    "Synced P2P UDP v2",
+    "Synced P2P TCP v2",
   ]) {
     commands.push(
       `& ${quotePowerShell(netsh)} @('advfirewall','firewall','delete','rule',${quotePowerShell(`name=${legacyRuleName}`)}) | Out-Null`,
@@ -1540,7 +1540,7 @@ app.whenReady().then(() => {
     executable: process.execPath,
     audioHelperExists: fs.existsSync(audioHelperPath()),
   });
-  protocol.handle("yiqikan-resource", async (request) => {
+  protocol.handle("synced-resource", async (request) => {
     const url = new URL(request.url);
     const relativePath = decodeURIComponent(url.pathname)
       .replace(/^\/+/, "")
@@ -1574,10 +1574,8 @@ app.whenReady().then(() => {
     }
   });
   if (app.isPackaged) {
-    app.setAsDefaultProtocolClient("yiqikan");
     app.setAsDefaultProtocolClient("synced");
   } else if (process.defaultApp && process.argv[1]) {
-    app.setAsDefaultProtocolClient("yiqikan", process.execPath, [path.resolve(process.argv[1])]);
     app.setAsDefaultProtocolClient("synced", process.execPath, [path.resolve(process.argv[1])]);
   }
   session.defaultSession.setDisplayMediaRequestHandler(async (request, callback) => {

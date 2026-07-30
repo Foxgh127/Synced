@@ -168,7 +168,7 @@ async function probe(socket, index) {
 
 function usage() {
   return [
-    "YiQiKan signal v3 bounded load test",
+    "Synced signal v3 bounded load test",
     "",
     "node server/load-test.mjs [options]",
     "  --url ws://127.0.0.1:8787/signal",
@@ -176,7 +176,7 @@ function usage() {
     "  --duration 20             ping soak duration in seconds (2-300)",
     "  --throughput-clients 2    clients running a 512 KiB v2 probe (0-8)",
     "",
-    "Remote targets require YIQIKAN_LOADTEST_ALLOW_REMOTE=true.",
+    "Remote targets require SYNCED_LOADTEST_ALLOW_REMOTE=true.",
   ].join("\n");
 }
 
@@ -190,9 +190,9 @@ if (!["ws:", "wss:"].includes(url.protocol) || url.pathname !== "/signal") {
   throw new Error("--url must be a ws(s):// URL ending in /signal");
 }
 const localTarget = ["127.0.0.1", "::1", "localhost"].includes(url.hostname);
-if (!localTarget && process.env.YIQIKAN_LOADTEST_ALLOW_REMOTE !== "true") {
+if (!localTarget && process.env.SYNCED_LOADTEST_ALLOW_REMOTE !== "true") {
   throw new Error(
-    "Refusing a remote load test without YIQIKAN_LOADTEST_ALLOW_REMOTE=true",
+    "Refusing a remote load test without SYNCED_LOADTEST_ALLOW_REMOTE=true",
   );
 }
 

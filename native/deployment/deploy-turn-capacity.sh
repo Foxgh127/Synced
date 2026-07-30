@@ -4,14 +4,14 @@ set -eu
 # Kept under the historical filename so existing runbooks continue to work.
 # This migration removes every coturn/signal bandwidth ceiling.
 turn_config="${TURN_CONFIG_FILE:-/etc/turnserver.conf}"
-signal_env="${SIGNAL_ENV_FILE:-/etc/yiqikan-signal.env}"
-backup_root="${BACKUP_ROOT:-/etc/yiqikan-backups}"
+signal_env="${SIGNAL_ENV_FILE:-/etc/synced-signal.env}"
+backup_root="${BACKUP_ROOT:-/etc/synced-backups}"
 turn_min_port="${TURN_MIN_PORT:-32768}"
 turn_max_port="${TURN_MAX_PORT:-65535}"
 turn_max_allocate_lifetime="${TURN_MAX_ALLOCATE_LIFETIME:-7200}"
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
 turn_backup="${backup_root}/turnserver.conf.${timestamp}"
-signal_backup="${backup_root}/yiqikan-signal.env.${timestamp}"
+signal_backup="${backup_root}/synced-signal.env.${timestamp}"
 turn_candidate="${turn_config}.next.$$"
 signal_candidate="${signal_env}.next.$$"
 
@@ -139,9 +139,9 @@ rollback() {
   cp -a "$turn_backup" "$turn_config"
   cp -a "$signal_backup" "$signal_env"
   systemctl restart coturn.service >/dev/null 2>&1 || true
-  systemctl restart yiqikan-signal.service >/dev/null 2>&1 || true
+  systemctl restart synced-signal.service >/dev/null 2>&1 || true
   systemctl --no-pager --full status coturn.service >&2 || true
-  systemctl --no-pager --full status yiqikan-signal.service >&2 || true
+  systemctl --no-pager --full status synced-signal.service >&2 || true
   exit 1
 }
 
@@ -202,7 +202,7 @@ if ! systemctl is-active --quiet coturn.service ||
   ! ss -H -ltn | grep -Eq ':3478[[:space:]]'; then
   rollback "coturn listeners did not become healthy"
 fi
-if ! systemctl restart yiqikan-signal.service || ! wait_for_signal; then
+if ! systemctl restart synced-signal.service || ! wait_for_signal; then
   rollback "signal service failed after removing bandwidth limits"
 fi
 

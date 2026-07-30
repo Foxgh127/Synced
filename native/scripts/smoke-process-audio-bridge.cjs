@@ -1,4 +1,4 @@
-process.env.YIQIKAN_E2E = "1";
+process.env.SYNCED_E2E = "1";
 
 const { spawn } = require("node:child_process");
 const path = require("node:path");
@@ -56,7 +56,7 @@ async function main() {
         .executeJavaScript(`(async () => {
           const sources = await window.roomDesktop.listSources();
           return sources.find(
-            (source) => source.name === "YiQiKan Native Process Audio Smoke",
+            (source) => source.name === "Synced Native Process Audio Smoke",
           )?.id || "";
         })()`)
         .catch(() => ""),

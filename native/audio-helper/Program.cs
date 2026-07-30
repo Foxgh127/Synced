@@ -9,7 +9,7 @@ using NAudio.CoreAudioApi;
 using NAudio.CoreAudioApi.Interfaces;
 using NAudio.Wave;
 
-namespace YiQiKan.AudioCapture;
+namespace Synced.AudioCapture;
 
 internal sealed class StatusPayload
 {
@@ -199,7 +199,7 @@ internal static class Program
             )
             {
                 return Fail(
-                    "用法：YiQiKan.AudioCapture --capture-window <窗口句柄> 或 --capture-process <进程 ID>"
+                    "用法：Synced.AudioCapture --capture-window <窗口句柄> 或 --capture-process <进程 ID>"
                 );
             }
 

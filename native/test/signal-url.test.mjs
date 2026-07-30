@@ -78,7 +78,7 @@ test("accepts only canonical app invitations with a valid room and signal URL", 
   assert.equal(invite.startsWith("synced://join?"), true);
   assert.deepEqual(
     parseJoinLink(
-      "yiqikan://join?room=A7K9P2WX&signal=wss://47.98.173.139/signal",
+      "synced://join?room=A7K9P2WX&signal=wss://47.98.173.139/signal",
     ),
     {
       room: "A7K9P2WX",
@@ -94,13 +94,13 @@ test("accepts only canonical app invitations with a valid room and signal URL", 
   );
   assert.deepEqual(
     parseJoinLink(
-      "yiqikan://join?room=INVALID1&signal=wss://signal.example.test",
+      "synced://join?room=INVALID1&signal=wss://signal.example.test",
     ),
     {},
   );
   assert.deepEqual(
     parseJoinLink(
-      "yiqikan://join?room=A7K9P2WX&signal=https://attacker.example",
+      "synced://join?room=A7K9P2WX&signal=https://attacker.example",
     ),
     {},
   );

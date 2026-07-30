@@ -7,7 +7,7 @@ const {
 } = require("electron");
 const path = require("node:path");
 
-const SOURCE_TITLE = "YiQiKan Window Capture Smoke Source";
+const SOURCE_TITLE = "Synced Window Capture Smoke Source";
 
 async function main() {
   app.commandLine.appendSwitch("autoplay-policy", "no-user-gesture-required");

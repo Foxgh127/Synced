@@ -346,7 +346,7 @@ export async function openChannelSession(
   let fullscreenChangeHandler: (() => void) | undefined;
   let removeMainWindowRestoredListener: (() => void) | undefined;
   let pictureInPictureOwnsWindowMinimize = false;
-  const miniWindowPreferenceKey = "yiqikan:mini-window-enabled";
+  const miniWindowPreferenceKey = "synced:mini-window-enabled";
   let miniWindowEnabled =
     localStorage.getItem(miniWindowPreferenceKey) === "true";
   let signalReconnectTimer: number | undefined;
@@ -441,10 +441,10 @@ export async function openChannelSession(
   document.body.classList.toggle("native-android", nativeAndroid);
   const nativeAutoplay = desktop || nativeAndroid;
   const savedMovieVolumeValue =
-    localStorage.getItem("yiqikan:movie-volume");
+    localStorage.getItem("synced:movie-volume");
   const savedMovieVolume = Number(savedMovieVolumeValue ?? "1");
   const savedMovieMuteWasExplicit =
-    localStorage.getItem("yiqikan:movie-muted-explicit") === "true";
+    localStorage.getItem("synced:movie-muted-explicit") === "true";
   let movieVolume = Number.isFinite(savedMovieVolume)
     ? Math.max(
         0,
@@ -581,23 +581,23 @@ export async function openChannelSession(
   let captureSourceGeometry: CaptureWindowGeometry | undefined;
   const captureVideoHealth = new CaptureVideoHealthController();
 
-  const savedResolution = localStorage.getItem("yiqikan:resolution");
+  const savedResolution = localStorage.getItem("synced:resolution");
   let resolutionKey: ResolutionKey = isResolutionKey(savedResolution)
     ? savedResolution
     : "original";
-  const savedFrameRate = Number(localStorage.getItem("yiqikan:frame-rate"));
+  const savedFrameRate = Number(localStorage.getItem("synced:frame-rate"));
   let frameRate: FrameRateOption = isFrameRateOption(savedFrameRate)
     ? savedFrameRate
     : 30;
   let embyFrameRate = normalizeEmbyFrameRate(
-    localStorage.getItem("yiqikan:emby-frame-rate"),
+    localStorage.getItem("synced:emby-frame-rate"),
   );
   // Every new broadcast starts at the source's full quality. Viewer reductions
   // are deliberately session-scoped so yesterday's reduced choice cannot make
   // a later full-quality broadcast look unexpectedly soft.
   let preferredHeight = 0;
   let preferredFrameRate = 0;
-  const savedFullscreenFit = localStorage.getItem("yiqikan:fullscreen-fit");
+  const savedFullscreenFit = localStorage.getItem("synced:fullscreen-fit");
   let fullscreenFit: "smart" | "contain" | "cover" =
     savedFullscreenFit === "contain" || savedFullscreenFit === "cover"
       ? savedFullscreenFit
@@ -608,8 +608,8 @@ export async function openChannelSession(
     fullscreenFit = "contain";
   }
   let highlightCorrection =
-    localStorage.getItem("yiqikan:highlight-correction") === "true";
-  const resumeTokenKey = `yiqikan:resume-token:${room}`;
+    localStorage.getItem("synced:highlight-correction") === "true";
+  const resumeTokenKey = `synced:resume-token:${room}`;
   let resumeToken = localStorage.getItem(resumeTokenKey) || "";
   if (!/^[a-z0-9-]{16,128}$/i.test(resumeToken)) {
     resumeToken =
@@ -1053,7 +1053,7 @@ export async function openChannelSession(
                   <span>密码不会保存；登录令牌由 Windows 系统加密后保留在本机，不会发送到房间或朋友设备。</span>
                 </div>
                 <form id="emby-login-form" class="emby-login-form">
-                  ${embyEndpointEditorMarkup("login", localStorage.getItem("yiqikan:emby-server") || "")}
+                  ${embyEndpointEditorMarkup("login", localStorage.getItem("synced:emby-server") || "")}
                   <label><span>用户名</span><input id="emby-username" type="text" required autocomplete="username" maxlength="128" /></label>
                   <label><span>密码</span><input id="emby-password" type="password" autocomplete="current-password" maxlength="1024" placeholder="无密码账户可留空" /></label>
                   <label class="emby-http-consent"><input id="emby-allow-http" type="checkbox" /><span>允许可信局域网中的未加密 HTTP（登录密码会经过局域网明文传输）</span></label>
@@ -1792,9 +1792,9 @@ export async function openChannelSession(
     movieVolume = Math.max(0, Math.min(1, Number(value) || 0));
     if (movieVolume > 0) lastAudibleMovieVolume = movieVolume;
     if (persist) {
-      localStorage.setItem("yiqikan:movie-volume", String(movieVolume));
+      localStorage.setItem("synced:movie-volume", String(movieVolume));
       localStorage.setItem(
-        "yiqikan:movie-muted-explicit",
+        "synced:movie-muted-explicit",
         String(movieVolume <= 0),
       );
     }
@@ -7607,7 +7607,7 @@ export async function openChannelSession(
     setEndpointEditorUrls(
       context,
       context === "login"
-        ? [localStorage.getItem("yiqikan:emby-server") || ""]
+        ? [localStorage.getItem("synced:emby-server") || ""]
         : [""],
     );
     editor.addEventListener("click", (event) => {
@@ -7987,7 +7987,7 @@ export async function openChannelSession(
       );
       embyAccounts = state.accounts;
       embyAccountPersistence = state.persistence;
-      localStorage.setItem("yiqikan:emby-server", serverUrls[0]);
+      localStorage.setItem("synced:emby-server", serverUrls[0]);
       resetEmbyBrowser();
       setEmbyLoginUi(true);
       await loadEmbyLibraries();
@@ -9508,7 +9508,7 @@ export async function openChannelSession(
       frameRateSelect?.value || embyFrameRate,
     );
     localStorage.setItem(
-      "yiqikan:emby-frame-rate",
+      "synced:emby-frame-rate",
       String(embyFrameRate),
     );
     const compatibilityDowngrade =
@@ -10013,7 +10013,7 @@ export async function openChannelSession(
       : ["smart", "contain", "cover"];
     const currentIndex = modes.indexOf(fullscreenFit);
     fullscreenFit = modes[(currentIndex + 1) % modes.length] ?? "smart";
-    localStorage.setItem("yiqikan:fullscreen-fit", fullscreenFit);
+    localStorage.setItem("synced:fullscreen-fit", fullscreenFit);
     updateFullscreenFitUi();
     void resolveFullscreenFit();
   }
@@ -11060,10 +11060,10 @@ export async function openChannelSession(
     }
     pictureInPictureOwnsWindowMinimize = false;
     if (
-      window.__yiqikanEnterMiniWindowForMinimize ===
+      window.__syncedEnterMiniWindowForMinimize ===
       enterMiniWindowForMinimize
     ) {
-      delete window.__yiqikanEnterMiniWindowForMinimize;
+      delete window.__syncedEnterMiniWindowForMinimize;
     }
     window.roomDesktop?.setMiniWindowEnabled(false);
     removeMainWindowRestoredListener?.();
@@ -11288,7 +11288,7 @@ export async function openChannelSession(
     .querySelector("#dock-smart-crop")
     ?.addEventListener("click", () => {
       fullscreenFit = fullscreenFit === "smart" ? "contain" : "smart";
-      localStorage.setItem("yiqikan:fullscreen-fit", fullscreenFit);
+      localStorage.setItem("synced:fullscreen-fit", fullscreenFit);
       updateFullscreenFitUi();
       void resolveFullscreenFit();
       const btn = document.getElementById("dock-smart-crop");
@@ -11633,7 +11633,7 @@ export async function openChannelSession(
         (event.target as HTMLSelectElement).value,
       );
       localStorage.setItem(
-        "yiqikan:emby-frame-rate",
+        "synced:emby-frame-rate",
         String(embyFrameRate),
       );
       const launchFrameRate =
@@ -11674,7 +11674,7 @@ export async function openChannelSession(
             : button.dataset.fitMode === "cover"
               ? "cover"
               : "smart";
-        localStorage.setItem("yiqikan:fullscreen-fit", fullscreenFit);
+        localStorage.setItem("synced:fullscreen-fit", fullscreenFit);
         updateFullscreenFitUi();
         void resolveFullscreenFit();
       });
@@ -11682,7 +11682,7 @@ export async function openChannelSession(
   highlightCorrectionInput?.addEventListener("change", () => {
     highlightCorrection = highlightCorrectionInput.checked;
     localStorage.setItem(
-      "yiqikan:highlight-correction",
+      "synced:highlight-correction",
       String(highlightCorrection),
     );
     applyHighlightCorrection();
@@ -11788,7 +11788,7 @@ export async function openChannelSession(
         (event.currentTarget as HTMLSelectElement).value,
       );
       localStorage.setItem(
-        "yiqikan:emby-frame-rate",
+        "synced:emby-frame-rate",
         String(embyFrameRate),
       );
     });
@@ -11808,8 +11808,8 @@ export async function openChannelSession(
         });
         resolutionKey = selected.resolution;
         frameRate = selected.frameRate;
-        localStorage.setItem("yiqikan:resolution", resolutionKey);
-        localStorage.setItem("yiqikan:frame-rate", String(frameRate));
+        localStorage.setItem("synced:resolution", resolutionKey);
+        localStorage.setItem("synced:frame-rate", String(frameRate));
         syncBroadcastQualityUi();
       });
     });
@@ -11820,7 +11820,7 @@ export async function openChannelSession(
         qualitySelectionTouched = true;
         frameRateLockedByUser = true;
         frameRate = Number(button.dataset.sessionFrameRate) as FrameRateOption;
-        localStorage.setItem("yiqikan:frame-rate", String(frameRate));
+        localStorage.setItem("synced:frame-rate", String(frameRate));
         syncBroadcastQualityUi();
       });
     });
@@ -11925,7 +11925,7 @@ export async function openChannelSession(
       pictureInPictureOwnsWindowMinimize = false;
       void document.exitPictureInPicture().catch(() => undefined);
     });
-  window.__yiqikanEnterMiniWindowForMinimize =
+  window.__syncedEnterMiniWindowForMinimize =
     enterMiniWindowForMinimize;
   window.roomDesktop?.setMiniWindowEnabled(miniWindowEnabled);
   updatePictureInPictureButton();

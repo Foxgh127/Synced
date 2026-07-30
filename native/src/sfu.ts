@@ -10,9 +10,9 @@ import {
   type LocalTrackPublication,
 } from "livekit-client";
 
-export const SFU_EMBY_MEDIA_TRACK = "yiqikan-emby-media";
-export const SFU_EMBY_CONTROL_TRACK = "yiqikan-emby-control";
-const SFU_EMBY_VIEWER_CONTROL_TOPIC = "yiqikan:emby-viewer-control";
+export const SFU_EMBY_MEDIA_TRACK = "synced-emby-media";
+export const SFU_EMBY_CONTROL_TRACK = "synced-emby-control";
+const SFU_EMBY_VIEWER_CONTROL_TOPIC = "synced:emby-viewer-control";
 const DATA_KIND_TEXT = 0;
 const DATA_KIND_BINARY = 1;
 const SFU_DATA_SEND_TIMEOUT_MS = 5_000;
@@ -108,7 +108,7 @@ class SfuRtcDataChannel extends EventTarget {
   readonly maxRetransmits = null;
   readonly negotiated = false;
   readonly ordered = true;
-  readonly protocol = "yiqikan-sfu";
+  readonly protocol = "synced-sfu";
   bufferedAmount = 0;
   bufferedAmountLowThreshold = 0;
   readyState: RTCDataChannelState = "connecting";
@@ -468,14 +468,14 @@ export class SfuSession {
     if (!this.isCurrentPublication(room, publicationGeneration)) {
       throw new DOMException("SFU publication was replaced", "AbortError");
     }
-    const streamName = "yiqikan-screen";
+    const streamName = "synced-screen";
     for (const sourceTrack of stream.getTracks()) {
       const track = sourceTrack.clone();
       const publishing = room.localParticipant.publishTrack(track, {
         name:
           sourceTrack.kind === "video"
-            ? "yiqikan-screen-video"
-            : "yiqikan-screen-audio",
+            ? "synced-screen-video"
+            : "synced-screen-audio",
         source:
           sourceTrack.kind === "video"
             ? Track.Source.ScreenShare

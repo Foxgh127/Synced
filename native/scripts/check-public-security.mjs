@@ -9,7 +9,7 @@ const sockets = new Set();
 const startedAt = Date.now();
 
 function trace(label) {
-  if (process.env.YIQIKAN_CHECK_DEBUG === "1") {
+  if (process.env.SYNCED_CHECK_DEBUG === "1") {
     console.error(
       `[security-check +${((Date.now() - startedAt) / 1_000).toFixed(1)}s] ${label}`,
     );

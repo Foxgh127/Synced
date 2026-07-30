@@ -1,4 +1,4 @@
-package com.yiqikan.room;
+package com.synced.room;
 
 import android.content.ClipData;
 import android.content.ClipboardManager;

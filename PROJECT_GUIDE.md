@@ -166,7 +166,7 @@ flowchart LR
 6. 渲染器中的 AudioWorklet 把 PCM 变成 `MediaStreamTrack`。
 7. 该音轨与窗口视频轨一起放入电影 `MediaStream`。
 
-这不会采集系统所有声音，也不会把“一起看”自己的连麦声再次混入电影。受 DRM 保护的内容仍可能被 Windows 或播放器阻止。
+这不会采集系统所有声音，也不会把“同频”自己的连麦声再次混入电影。受 DRM 保护的内容仍可能被 Windows 或播放器阻止。
 
 ### 4.5 建立电影 WebRTC
 
@@ -607,7 +607,7 @@ Electron 保持 `contextIsolation: true`、`nodeIntegration: false`、`sandbox: 
 | `NetworkBridgePlugin.java` | 识别物理网络和 IPv4，避免把 VPN/TUN 误当局域网 |
 | `PlaybackControlsPlugin.java` | 应用窗口亮度和音乐流音量 |
 | `NativeClipboardPlugin.java` | Android 剪贴板，仅写入邀请信息，不回读用户剪贴板 |
-| `AndroidManifest.xml` | 网络、录音、音频设置、蓝牙权限与 `yiqikan://join` 深链 |
+| `AndroidManifest.xml` | 网络、录音、音频设置、蓝牙权限与 `synced://join` 深链 |
 | `network_security_config.xml` | Android 网络安全策略 |
 | `app/build.gradle` | 版本、签名、SDK 与 APK 构建 |
 | `res/` | 图标、启动图、主题和布局 |
@@ -615,13 +615,13 @@ Electron 保持 `contextIsolation: true`、`nodeIntegration: false`、`sandbox: 
 ### 8.6 `native/server/` 与 `native/deployment/`
 
 - `server/index.mjs`：全部频道协议、临时 TURN 凭证、限流、心跳、恢复和管理操作。
-- `deployment/nginx-yiqikan-signal-location.conf`：腾讯云信令、SFU 和凭据刷新路由。
-- `deployment/nginx-yiqikan-standby.conf`：阿里云仅信令反代，不含媒体路由。
+- `deployment/nginx-synced-signal-location.conf`：腾讯云信令、SFU 和凭据刷新路由。
+- `deployment/nginx-synced-standby.conf`：阿里云仅信令反代，不含媒体路由。
 - `deployment/docker-compose.yml`：腾讯云完整主节点部署。
-- `deployment/yiqikan-signal.service`：两节点共用的 systemd 信令服务。
-- `deployment/yiqikan-signal.env.example`：腾讯云环境变量模板。
-- `deployment/yiqikan-signal-hz.env.example`：阿里云备用信令模板。
-- `deployment/99-yiqikan-network.conf`：Linux 网络缓冲和 TCP 探测参数。
+- `deployment/synced-signal.service`：两节点共用的 systemd 信令服务。
+- `deployment/synced-signal.env.example`：腾讯云环境变量模板。
+- `deployment/synced-signal-hz.env.example`：阿里云备用信令模板。
+- `deployment/99-synced-network.conf`：Linux 网络缓冲和 TCP 探测参数。
 - `deployment/README.md`：运维部署的更细说明。
 
 ### 8.7 测试与脚本
@@ -672,7 +672,7 @@ Electron 保持 `contextIsolation: true`、`nodeIntegration: false`、`sandbox: 
 | Windows 电影声音 | `native/audio-helper/Program.cs`, `native/src/process-audio.ts` |
 | 连麦 | `native/src/voice.ts` |
 | 默认通话处理/强降噪模型 | `native/src/voice-processing.ts`, `native/src/deepfilter-noise-suppressor.ts`, `native/public/models/` |
-| Android 声音路由 | `native/android/app/src/main/java/com/yiqikan/room/AudioRoutePlugin.java` |
+| Android 声音路由 | `native/android/app/src/main/java/com/synced/room/AudioRoutePlugin.java` |
 | 聊天、时间戳、成员区 | `native/src/room-companion.ts` |
 | 弹幕 | `native/src/danmaku-overlay.ts`, `native/electron/overlay.html` |
 | 信令协议与权限 | `native/server/index.mjs`, `native/src/rtc.ts` |
@@ -777,7 +777,7 @@ cd android
 npm run apk:release
 ```
 
-正式脚本会自动寻找 `native/.toolchains/jdk/`；签名配置位于当前用户的 `.yiqikan/signing/keystore.properties`，不得提交到 Git。
+正式脚本会自动寻找 `native/.toolchains/jdk/`；签名配置位于当前用户的 `.synced/signing/keystore.properties`，不得提交到 Git。
 
 输出：
 
@@ -814,7 +814,7 @@ npm test
 1. Windows 必须为 10 2004 / build 19041 或更高。
 2. 确认选中的是实际播放窗口，不是启动器或封面窗口。
 3. 电影播放器必须正在输出声音。
-4. 检查 `YiQiKan.AudioCapture.exe` 是否随包存在。
+4. 检查 `Synced.AudioCapture.exe` 是否随包存在。
 5. DRM 影片可能禁止系统采集。
 6. 同一播放器的多窗口若共用进程，声音按进程树而非单个音频会话隔离。
 
@@ -874,8 +874,8 @@ app.getPath("userData")/logs/portable.log
 服务端用 systemd 时看：
 
 ```bash
-journalctl -u yiqikan-signal -f
-journalctl -u yiqikan-livekit -f  # 仅腾讯云
+journalctl -u synced-signal -f
+journalctl -u synced-livekit -f  # 仅腾讯云
 journalctl -u coturn -f           # 仅腾讯云
 ```
 

@@ -15,29 +15,29 @@ export async function generateMetadata(): Promise<Metadata> {
 
   return {
     metadataBase: new URL(origin),
-    title: "一起看｜一键分享，一起看电影",
+    title: "同频｜一键分享，同频观影",
     description:
       "选择电影窗口，自动请求共享画面与声音，生成一个朋友打开就能看的低延迟链接。",
-    applicationName: "一起看",
+    applicationName: "同频",
     openGraph: {
       type: "website",
       locale: "zh_CN",
-      title: "一起看｜一键分享，一起看电影",
+      title: "同频｜一键分享，同频观影",
       description: "选择窗口，生成链接，朋友打开即看。",
       url: origin,
-      siteName: "一起看",
+      siteName: "同频",
       images: [
         {
           url: `${origin}/og.png`,
           width: 1200,
           height: 630,
-          alt: "一起看，一键分享，一起看电影",
+          alt: "同频，一键分享，同步观影",
         },
       ],
     },
     twitter: {
       card: "summary_large_image",
-      title: "一起看｜一键分享，一起看电影",
+      title: "同频｜一键分享，同频观影",
       description: "选择窗口，生成链接，朋友打开即看。",
       images: [`${origin}/og.png`],
     },

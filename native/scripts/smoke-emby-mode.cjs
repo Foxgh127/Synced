@@ -189,7 +189,7 @@ const browserBundle = buildSync({
             pc.addEventListener("connectionstatechange", () => {
               state.connected = pc.connectionState === "connected";
             });
-            const channel = pc.createDataChannel("yiqikan-emby-v1", {
+            const channel = pc.createDataChannel("synced-emby-v1", {
               ordered: false,
             });
             state.channel = channel;
@@ -213,7 +213,7 @@ const browserBundle = buildSync({
               state.connected = pc.connectionState === "connected";
             });
             pc.addEventListener("datachannel", (event) => {
-              if (event.channel.label !== "yiqikan-emby-v1") {
+              if (event.channel.label !== "synced-emby-v1") {
                 event.channel.close();
                 return;
               }
@@ -588,7 +588,7 @@ async function main() {
   app.commandLine.appendSwitch("disable-background-timer-throttling");
   await app.whenReady();
 
-  const temporary = mkdtempSync(path.join(os.tmpdir(), "yiqikan-emby-e2e-"));
+  const temporary = mkdtempSync(path.join(os.tmpdir(), "synced-emby-e2e-"));
   const fixture = path.join(temporary, "fixture.mp4");
   makeFixture(fixture);
   const mock = await createMockEmby(fixture);

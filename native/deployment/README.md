@@ -36,7 +36,7 @@ TURN_REALM=synced.com.cn
 TURN_URLS=turn:43.161.195.12:3478?transport=udp,turn:43.161.195.12:3478?transport=tcp
 SFU_ENABLED=true
 SFU_PUBLIC_URL=wss://synced.com.cn/sfu
-LIVEKIT_API_KEY=yiqikan_sfu
+LIVEKIT_API_KEY=synced_sfu
 ```
 
 启动并核验：
@@ -57,7 +57,7 @@ Compose 固定使用 `livekit/livekit-server:v1.13.4` 与
 
 ## 反向代理与防火墙
 
-主节点的 `nginx-yiqikan-signal-location.conf` 包含：
+主节点的 `nginx-synced-signal-location.conf` 包含：
 
 - `/signal` → `127.0.0.1:8787`
 - `/sfu/` → `127.0.0.1:7880/`，保留 WebSocket upgrade
@@ -90,14 +90,14 @@ npm run check:public:sfu
 
 ## 备用信令节点
 
-杭州节点只运行 `yiqikan-signal.service`、Nginx 和证书续签。不要在该节点安装或
+杭州节点只运行 `synced-signal.service`、Nginx 和证书续签。不要在该节点安装或
 启动 coturn、STUN、LiveKit、媒体端口兼容代理或 Docker 媒体容器。
 
 备用节点使用：
 
-- `yiqikan-signal-hz.env.example`：8 人房间、腾讯云 STUN/TURN、腾讯云 LiveKit；
-- `yiqikan-signal.service`：仅监听 `127.0.0.1:8787`；
-- `nginx-yiqikan-standby.conf`：只暴露 `/signal`、`/iceservers` 和健康检查；
+- `synced-signal-hz.env.example`：8 人房间、腾讯云 STUN/TURN、腾讯云 LiveKit；
+- `synced-signal.service`：仅监听 `127.0.0.1:8787`；
+- `nginx-synced-standby.conf`：只暴露 `/signal`、`/iceservers` 和健康检查；
 - `deploy-standby-routing.sh`：需要调整 ICE 路由时执行原子更新和回滚。
 
 它仍需持有与腾讯云主节点相同的 TURN secret 和 LiveKit API secret，仅用于签发
@@ -117,48 +117,48 @@ UDP `443`、TCP/UDP `3478`、LiveKit 端口或 relay 端口范围。`MAX_CLIENTS
 npm run bundle:signal
 ```
 
-将 `release/server/yiqikan-signal.mjs` 与 `deploy-signal-v3.sh` 传到服务器临时
+将 `release/server/synced-signal.mjs` 与 `deploy-signal-v3.sh` 传到服务器临时
 目录，然后执行：
 
 ```bash
 chmod 700 /tmp/deploy-signal-v3.sh
 EXPECTED_SHA256='<发布清单中的哈希>' \
-  /tmp/deploy-signal-v3.sh /tmp/yiqikan-signal.mjs
+  /tmp/deploy-signal-v3.sh /tmp/synced-signal.mjs
 ```
 
 脚本会先执行语法检查、原子替换并验证 `/capabilities`。失败时恢复
-`/opt/yiqikan/releases/` 中的上一份信令文件。
+`/opt/synced/releases/` 中的上一份信令文件。
 
-现有 systemd 主机还需把以下变量加入 `/etc/yiqikan-signal.env`：
+现有 systemd 主机还需把以下变量加入 `/etc/synced-signal.env`：
 
 ```dotenv
 MAX_VIEWERS_PER_ROOM=7
 SFU_ENABLED=true
 SFU_PUBLIC_URL=wss://synced.com.cn/sfu
-LIVEKIT_API_KEY=yiqikan_sfu
-LIVEKIT_API_SECRET_FILE=/etc/yiqikan-livekit.secret
+LIVEKIT_API_KEY=synced_sfu
+LIVEKIT_API_SECRET_FILE=/etc/synced-livekit.secret
 ```
 
-`/etc/yiqikan-livekit.secret` 应为 `root:yiqikan 0640`，并与 LiveKit 服务配置
+`/etc/synced-livekit.secret` 应为 `root:synced 0640`，并与 LiveKit 服务配置
 中的 API secret 完全一致。
 
-主节点沿用 systemd 时，使用仓库中的 `yiqikan-livekit.service`、
-`yiqikan-livekit.env.example`、`livekit-entrypoint.sh` 和
-`nginx-yiqikan-signal-location.conf`。LiveKit 官方二进制固定为 v1.13.4；
+主节点沿用 systemd 时，使用仓库中的 `synced-livekit.service`、
+`synced-livekit.env.example`、`livekit-entrypoint.sh` 和
+`nginx-synced-signal-location.conf`。LiveKit 官方二进制固定为 v1.13.4；
 下载 `livekit_1.13.4_linux_amd64.tar.gz` 后必须按官方 `checksums.txt` 校验，
 再安装为 `/usr/local/bin/livekit-server`。部署文件位置如下：
 
 ```text
-/opt/yiqikan/livekit-entrypoint.sh
-/etc/yiqikan-livekit.env
-/etc/yiqikan-livekit.secret
-/etc/systemd/system/yiqikan-livekit.service
-/etc/nginx/snippets/yiqikan-signal-location.conf
+/opt/synced/livekit-entrypoint.sh
+/etc/synced-livekit.env
+/etc/synced-livekit.secret
+/etc/systemd/system/synced-livekit.service
+/etc/nginx/snippets/synced-signal-location.conf
 ```
 
 安装后先执行 `systemd-analyze verify` 和 `nginx -t`，再
-`systemctl enable --now yiqikan-livekit.service`，确认 7880/TCP、7881/TCP
-与 7882/UDP 均已监听。服务必须以 `yiqikan` 用户运行；API secret 与运行时
+`systemctl enable --now synced-livekit.service`，确认 7880/TCP、7881/TCP
+与 7882/UDP 均已监听。服务必须以 `synced` 用户运行；API secret 与运行时
 生成的 LiveKit YAML 均不得写入日志。
 
 ## 移除旧带宽限制
@@ -192,13 +192,13 @@ node server/load-test.mjs --clients 32 --duration 20 --throughput-clients 2
 ```
 
 压测工具默认拒绝远程目标。维护窗口确需压测公网节点时，显式设置
-`YIQIKAN_LOADTEST_ALLOW_REMOTE=true` 并逐级增加连接数。
+`SYNCED_LOADTEST_ALLOW_REMOTE=true` 并逐级增加连接数。
 
 TURN 连通与可选吞吐检查：
 
 ```powershell
-$env:YIQIKAN_TURN_TRANSPORT = "udp"
-$env:YIQIKAN_TURN_BENCH_BYTES = "1048576"
+$env:SYNCED_TURN_TRANSPORT = "udp"
+$env:SYNCED_TURN_BENCH_BYTES = "1048576"
 npx electron scripts/smoke-public-turn.cjs
 ```
 

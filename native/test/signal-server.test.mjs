@@ -429,13 +429,13 @@ test("publishes protocol-v3 capabilities and bounded v2 probes", async () => {
   const metricsResponse = await fetch(`${httpBaseUrl}/metrics`);
   assert.equal(metricsResponse.status, 200);
   const metrics = await metricsResponse.text();
-  assert.match(metrics, /yiqikan_signal_network_probe_rounds_total\s+\d+/);
-  assert.match(metrics, /yiqikan_signal_network_probe_bytes_total\s+\d+/);
+  assert.match(metrics, /synced_signal_network_probe_rounds_total\s+\d+/);
+  assert.match(metrics, /synced_signal_network_probe_bytes_total\s+\d+/);
   socket.close();
 });
 
 test("issues scoped LiveKit access and refreshable TURN credentials", async () => {
-  const apiKey = "yiqikan_test";
+  const apiKey = "synced_test";
   const apiSecret = "s".repeat(48);
   const credential = ownerCredential(207);
   const sfuServer = createSignalServer({
@@ -473,7 +473,7 @@ test("issues scoped LiveKit access and refreshable TURN credentials", async () =
     );
     const hostJoined = await hostJoinedMessage;
     assert.equal(hostJoined.sfu.url, "wss://media.example.test/sfu");
-    assert.equal(hostJoined.sfu.room, `yiqikan-${credential.room.toLowerCase()}`);
+    assert.equal(hostJoined.sfu.room, `synced-${credential.room.toLowerCase()}`);
     assert.ok(hostJoined.sfu.expiresAt > Date.now() + 5 * 60_000);
     assert.ok(hostJoined.iceRefreshToken);
     assert.ok(hostJoined.iceExpiresAt > Date.now());

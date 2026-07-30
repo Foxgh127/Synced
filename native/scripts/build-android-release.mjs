@@ -18,11 +18,11 @@ const androidRoot = path.join(projectRoot, "android");
 const localJdkRoot = path.join(projectRoot, ".toolchains", "jdk");
 const signingProperties = path.join(
   os.homedir(),
-  ".yiqikan",
+  ".synced",
   "signing",
   "keystore.properties",
 );
-const expectedPackage = "com.yiqikan.room";
+const expectedPackage = "com.synced.room";
 const expectedCertificateSha256 =
   "ca5c8f711b2d91ce5e7bd0dbf762bd191d5e8d9bb9269a3dee53a0540721e0a5";
 const expectedPermissions = [

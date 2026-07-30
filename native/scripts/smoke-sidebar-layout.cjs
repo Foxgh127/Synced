@@ -1,4 +1,4 @@
-process.env.YIQIKAN_E2E = "1";
+process.env.SYNCED_E2E = "1";
 
 const fs = require("node:fs");
 const os = require("node:os");
@@ -70,7 +70,7 @@ async function main() {
   mainWindow.show();
   mainWindow.setSize(1440, 900);
   await mainWindow.webContents.executeJavaScript(
-    "localStorage.setItem('yiqikan:mini-window-enabled', 'false')",
+    "localStorage.setItem('synced:mini-window-enabled', 'false')",
   );
   await mainWindow.webContents.executeJavaScript(
     "document.querySelector('#choose-host')?.click()",
@@ -118,7 +118,7 @@ async function main() {
   })()`);
   const setupScreenshotPath = path.join(
     os.tmpdir(),
-    "yiqikan-setup-layout-smoke.png",
+    "synced-setup-layout-smoke.png",
   );
   await new Promise((resolve) => setTimeout(resolve, 240));
   fs.writeFileSync(
@@ -280,7 +280,7 @@ async function main() {
         (danmakuRect?.bottom || 0) - (stageRect?.bottom || 0),
       ),
       movieVolumeControl: Boolean(document.querySelector("#movie-volume-control")),
-      movieVolumePersisted: localStorage.getItem("yiqikan:movie-volume"),
+      movieVolumePersisted: localStorage.getItem("synced:movie-volume"),
       movieVolumeValue: document.querySelector("#movie-volume-value")?.textContent,
       embyViewerTimeline: Boolean(document.querySelector("#stage-progress")),
       playbackDockInsideStage:
@@ -358,7 +358,7 @@ async function main() {
         typeof document.querySelector("#channel-video")?.requestPictureInPicture === "function",
     };
   })()`);
-  const screenshotPath = path.join(os.tmpdir(), "yiqikan-sidebar-smoke.png");
+  const screenshotPath = path.join(os.tmpdir(), "synced-sidebar-smoke.png");
   fs.writeFileSync(screenshotPath, await mainWindow.webContents.capturePage().then((image) => image.toPNG()));
   const lobbyPanelLayout =
     await mainWindow.webContents.executeJavaScript(`(async () => {
@@ -509,7 +509,7 @@ async function main() {
   })()`, true);
   const fullscreenScreenshotPath = path.join(
     os.tmpdir(),
-    "yiqikan-fullscreen-controls-smoke.png",
+    "synced-fullscreen-controls-smoke.png",
   );
   fs.writeFileSync(
     fullscreenScreenshotPath,
@@ -620,7 +620,7 @@ async function main() {
   });
   const miniWindowOnScreenshotPath = path.join(
     os.tmpdir(),
-    "yiqikan-mini-window-on-smoke.png",
+    "synced-mini-window-on-smoke.png",
   );
   fs.writeFileSync(
     miniWindowOnScreenshotPath,
@@ -650,7 +650,7 @@ async function main() {
         state: button?.querySelector(".mini-window-state")?.textContent,
         disabled: button?.disabled,
         pictureInPictureActive: Boolean(document.pictureInPictureElement),
-        stored: localStorage.getItem("yiqikan:mini-window-enabled"),
+        stored: localStorage.getItem("synced:mini-window-enabled"),
       };
     })()`);
   const miniWindowDisabledState =
@@ -664,7 +664,7 @@ async function main() {
         state: button?.querySelector(".mini-window-state")?.textContent,
         disabled: button?.disabled,
         pictureInPictureActive: Boolean(document.pictureInPictureElement),
-        stored: localStorage.getItem("yiqikan:mini-window-enabled"),
+        stored: localStorage.getItem("synced:mini-window-enabled"),
       };
     })()`);
   mainWindow.minimize();

@@ -8,10 +8,10 @@ function source(relativePath) {
 }
 
 test("standby nginx exposes signalling only and overwrites untrusted XFF", () => {
-  const nginx = source("deployment/nginx-yiqikan-standby.conf");
+  const nginx = source("deployment/nginx-synced-standby.conf");
   assert.match(nginx, /limit_conn_zone\s+\$binary_remote_addr/);
   assert.match(nginx, /limit_req_zone\s+\$binary_remote_addr/);
-  assert.match(nginx, /limit_conn\s+yiqikan_signal_connections\s+8;/);
+  assert.match(nginx, /limit_conn\s+synced_signal_connections\s+8;/);
   assert.match(
     nginx,
     /proxy_set_header\s+X-Forwarded-For\s+\$remote_addr;/,
@@ -57,17 +57,17 @@ test("Docker deployment keeps the TURN secret out of argv and environment", () =
 });
 
 test("standby node has one signalling-only deployment surface", () => {
-  const environment = source("deployment/yiqikan-signal-hz.env.example");
-  const nginx = source("deployment/nginx-yiqikan-standby.conf");
+  const environment = source("deployment/synced-signal-hz.env.example");
+  const nginx = source("deployment/nginx-synced-standby.conf");
   assert.match(
     environment,
     /^ICE_SERVERS_JSON='.*stun:43\.161\.195\.12:3478.*'$/m,
   );
   assert.doesNotMatch(environment, /stun:47\.98\.173\.139/);
-  assert.match(environment, /^TURN_SECRET_FILE=\/etc\/yiqikan-turn\.secret$/m);
+  assert.match(environment, /^TURN_SECRET_FILE=\/etc\/synced-turn\.secret$/m);
   assert.match(
     environment,
-    /^LIVEKIT_API_SECRET_FILE=\/etc\/yiqikan-livekit\.secret$/m,
+    /^LIVEKIT_API_SECRET_FILE=\/etc\/synced-livekit\.secret$/m,
   );
   assert.match(environment, /^SFU_PUBLIC_URL=wss:\/\/synced\.com\.cn\/sfu$/m);
   assert.match(environment, /^MAX_VIEWERS_PER_ROOM=7$/m);
@@ -77,43 +77,43 @@ test("standby node has one signalling-only deployment surface", () => {
     "deployment/.env.low-bandwidth.example",
     "deployment/docker-compose.low-bandwidth.yml",
     "deployment/turnserver-stun.conf",
-    "deployment/yiqikan-stun-443.service",
-    "deployment/yiqikan-signal-443.service",
-    "deployment/yiqikan-signal-443.socket",
+    "deployment/synced-stun-443.service",
+    "deployment/synced-signal-443.service",
+    "deployment/synced-signal-443.socket",
   ]) {
     assert.equal(existsSync(path.resolve(removed)), false, removed);
   }
 });
 
 test("systemd services can read their secret-bearing configuration safely", () => {
-  const service = source("deployment/yiqikan-signal.service");
+  const service = source("deployment/synced-signal.service");
   const signalEnvironment = source(
-    "deployment/yiqikan-signal.env.example",
+    "deployment/synced-signal.env.example",
   );
   const deploymentGuide = source("deployment/README.md");
-  assert.match(service, /^User=yiqikan$/m);
-  assert.match(service, /^Group=yiqikan$/m);
+  assert.match(service, /^User=synced$/m);
+  assert.match(service, /^Group=synced$/m);
   assert.match(
     signalEnvironment,
-    /^TURN_SECRET_FILE=\/etc\/yiqikan-turn\.secret$/m,
+    /^TURN_SECRET_FILE=\/etc\/synced-turn\.secret$/m,
   );
   assert.match(signalEnvironment, /^MAX_VIEWERS_PER_ROOM=7$/m);
   assert.match(signalEnvironment, /^SFU_ENABLED=true$/m);
   assert.match(
     signalEnvironment,
-    /^LIVEKIT_API_SECRET_FILE=\/etc\/yiqikan-livekit\.secret$/m,
+    /^LIVEKIT_API_SECRET_FILE=\/etc\/synced-livekit\.secret$/m,
   );
   assert.match(deploymentGuide, /SFU.*P2P/s);
 });
 
 test("systemd LiveKit deployment is hardened and has no media bandwidth ceiling", () => {
-  const service = source("deployment/yiqikan-livekit.service");
-  const environment = source("deployment/yiqikan-livekit.env.example");
+  const service = source("deployment/synced-livekit.service");
+  const environment = source("deployment/synced-livekit.env.example");
   const entrypoint = source("deployment/livekit-entrypoint.sh");
-  const nginx = source("deployment/nginx-yiqikan-signal-location.conf");
+  const nginx = source("deployment/nginx-synced-signal-location.conf");
 
-  assert.match(service, /^User=yiqikan$/m);
-  assert.match(service, /^Group=yiqikan$/m);
+  assert.match(service, /^User=synced$/m);
+  assert.match(service, /^Group=synced$/m);
   assert.match(service, /^NoNewPrivileges=yes$/m);
   assert.match(service, /^ProtectSystem=strict$/m);
   assert.match(service, /^Restart=always$/m);
@@ -121,7 +121,7 @@ test("systemd LiveKit deployment is hardened and has no media bandwidth ceiling"
     service,
     /^RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK$/m,
   );
-  assert.match(service, /^EnvironmentFile=\/etc\/yiqikan-livekit\.env$/m);
+  assert.match(service, /^EnvironmentFile=\/etc\/synced-livekit\.env$/m);
   assert.match(environment, /^LIVEKIT_BINARY=\/usr\/local\/bin\/livekit-server$/m);
   assert.match(entrypoint, /LIVEKIT_BINARY:-\/livekit-server/);
   assert.match(entrypoint, /bytes_per_sec: -1/);
@@ -134,10 +134,10 @@ test("systemd LiveKit deployment is hardened and has no media bandwidth ceiling"
 test("Android playback owns a media foreground service only while active", () => {
   const manifest = source("android/app/src/main/AndroidManifest.xml");
   const activity = source(
-    "android/app/src/main/java/com/yiqikan/room/MainActivity.java",
+    "android/app/src/main/java/com/synced/room/MainActivity.java",
   );
   const plugin = source(
-    "android/app/src/main/java/com/yiqikan/room/PlaybackControlsPlugin.java",
+    "android/app/src/main/java/com/synced/room/PlaybackControlsPlugin.java",
   );
   assert.match(manifest, /FOREGROUND_SERVICE_MEDIA_PLAYBACK/);
   assert.match(manifest, /foregroundServiceType="mediaPlayback"/);
@@ -171,7 +171,7 @@ test("Android keeps private app data out of cloud backup and device transfer", (
 
 test("Android built-in audio routes remain usable without Bluetooth permission", () => {
   const plugin = source(
-    "android/app/src/main/java/com/yiqikan/room/AudioRoutePlugin.java",
+    "android/app/src/main/java/com/synced/room/AudioRoutePlugin.java",
   );
   assert.match(
     plugin,
@@ -261,18 +261,18 @@ test("public signal diagnostics never print TURN credentials", () => {
 
 test("v3 deployment has an atomic rollback and bounded low-memory service", () => {
   const deploy = source("deployment/deploy-signal-v3.sh");
-  const service = source("deployment/yiqikan-signal.service");
+  const service = source("deployment/synced-signal.service");
   assert.match(deploy, /node --check "\$source_bundle"/);
   assert.match(deploy, /mv -f "\$candidate" "\$live_bundle"/);
   assert.match(deploy, /body\.protocolVersion !== expectedProtocol/);
   assert.match(
     deploy,
-    /if ! systemctl restart yiqikan-signal\.service; then\s+rollback/u,
+    /if ! systemctl restart synced-signal\.service; then\s+rollback/u,
   );
   assert.match(deploy, /stat -c %u "\$live_bundle"/u);
   assert.match(deploy, /stat -c %g "\$live_bundle"/u);
   assert.match(deploy, /stat -c %a "\$live_bundle"/u);
-  assert.doesNotMatch(deploy, /install -o root -g yiqikan/u);
+  assert.doesNotMatch(deploy, /install -o root -g synced/u);
   assert.doesNotMatch(deploy, /install -d .*"\$install_root"/u);
   assert.match(deploy, /wait_for_health "health"/);
   assert.match(deploy, /rolling back/);

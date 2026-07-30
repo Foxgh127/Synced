@@ -13,17 +13,17 @@ const packageJson = JSON.parse(
   fs.readFileSync(path.join(projectRoot, "package.json"), "utf8"),
 );
 const portablePath =
-  process.env.YIQIKAN_EMBY_FIELD_EXE ||
+  process.env.SYNCED_EMBY_FIELD_EXE ||
   path.join(
     projectRoot,
     "release",
     "windows-dist",
     `Synced-${EXPECTED_VERSION}-portable.exe`,
   );
-const debugPort = Number(process.env.YIQIKAN_EMBY_FIELD_PORT || 9349);
+const debugPort = Number(process.env.SYNCED_EMBY_FIELD_PORT || 9349);
 const playbackDurationMs = Math.max(
   30_000,
-  Number(process.env.YIQIKAN_EMBY_FIELD_PLAYBACK_MS || 30_000),
+  Number(process.env.SYNCED_EMBY_FIELD_PLAYBACK_MS || 30_000),
 );
 const artifactStamp = new Date().toISOString().replace(/[:.]/gu, "-");
 const artifactDirectory = path.join(projectRoot, "release", "field-tests");
@@ -280,7 +280,7 @@ Add-Type -AssemblyName System.Drawing
 Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
-public static class YiQiKanFieldCapture {
+public static class SyncedFieldCapture {
   public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr parameter);
   [StructLayout(LayoutKind.Sequential)]
   public struct Rect { public int Left; public int Top; public int Right; public int Bottom; }
@@ -305,23 +305,23 @@ public static class YiQiKanFieldCapture {
   }
 }
 '@
-$targetPid = [int]$env:YIQIKAN_FIELD_CAPTURE_PID
+$targetPid = [int]$env:SYNCED_FIELD_CAPTURE_PID
 $target = Get-Process -Id $targetPid -ErrorAction Stop
 for ($attempt = 0; $attempt -lt 20; $attempt++) {
   Start-Sleep -Milliseconds 100
   $target.Refresh()
   $handle = $target.MainWindowHandle
   if ($handle -eq 0) {
-    $handle = [YiQiKanFieldCapture]::FindVisibleWindow([uint32]$targetPid)
+    $handle = [SyncedFieldCapture]::FindVisibleWindow([uint32]$targetPid)
   }
   if ($handle -ne 0) { break }
 }
 if ($handle -eq 0) { exit 2 }
-[YiQiKanFieldCapture]::ShowWindow($handle, 9) | Out-Null
-[YiQiKanFieldCapture]::SetForegroundWindow($handle) | Out-Null
+[SyncedFieldCapture]::ShowWindow($handle, 9) | Out-Null
+[SyncedFieldCapture]::SetForegroundWindow($handle) | Out-Null
 Start-Sleep -Milliseconds 250
-$rect = New-Object YiQiKanFieldCapture+Rect
-if (-not [YiQiKanFieldCapture]::GetWindowRect($handle, [ref]$rect)) { exit 3 }
+$rect = New-Object SyncedFieldCapture+Rect
+if (-not [SyncedFieldCapture]::GetWindowRect($handle, [ref]$rect)) { exit 3 }
 $width = $rect.Right - $rect.Left
 $height = $rect.Bottom - $rect.Top
 if ($width -lt 1 -or $height -lt 1) { exit 4 }
@@ -330,7 +330,7 @@ $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
 try {
   $graphics.CopyFromScreen($rect.Left, $rect.Top, 0, 0, $bitmap.Size)
   $bitmap.Save(
-    $env:YIQIKAN_FIELD_SCREENSHOT,
+    $env:SYNCED_FIELD_SCREENSHOT,
     [System.Drawing.Imaging.ImageFormat]::Jpeg
   )
 } finally {
@@ -348,8 +348,8 @@ try {
       timeout: 8_000,
       env: {
         ...process.env,
-        YIQIKAN_FIELD_CAPTURE_PID: String(launcher.pid),
-        YIQIKAN_FIELD_SCREENSHOT: outputPath,
+        SYNCED_FIELD_CAPTURE_PID: String(launcher.pid),
+        SYNCED_FIELD_SCREENSHOT: outputPath,
       },
     },
   );
@@ -368,14 +368,14 @@ function readPortableVersion() {
       "-NoProfile",
       "-NonInteractive",
       "-Command",
-      "(Get-Item -LiteralPath $env:YIQIKAN_FIELD_PORTABLE_PATH).VersionInfo.ProductVersion",
+      "(Get-Item -LiteralPath $env:SYNCED_FIELD_PORTABLE_PATH).VersionInfo.ProductVersion",
     ],
     {
       encoding: "utf8",
       windowsHide: true,
       env: {
         ...process.env,
-        YIQIKAN_FIELD_PORTABLE_PATH: portablePath,
+        SYNCED_FIELD_PORTABLE_PATH: portablePath,
       },
       stdio: ["ignore", "pipe", "ignore"],
       timeout: 10_000,
@@ -519,9 +519,9 @@ async function main() {
         stdio: "ignore",
         env: {
           ...process.env,
-          YIQIKAN_E2E: "1",
-          YIQIKAN_E2E_VISIBLE: "1",
-          YIQIKAN_SKIP_FIREWALL_REPAIR: "1",
+          SYNCED_E2E: "1",
+          SYNCED_E2E_VISIBLE: "1",
+          SYNCED_SKIP_FIREWALL_REPAIR: "1",
         },
       },
     );

@@ -2,23 +2,23 @@ const path = require("node:path");
 const { app, BrowserWindow } = require("electron");
 
 const signalUrl =
-  process.env.YIQIKAN_TURN_SIGNAL || "wss://synced.com.cn/signal";
-const directMode = process.env.YIQIKAN_TURN_DIRECT === "1";
+  process.env.SYNCED_TURN_SIGNAL || "wss://synced.com.cn/signal";
+const directMode = process.env.SYNCED_TURN_DIRECT === "1";
 const requestedTransport =
   directMode
     ? "direct"
-    : process.env.YIQIKAN_TURN_TRANSPORT === "tcp"
+    : process.env.SYNCED_TURN_TRANSPORT === "tcp"
       ? "tcp"
       : "udp";
 const timeoutMs = Math.max(
   2_000,
-  Number(process.env.YIQIKAN_TURN_TIMEOUT_MS) || 20_000,
+  Number(process.env.SYNCED_TURN_TIMEOUT_MS) || 20_000,
 );
 const benchmarkBytes = Math.min(
   256 * 1024 * 1024,
   Math.max(
     0,
-    Math.trunc(Number(process.env.YIQIKAN_TURN_BENCH_BYTES) || 0),
+    Math.trunc(Number(process.env.SYNCED_TURN_BENCH_BYTES) || 0),
   ),
 );
 

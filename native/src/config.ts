@@ -259,8 +259,7 @@ export function describeSignalHost(signal: string): string {
 
 export const JOIN_LINK_SCHEME = "synced";
 
-/** The pre-2.0 scheme stays accepted so links already shared keep working. */
-const ACCEPTED_JOIN_SCHEMES = new Set(["synced:", "yiqikan:"]);
+const ACCEPTED_JOIN_SCHEMES = new Set(["synced:"]);
 
 export interface ParsedJoinLink {
   room?: string;

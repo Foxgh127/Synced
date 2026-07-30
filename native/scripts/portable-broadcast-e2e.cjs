@@ -23,7 +23,7 @@ const packageJson = JSON.parse(
 );
 const healthConfig = buildHealthConfig();
 const portable =
-  process.env.YIQIKAN_PORTABLE_EXE ||
+  process.env.SYNCED_PORTABLE_EXE ||
   path.join(
     projectRoot,
     "release",
@@ -31,24 +31,24 @@ const portable =
     `Synced-${packageJson.version}-portable.exe`,
   );
 const sourceTitle =
-  process.env.YIQIKAN_E2E_SOURCE_TITLE ||
-  "YiQiKan Native Process Audio Smoke";
+  process.env.SYNCED_E2E_SOURCE_TITLE ||
+  "Synced Native Process Audio Smoke";
 const launchTestSource =
-  process.env.YIQIKAN_E2E_USE_TEST_SOURCE === "1" ||
-  (!process.env.YIQIKAN_E2E_SOURCE_TITLE &&
-    process.env.YIQIKAN_E2E_USE_TEST_SOURCE !== "0");
-const targetResolution = process.env.YIQIKAN_E2E_RESOLUTION || "高清";
-const targetFrameRate = process.env.YIQIKAN_E2E_FRAME_RATE || "60";
-const debugPort = Number(process.env.YIQIKAN_E2E_PORT || 9339);
-const phoneE2e = process.env.YIQIKAN_E2E_PHONE === "1";
+  process.env.SYNCED_E2E_USE_TEST_SOURCE === "1" ||
+  (!process.env.SYNCED_E2E_SOURCE_TITLE &&
+    process.env.SYNCED_E2E_USE_TEST_SOURCE !== "0");
+const targetResolution = process.env.SYNCED_E2E_RESOLUTION || "高清";
+const targetFrameRate = process.env.SYNCED_E2E_FRAME_RATE || "60";
+const debugPort = Number(process.env.SYNCED_E2E_PORT || 9339);
+const phoneE2e = process.env.SYNCED_E2E_PHONE === "1";
 const switchPhoneNetwork =
-  process.env.YIQIKAN_E2E_SWITCH_NETWORK === "1";
-const phoneDebugPort = Number(process.env.YIQIKAN_PHONE_DEBUG_PORT || 9341);
+  process.env.SYNCED_E2E_SWITCH_NETWORK === "1";
+const phoneDebugPort = Number(process.env.SYNCED_PHONE_DEBUG_PORT || 9341);
 const signalUrl =
-  process.env.YIQIKAN_E2E_SIGNAL || "wss://synced.com.cn/signal";
+  process.env.SYNCED_E2E_SIGNAL || "wss://synced.com.cn/signal";
 const androidPackage =
-  process.env.YIQIKAN_ANDROID_PACKAGE || "com.yiqikan.room";
-const adbSerial = process.env.YIQIKAN_ADB_SERIAL?.trim();
+  process.env.SYNCED_ANDROID_PACKAGE || "com.synced.room";
+const adbSerial = process.env.SYNCED_ADB_SERIAL?.trim();
 const liveChildren = new Set();
 
 function delay(milliseconds) {
@@ -299,10 +299,10 @@ function createCdp(webSocketUrl) {
 
 function rtcProbeScript(repairLegacySdp = false) {
   return `(() => {
-    if (window.__yiqikanE2eRtcProbeInstalled) return true;
+    if (window.__syncedE2eRtcProbeInstalled) return true;
     if (${repairLegacySdp ? "true" : "false"}) {
       const nativeSend = window.WebSocket?.prototype?.send;
-      if (nativeSend && !window.__yiqikanE2eWebSocketRepair) {
+      if (nativeSend && !window.__syncedE2eWebSocketRepair) {
         window.WebSocket.prototype.send = function(payload) {
           let outgoing = payload;
           try {
@@ -323,7 +323,7 @@ function rtcProbeScript(repairLegacySdp = false) {
           }
           return nativeSend.call(this, outgoing);
         };
-        window.__yiqikanE2eWebSocketRepair = true;
+        window.__syncedE2eWebSocketRepair = true;
       }
     }
     const NativePeerConnection = window.RTCPeerConnection;
@@ -374,8 +374,8 @@ function rtcProbeScript(repairLegacySdp = false) {
       }
     }
     window.RTCPeerConnection = ProbedPeerConnection;
-    window.__yiqikanE2eRtcPeers = peers;
-    window.__yiqikanE2eRtcProbeInstalled = true;
+    window.__syncedE2eRtcPeers = peers;
+    window.__syncedE2eRtcProbeInstalled = true;
     return true;
   })()`;
 }
@@ -383,8 +383,8 @@ function rtcProbeScript(repairLegacySdp = false) {
 function rtcSnapshotExpression() {
   return `(async () => {
     const entries = [
-      ...(window.__yiqikanRtcPeers || []),
-      ...(window.__yiqikanE2eRtcPeers || [])
+      ...(window.__syncedRtcPeers || []),
+      ...(window.__syncedE2eRtcPeers || [])
     ];
     return Promise.all(entries.map(async (entry, index) => {
       const pc = entry.pc;
@@ -444,7 +444,7 @@ function rtcSnapshotExpression() {
 
 function senderEncodingExpression() {
   return `(() => {
-    const peers = window.__yiqikanRtcPeers || [];
+    const peers = window.__syncedRtcPeers || [];
     const outbound = [...peers].reverse().find((entry) =>
       entry.pc?.getSenders?.().some((sender) => sender.track?.kind === 'video')
     );
@@ -715,8 +715,8 @@ async function main() {
       stdio: "ignore",
       env: {
         ...process.env,
-        YIQIKAN_E2E: "1",
-        YIQIKAN_SKIP_FIREWALL_REPAIR: "1",
+        SYNCED_E2E: "1",
+        SYNCED_SKIP_FIREWALL_REPAIR: "1",
       },
     },
   );
@@ -1133,8 +1133,8 @@ async function main() {
           while (Date.now() - switchedAt < 75_000) {
             const snapshot = await phoneEvaluate(`(async () => {
               const entries = [
-                ...(window.__yiqikanRtcPeers || []),
-                ...(window.__yiqikanE2eRtcPeers || [])
+                ...(window.__syncedRtcPeers || []),
+                ...(window.__syncedE2eRtcPeers || [])
               ];
               const latest = [...entries].reverse().find((entry) =>
                 entry.pc?.getReceivers?.().some((receiver) =>

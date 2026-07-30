@@ -1,13 +1,13 @@
 #!/bin/sh
 set -eu
 
-signal_env="${SIGNAL_ENV_FILE:-/etc/yiqikan-signal.env}"
-backup_root="${BACKUP_ROOT:-/etc/yiqikan-backups}"
+signal_env="${SIGNAL_ENV_FILE:-/etc/synced-signal.env}"
+backup_root="${BACKUP_ROOT:-/etc/synced-backups}"
 default_ice_servers_json='[{"urls":["stun:43.161.195.12:3478"]}]'
 ice_servers_json="${ICE_SERVERS_JSON:-$default_ice_servers_json}"
 turn_urls="${TURN_URLS:-turn:43.161.195.12:3478?transport=udp,turn:43.161.195.12:3478?transport=tcp}"
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
-backup="${backup_root}/yiqikan-signal.env.standby.${timestamp}"
+backup="${backup_root}/synced-signal.env.standby.${timestamp}"
 candidate="${signal_env}.next.$$"
 
 cleanup() {
@@ -54,8 +54,8 @@ rollback() {
   reason="$1"
   echo "${reason}; restoring standby signal routing" >&2
   cp -a "$backup" "$signal_env"
-  systemctl restart yiqikan-signal.service >/dev/null 2>&1 || true
-  systemctl --no-pager --full status yiqikan-signal.service >&2 || true
+  systemctl restart synced-signal.service >/dev/null 2>&1 || true
+  systemctl --no-pager --full status synced-signal.service >&2 || true
   exit 1
 }
 
@@ -75,7 +75,7 @@ chown --reference="$signal_env" "$candidate"
 chmod --reference="$signal_env" "$candidate"
 mv -f "$candidate" "$signal_env"
 
-if ! systemctl restart yiqikan-signal.service || ! wait_for_signal; then
+if ! systemctl restart synced-signal.service || ! wait_for_signal; then
   rollback "standby signal routing failed readiness checks"
 fi
 

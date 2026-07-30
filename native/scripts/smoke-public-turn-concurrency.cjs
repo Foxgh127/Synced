@@ -4,7 +4,7 @@ const path = require("node:path");
 const electron = require("electron");
 const smokeScript = path.join(__dirname, "smoke-public-turn.cjs");
 const transports = (
-  process.env.YIQIKAN_TURN_CONCURRENCY_TRANSPORTS ||
+  process.env.SYNCED_TURN_CONCURRENCY_TRANSPORTS ||
   "udp,udp,tcp,tcp"
 )
   .split(",")
@@ -16,7 +16,7 @@ const benchmarkBytes = String(
     Math.min(
       4 * 1024 * 1024,
       Math.trunc(
-        Number(process.env.YIQIKAN_TURN_BENCH_BYTES) || 256 * 1024,
+        Number(process.env.SYNCED_TURN_BENCH_BYTES) || 256 * 1024,
       ),
     ),
   ),
@@ -25,7 +25,7 @@ const timeoutMs = Math.max(
   15_000,
   Math.min(
     120_000,
-    Number(process.env.YIQIKAN_TURN_CONCURRENCY_TIMEOUT_MS) || 60_000,
+    Number(process.env.SYNCED_TURN_CONCURRENCY_TIMEOUT_MS) || 60_000,
   ),
 );
 
@@ -40,8 +40,8 @@ function runWorker(transport, index) {
       stdio: ["ignore", "pipe", "pipe"],
       env: {
         ...process.env,
-        YIQIKAN_TURN_TRANSPORT: transport,
-        YIQIKAN_TURN_BENCH_BYTES: benchmarkBytes,
+        SYNCED_TURN_TRANSPORT: transport,
+        SYNCED_TURN_BENCH_BYTES: benchmarkBytes,
       },
     });
     let stdout = "";

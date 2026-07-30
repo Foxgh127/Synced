@@ -4,7 +4,7 @@ const os = require("node:os");
 const path = require("node:path");
 
 const temporaryUserData = fs.mkdtempSync(
-  path.join(os.tmpdir(), "yiqikan-recent-history-"),
+  path.join(os.tmpdir(), "synced-recent-history-"),
 );
 app.setPath("userData", temporaryUserData);
 
@@ -53,7 +53,7 @@ async function main() {
     );
     await withTimeout(
       window.webContents.executeJavaScript(`localStorage.setItem(
-        "yiqikan:recent-channels",
+        "synced:recent-channels",
         JSON.stringify([{
           room: "TEST2345",
           name: "右键删除测试",
@@ -76,7 +76,7 @@ async function main() {
         button: 2
       }));
       const count = () =>
-        JSON.parse(localStorage.getItem("yiqikan:recent-channels") || "[]").length;
+        JSON.parse(localStorage.getItem("synced:recent-channels") || "[]").length;
 
       openMenu();
       const openedByRightClick = Boolean(

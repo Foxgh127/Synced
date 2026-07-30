@@ -172,7 +172,7 @@ coturn、LiveKit 和信令不设置静态带宽上限，吞吐由实际公网容
 腾讯云公网 IP 的注册地域为香港；云主机峰值带宽并不保证中国大陆到香港的端到端
 吞吐。影片因此优先使用 SFU 并保留 P2P 回退。若外部 TURN 吞吐基准持续偏低，应
 扩容或迁移到更合适的线路，而不是继续抬高客户端码率。可设置
-`YIQIKAN_TURN_BENCH_BYTES=1048576` 运行
+`SYNCED_TURN_BENCH_BYTES=1048576` 运行
 `scripts/smoke-public-turn.cjs` 复测真实中继吞吐。
 
 语音 TURN 的 UDP 与 TCP 必须分别从服务器外部验证。`TURN_TCP_ENABLED` 默认是
@@ -180,7 +180,7 @@ coturn、LiveKit 和信令不设置静态带宽上限，吞吐由实际公网容
 TCP 自检确认：
 
 ```powershell
-$env:YIQIKAN_TURN_TRANSPORT = "tcp"
+$env:SYNCED_TURN_TRANSPORT = "tcp"
 npx electron scripts/smoke-public-turn.cjs
 ```
 

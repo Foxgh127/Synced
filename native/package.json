@@ -72,7 +72,7 @@
     "brace-expansion": "$brace-expansion"
   },
   "build": {
-    "appId": "com.yiqikan.room.desktop",
+    "appId": "com.synced.room.desktop",
     "productName": "同频",
     "asar": true,
     "electronDist": "node_modules/electron/dist",
@@ -92,7 +92,7 @@
         "from": "audio-helper/publish/win-x64",
         "to": "audio-helper",
         "filter": [
-          "YiQiKan.AudioCapture.exe"
+          "Synced.AudioCapture.exe"
         ]
       },
       {
@@ -116,8 +116,7 @@
       {
         "name": "同频频道邀请",
         "schemes": [
-          "synced",
-          "yiqikan"
+          "synced"
         ]
       }
     ],

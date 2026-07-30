@@ -98,9 +98,9 @@ function buildViewerUrl(streamId: string) {
 
 function Brand() {
   return (
-    <div className="brand" aria-label="一起看">
+    <div className="brand" aria-label="同频">
       <span className="brand-mark" aria-hidden="true" />
-      <span>一起看</span>
+      <span>同频</span>
     </div>
   );
 }
@@ -441,7 +441,7 @@ export default function Home() {
               ref={frameRef}
               className="vdo-frame viewer-frame"
               src={viewerSrc}
-              title="一起看电影直播画面"
+              title="同频共享画面"
               allow="autoplay; fullscreen; picture-in-picture; encrypted-media"
               allowFullScreen
               referrerPolicy="no-referrer"
@@ -510,7 +510,7 @@ export default function Home() {
                   {notice}
                 </div>
               )}
-              <h1 id="hero-title">一键分享，一起看电影</h1>
+              <h1 id="hero-title">一键分享，同频观影</h1>
               <p className="support">
                 选择一个窗口，我们会自动请求共享画面与声音，并生成观看链接。
               </p>

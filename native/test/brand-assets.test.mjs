@@ -105,7 +105,7 @@ test("Android legacy, adaptive, round, monochrome and notification assets agree"
       ),
       read("android/app/src/main/res/drawable/ic_stat_synced.xml", "utf8"),
       read(
-        "android/app/src/main/java/com/yiqikan/room/PlaybackForegroundService.java",
+        "android/app/src/main/java/com/synced/room/PlaybackForegroundService.java",
         "utf8",
       ),
     ]);

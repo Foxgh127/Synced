@@ -19,6 +19,9 @@ import {
 } from "./config";
 import { hideEmbeddedGame } from "./embedded-game";
 import { isNativeAndroid } from "./immersive";
+import { migrateStorageIdentity } from "./storage-identity";
+
+migrateStorageIdentity(localStorage);
 
 const root = document.querySelector<HTMLDivElement>("#app");
 if (!root) {
@@ -51,7 +54,7 @@ function escapeHtml(value: string): string {
 }
 
 function getSignalUrl(): string {
-  const saved = localStorage.getItem("yiqikan:signal");
+  const saved = localStorage.getItem("synced:signal");
   if (!saved) return DEFAULT_SIGNAL_URL;
   try {
     return normalizeSignalUrl(saved);
@@ -62,7 +65,7 @@ function getSignalUrl(): string {
 
 function saveSignalUrl(value: string): string {
   const normalized = normalizeSignalUrl(value);
-  localStorage.setItem("yiqikan:signal", normalized);
+  localStorage.setItem("synced:signal", normalized);
   return normalized;
 }
 
@@ -456,7 +459,7 @@ function renderDesktopHome(): void {
         <section class="home-hero">
           <div class="hero-copy">
             <span class="eyebrow">PRIVATE WATCH PARTY</span>
-            <h1>今晚，和朋友<br /><em>一起看点好的。</em></h1>
+            <h1>今晚，和朋友<br /><em>同频看点好的。</em></h1>
             <p>选择播放器窗口，影片声音只从该窗口的进程采集；朋友用房间码进入，就能看、聊、连麦。</p>
             <div class="hero-trust">
               <span>● 大陆服务器在线</span>

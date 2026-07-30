@@ -1088,12 +1088,12 @@ export class EmbyMsePlayer extends EventTarget {
       if (!this.streamComplete) this.dispatchEvent(new Event("disconnected"));
     };
     (channel as RTCDataChannel & {
-      __yiqikanEmbyMessage?: (event: MessageEvent) => void;
-      __yiqikanEmbyClose?: () => void;
-    }).__yiqikanEmbyMessage = handleMessage;
+      __syncedEmbyMessage?: (event: MessageEvent) => void;
+      __syncedEmbyClose?: () => void;
+    }).__syncedEmbyMessage = handleMessage;
     (channel as RTCDataChannel & {
-      __yiqikanEmbyClose?: () => void;
-    }).__yiqikanEmbyClose = handleClose;
+      __syncedEmbyClose?: () => void;
+    }).__syncedEmbyClose = handleClose;
     channel.addEventListener("message", handleMessage);
     channel.addEventListener("close", handleClose);
     if (channel.readyState === "open") this.sendClockPing();
@@ -1101,9 +1101,9 @@ export class EmbyMsePlayer extends EventTarget {
       const handleOpen = () => this.sendClockPing();
       (
         channel as RTCDataChannel & {
-          __yiqikanEmbyOpen?: () => void;
+          __syncedEmbyOpen?: () => void;
         }
-      ).__yiqikanEmbyOpen = handleOpen;
+      ).__syncedEmbyOpen = handleOpen;
       channel.addEventListener("open", handleOpen, { once: true });
     }
   }
@@ -1129,16 +1129,16 @@ export class EmbyMsePlayer extends EventTarget {
     const handleOpen = () => this.sendClockPing();
     (
       channel as RTCDataChannel & {
-        __yiqikanEmbyControlMessage?: (event: MessageEvent) => void;
-        __yiqikanEmbyControlClose?: () => void;
-        __yiqikanEmbyControlOpen?: () => void;
+        __syncedEmbyControlMessage?: (event: MessageEvent) => void;
+        __syncedEmbyControlClose?: () => void;
+        __syncedEmbyControlOpen?: () => void;
       }
-    ).__yiqikanEmbyControlMessage = handleMessage;
+    ).__syncedEmbyControlMessage = handleMessage;
     (
       channel as RTCDataChannel & {
-        __yiqikanEmbyControlClose?: () => void;
+        __syncedEmbyControlClose?: () => void;
       }
-    ).__yiqikanEmbyControlClose = handleClose;
+    ).__syncedEmbyControlClose = handleClose;
     channel.addEventListener("message", handleMessage);
     channel.addEventListener("close", handleClose);
     if (channel.readyState === "open") {
@@ -1146,9 +1146,9 @@ export class EmbyMsePlayer extends EventTarget {
     } else {
       (
         channel as RTCDataChannel & {
-          __yiqikanEmbyControlOpen?: () => void;
+          __syncedEmbyControlOpen?: () => void;
         }
-      ).__yiqikanEmbyControlOpen = handleOpen;
+      ).__syncedEmbyControlOpen = handleOpen;
       channel.addEventListener("open", handleOpen, { once: true });
     }
   }
@@ -2463,22 +2463,22 @@ export class EmbyMsePlayer extends EventTarget {
   private detachChannel(): void {
     const channel = this.channel as
       | (RTCDataChannel & {
-          __yiqikanEmbyMessage?: (event: MessageEvent) => void;
-          __yiqikanEmbyClose?: () => void;
-          __yiqikanEmbyOpen?: () => void;
+          __syncedEmbyMessage?: (event: MessageEvent) => void;
+          __syncedEmbyClose?: () => void;
+          __syncedEmbyOpen?: () => void;
         })
       | undefined;
-    if (channel?.__yiqikanEmbyMessage) {
-      channel.removeEventListener("message", channel.__yiqikanEmbyMessage);
-      delete channel.__yiqikanEmbyMessage;
+    if (channel?.__syncedEmbyMessage) {
+      channel.removeEventListener("message", channel.__syncedEmbyMessage);
+      delete channel.__syncedEmbyMessage;
     }
-    if (channel?.__yiqikanEmbyClose) {
-      channel.removeEventListener("close", channel.__yiqikanEmbyClose);
-      delete channel.__yiqikanEmbyClose;
+    if (channel?.__syncedEmbyClose) {
+      channel.removeEventListener("close", channel.__syncedEmbyClose);
+      delete channel.__syncedEmbyClose;
     }
-    if (channel?.__yiqikanEmbyOpen) {
-      channel.removeEventListener("open", channel.__yiqikanEmbyOpen);
-      delete channel.__yiqikanEmbyOpen;
+    if (channel?.__syncedEmbyOpen) {
+      channel.removeEventListener("open", channel.__syncedEmbyOpen);
+      delete channel.__syncedEmbyOpen;
     }
     this.channel = undefined;
   }
@@ -2486,31 +2486,31 @@ export class EmbyMsePlayer extends EventTarget {
   private detachControlChannel(): void {
     const channel = this.controlChannel as
       | (RTCDataChannel & {
-          __yiqikanEmbyControlMessage?: (event: MessageEvent) => void;
-          __yiqikanEmbyControlClose?: () => void;
-          __yiqikanEmbyControlOpen?: () => void;
+          __syncedEmbyControlMessage?: (event: MessageEvent) => void;
+          __syncedEmbyControlClose?: () => void;
+          __syncedEmbyControlOpen?: () => void;
         })
       | undefined;
-    if (channel?.__yiqikanEmbyControlMessage) {
+    if (channel?.__syncedEmbyControlMessage) {
       channel.removeEventListener(
         "message",
-        channel.__yiqikanEmbyControlMessage,
+        channel.__syncedEmbyControlMessage,
       );
-      delete channel.__yiqikanEmbyControlMessage;
+      delete channel.__syncedEmbyControlMessage;
     }
-    if (channel?.__yiqikanEmbyControlClose) {
+    if (channel?.__syncedEmbyControlClose) {
       channel.removeEventListener(
         "close",
-        channel.__yiqikanEmbyControlClose,
+        channel.__syncedEmbyControlClose,
       );
-      delete channel.__yiqikanEmbyControlClose;
+      delete channel.__syncedEmbyControlClose;
     }
-    if (channel?.__yiqikanEmbyControlOpen) {
+    if (channel?.__syncedEmbyControlOpen) {
       channel.removeEventListener(
         "open",
-        channel.__yiqikanEmbyControlOpen,
+        channel.__syncedEmbyControlOpen,
       );
-      delete channel.__yiqikanEmbyControlOpen;
+      delete channel.__syncedEmbyControlOpen;
     }
     this.controlChannel = undefined;
   }

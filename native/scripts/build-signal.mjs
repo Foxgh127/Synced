@@ -2,7 +2,7 @@ import { build } from "esbuild";
 
 await build({
   entryPoints: ["server/index.mjs"],
-  outfile: "release/server/yiqikan-signal.mjs",
+  outfile: "release/server/synced-signal.mjs",
   bundle: true,
   platform: "node",
   target: "node22",
@@ -12,4 +12,4 @@ await build({
   },
 });
 
-console.log("Built release/server/yiqikan-signal.mjs");
+console.log("Built release/server/synced-signal.mjs");

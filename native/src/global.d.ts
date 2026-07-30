@@ -133,7 +133,7 @@ declare global {
       ) => () => void;
       platform: string;
     };
-    __yiqikanEnterMiniWindowForMinimize?: () => Promise<boolean>;
+    __syncedEnterMiniWindowForMinimize?: () => Promise<boolean>;
   }
 
   interface EmbeddedGameBounds {

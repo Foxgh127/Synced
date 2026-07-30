@@ -22,7 +22,7 @@ test("real portable Emby field test is pinned to 2.8.1 and observes playback", (
   assert.match(script, /unhandledRejections/u);
   assert.match(script, /Page\.captureScreenshot/u);
   assert.match(script, /startClickRetries < 2/u);
-  assert.match(script, /YIQIKAN_E2E_VISIBLE: "1"/u);
+  assert.match(script, /SYNCED_E2E_VISIBLE: "1"/u);
   assert.match(script, /optimizeForSpeed: true/u);
   assert.match(script, /captureLauncherWindow/u);
   assert.match(script, /CopyFromScreen/u);

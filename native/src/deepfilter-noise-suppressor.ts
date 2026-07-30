@@ -12,7 +12,7 @@ export interface DeepFilterNoiseProcessor {
 
 function modelBaseUrl(): string {
   if (window.roomDesktop) {
-    return "yiqikan-resource://app/models/deepfilternet3";
+    return "synced-resource://app/models/deepfilternet3";
   }
   return new URL("models/deepfilternet3", document.baseURI).href.replace(
     /\/$/,

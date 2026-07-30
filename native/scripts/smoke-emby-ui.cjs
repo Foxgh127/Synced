@@ -1,4 +1,4 @@
-process.env.YIQIKAN_E2E = "1";
+process.env.SYNCED_E2E = "1";
 
 const { app, BrowserWindow } = require("electron");
 const { execFileSync } = require("node:child_process");
@@ -263,7 +263,7 @@ async function click(window, expression) {
 
 async function main() {
   const temporary = mkdtempSync(
-    path.join(os.tmpdir(), "yiqikan-emby-ui-"),
+    path.join(os.tmpdir(), "synced-emby-ui-"),
   );
   // Account persistence is part of this smoke test. Keep its encrypted test
   // tokens inside the disposable fixture directory so repeated release runs
@@ -282,11 +282,11 @@ async function main() {
   let window;
   const screenshotPath = path.join(
     os.tmpdir(),
-    "yiqikan-emby-ui-smoke.png",
+    "synced-emby-ui-smoke.png",
   );
   const broadcastScreenshotPath = path.join(
     os.tmpdir(),
-    "yiqikan-broadcast-mode-smoke.png",
+    "synced-broadcast-mode-smoke.png",
   );
   const rendererErrors = [];
   let phase = "startup";
@@ -314,12 +314,12 @@ async function main() {
       document.querySelector("#host-signal-url").value =
         ${JSON.stringify(signalUrl)};
       document.querySelector("#host-nickname").value = "Emby UI 验收";
-      window.__yiqikanScreenCaptureCalls = 0;
+      window.__syncedScreenCaptureCalls = 0;
       const mediaDevices = navigator.mediaDevices;
       if (mediaDevices?.getDisplayMedia) {
         const original = mediaDevices.getDisplayMedia.bind(mediaDevices);
         mediaDevices.getDisplayMedia = (...args) => {
-          window.__yiqikanScreenCaptureCalls += 1;
+          window.__syncedScreenCaptureCalls += 1;
           return original(...args);
         };
       }
@@ -585,7 +585,7 @@ async function main() {
             Boolean(document.querySelector("#local-stage-badge")) ||
             Boolean(document.querySelector("#audio-route-badge")),
           mediaStatus: document.querySelector("#hud-media-text")?.textContent,
-          captureCalls: window.__yiqikanScreenCaptureCalls,
+          captureCalls: window.__syncedScreenCaptureCalls,
           password: document.querySelector("#emby-password")?.value || "",
           tokenInDom: document.documentElement.innerHTML.includes(${JSON.stringify(
             mock.token,

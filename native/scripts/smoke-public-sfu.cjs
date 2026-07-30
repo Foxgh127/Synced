@@ -4,10 +4,10 @@ const WebSocket = require("ws");
 const ownerTools = require("./channel-owner.cjs");
 
 const signalUrl =
-  process.env.YIQIKAN_SFU_SIGNAL || "wss://synced.com.cn/signal";
+  process.env.SYNCED_SFU_SIGNAL || "wss://synced.com.cn/signal";
 const timeoutMs = Math.max(
   10_000,
-  Number(process.env.YIQIKAN_SFU_TIMEOUT_MS) || 35_000,
+  Number(process.env.SYNCED_SFU_TIMEOUT_MS) || 35_000,
 );
 
 function joinSignal({
@@ -213,7 +213,7 @@ async function main() {
           )
         ]);
 
-        const reliablePayload = new TextEncoder().encode("yiqikan-sfu-ping");
+        const reliablePayload = new TextEncoder().encode("synced-sfu-ping");
         const reliableReceived = timeout(
           new Promise((resolve) => {
             viewerRoom.on(
@@ -221,8 +221,8 @@ async function main() {
               (payload, participant, _kind, topic) => {
                 if (
                   participant?.identity === access.ownerId &&
-                  topic === "yiqikan:sfu-smoke" &&
-                  new TextDecoder().decode(payload) === "yiqikan-sfu-ping"
+                  topic === "synced:sfu-smoke" &&
+                  new TextDecoder().decode(payload) === "synced-sfu-ping"
                 ) {
                   resolve(true);
                 }
@@ -233,17 +233,17 @@ async function main() {
         );
         await ownerRoom.localParticipant.publishData(reliablePayload, {
           reliable: true,
-          topic: "yiqikan:sfu-smoke",
+          topic: "synced:sfu-smoke",
           destinationIdentities: [access.viewerId]
         });
         await reliableReceived;
 
         const dataTrackPromise = ownerParticipant.dataTracks.getDeferred(
-          "yiqikan-sfu-data-smoke"
+          "synced-sfu-data-smoke"
         );
         const localDataTrack =
           await ownerRoom.localParticipant.publishDataTrack({
-            name: "yiqikan-sfu-data-smoke"
+            name: "synced-sfu-data-smoke"
           });
         const remoteDataTrack = await timeout(
           dataTrackPromise,
@@ -253,7 +253,7 @@ async function main() {
         dataReader = remoteDataTrack.subscribe({ bufferSize: 32 }).getReader();
         const trackFrame = dataReader.read();
         const trackPayload = new TextEncoder().encode(
-          "yiqikan-emby-data-track"
+          "synced-emby-data-track"
         );
         let trackResult;
         for (let attempt = 0; attempt < 20 && !trackResult; attempt += 1) {
@@ -268,7 +268,7 @@ async function main() {
           !trackResult ||
           trackResult.done ||
           new TextDecoder().decode(trackResult.value.payload) !==
-            "yiqikan-emby-data-track"
+            "synced-emby-data-track"
         ) {
           throw new Error("SFU 数据轨载荷不完整");
         }
@@ -307,7 +307,7 @@ async function main() {
           "观众没有订阅到 SFU 画面"
         );
         await ownerRoom.localParticipant.publishTrack(canvasTrack, {
-          name: "yiqikan-screen-video-smoke",
+          name: "synced-screen-video-smoke",
           source: Track.Source.ScreenShare,
           videoCodec: "h264",
           simulcast: false
@@ -380,7 +380,7 @@ async function main() {
         );
         const lateRemoteDataTrack = await timeout(
           lateOwnerParticipant.dataTracks.getDeferred(
-            "yiqikan-sfu-data-smoke"
+            "synced-sfu-data-smoke"
           ),
           "后来加入的观众没有订阅到既有 SFU 数据轨"
         );
@@ -390,7 +390,7 @@ async function main() {
           .getReader();
         const lateTrackFrame = lateDataReader.read();
         const lateTrackPayload = new TextEncoder().encode(
-          "yiqikan-late-viewer-data-track"
+          "synced-late-viewer-data-track"
         );
         let lateTrackResult;
         for (
@@ -411,7 +411,7 @@ async function main() {
           !lateTrackResult ||
           lateTrackResult.done ||
           new TextDecoder().decode(lateTrackResult.value.payload) !==
-            "yiqikan-late-viewer-data-track"
+            "synced-late-viewer-data-track"
         ) {
           throw new Error("后来加入的观众收到的数据轨载荷不完整");
         }
@@ -451,7 +451,7 @@ async function main() {
         await ownerSawViewerLeave;
 
         const postLeavePayload = new TextEncoder().encode(
-          "yiqikan-after-viewer-left"
+          "synced-after-viewer-left"
         );
         const postLeaveReceived = timeout(
           new Promise((resolve) => {
@@ -460,9 +460,9 @@ async function main() {
               (payload, participant, _kind, topic) => {
                 if (
                   participant?.identity === access.ownerId &&
-                  topic === "yiqikan:sfu-after-leave" &&
+                  topic === "synced:sfu-after-leave" &&
                   new TextDecoder().decode(payload) ===
-                    "yiqikan-after-viewer-left"
+                    "synced-after-viewer-left"
                 ) {
                   resolve(true);
                 }
@@ -473,7 +473,7 @@ async function main() {
         );
         await ownerRoom.localParticipant.publishData(postLeavePayload, {
           reliable: true,
-          topic: "yiqikan:sfu-after-leave",
+          topic: "synced:sfu-after-leave",
           destinationIdentities: [access.lateViewerId]
         });
         await postLeaveReceived;

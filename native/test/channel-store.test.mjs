@@ -52,7 +52,7 @@ function roomFromToken(token) {
 
 test("rotates an unauthenticated legacy code into a stable private credential", async () => {
   globalThis.localStorage = memoryStorage({
-    "yiqikan:host-channel": "F7K9P2WX",
+    "synced:host-channel": "F7K9P2WX",
   });
   const store = await loadChannelStore();
   const first = await store.getHostChannelOwnership();

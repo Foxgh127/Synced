@@ -1,5 +1,5 @@
 [Unit]
-Description=Check the YiQiKan public-IP TLS certificate twice daily
+Description=Check the Synced public-IP TLS certificate twice daily
 
 [Timer]
 OnCalendar=*-*-* 03,15:17:00

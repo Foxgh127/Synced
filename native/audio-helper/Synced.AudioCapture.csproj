@@ -6,8 +6,8 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <AssemblyName>YiQiKan.AudioCapture</AssemblyName>
-    <RootNamespace>YiQiKan.AudioCapture</RootNamespace>
+    <AssemblyName>Synced.AudioCapture</AssemblyName>
+    <RootNamespace>Synced.AudioCapture</RootNamespace>
   </PropertyGroup>
 
   <ItemGroup>

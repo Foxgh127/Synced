@@ -2,7 +2,7 @@
 set -eu
 
 secret_file="${TURN_SECRET_FILE:-/run/secrets/turn_secret}"
-runtime_config="/tmp/yiqikan-turnserver.conf"
+runtime_config="/tmp/synced-turnserver.conf"
 
 if [ ! -r "$secret_file" ]; then
   echo "TURN secret file is missing or unreadable: $secret_file" >&2

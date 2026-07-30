@@ -5,10 +5,10 @@ After=network-online.target coturn.service
 
 [Service]
 Type=simple
-User=yiqikan
-Group=yiqikan
-EnvironmentFile=/etc/yiqikan-livekit.env
-ExecStart=/opt/yiqikan/livekit-entrypoint.sh
+User=synced
+Group=synced
+EnvironmentFile=/etc/synced-livekit.env
+ExecStart=/opt/synced/livekit-entrypoint.sh
 Restart=always
 RestartSec=3s
 TimeoutStopSec=30s

@@ -1,4 +1,4 @@
-process.env.YIQIKAN_E2E = "1";
+process.env.SYNCED_E2E = "1";
 
 const { app, BrowserWindow, screen } = require("electron");
 const path = require("node:path");

@@ -1,4 +1,4 @@
-process.env.YIQIKAN_E2E = "1";
+process.env.SYNCED_E2E = "1";
 
 const { app, BrowserWindow } = require("electron");
 const { writeFileSync } = require("node:fs");
@@ -99,7 +99,7 @@ async function main() {
   })()`);
   const musicScreenshotPath = path.join(
     os.tmpdir(),
-    "yiqikan-music-menu-smoke.png",
+    "synced-music-menu-smoke.png",
   );
   const processAnnotatedSourceCount = captureSources.filter(
     (source) => source.processName || source.executableName,
@@ -153,7 +153,7 @@ async function main() {
   );
   const gameCenterScreenshotPath = path.join(
     os.tmpdir(),
-    "yiqikan-game-center-smoke.png",
+    "synced-game-center-smoke.png",
   );
   writeFileSync(
     gameCenterScreenshotPath,

@@ -55,7 +55,7 @@ test("signal and deployment never impose TURN or SFU bandwidth ceilings", () => 
 test("SFU deployment exposes UDP, TCP, TURN, and reverse-proxied signaling", () => {
   const compose = source("deployment/docker-compose.yml");
   const livekitEntrypoint = source("deployment/livekit-entrypoint.sh");
-  const nginx = source("deployment/nginx-yiqikan-signal-location.conf");
+  const nginx = source("deployment/nginx-synced-signal-location.conf");
 
   assert.match(compose, /network_mode:\s*host/);
   assert.match(compose, /livekit\/livekit-server:v1\.13\.4/);
@@ -265,5 +265,5 @@ test("dynamic membership isolates late joins and departed viewer state", () => {
   assert.match(publicSmoke, /lateViewerJoined:\s*true/);
   assert.match(publicSmoke, /viewerLeaveIsolated:\s*true/);
   assert.match(publicSmoke, /RoomEvent\.ParticipantDisconnected/);
-  assert.match(publicSmoke, /yiqikan-after-viewer-left/);
+  assert.match(publicSmoke, /synced-after-viewer-left/);
 });

@@ -218,10 +218,10 @@ type AudioWithSink = HTMLAudioElement & {
   setSinkId?: (deviceId: string) => Promise<void>;
 };
 
-const INPUT_KEY = "yiqikan:voice-input";
-const OUTPUT_KEY = "yiqikan:voice-output";
-const VOLUME_KEY = "yiqikan:voice-volume";
-const NOISE_MODE_KEY = "yiqikan:voice-noise-mode";
+const INPUT_KEY = "synced:voice-input";
+const OUTPUT_KEY = "synced:voice-output";
+const VOLUME_KEY = "synced:voice-volume";
+const NOISE_MODE_KEY = "synced:voice-noise-mode";
 const DEVICE_CHANGE_DEBOUNCE_MS = 400;
 const SPEAKING_SAMPLE_INTERVAL_MS = 150;
 const SPEAKING_START_LEVEL = 0.032;

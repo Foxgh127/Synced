@@ -4,14 +4,14 @@ const path = require("node:path");
 const { AudioPacketDecoder } = require("../electron/audio-packet.cjs");
 
 const helper =
-  process.env.YIQIKAN_AUDIO_HELPER ||
+  process.env.SYNCED_AUDIO_HELPER ||
   path.join(
     __dirname,
     "..",
     "audio-helper",
     "publish",
     "win-x64",
-    "YiQiKan.AudioCapture.exe",
+    "Synced.AudioCapture.exe",
   );
 
 async function main() {
