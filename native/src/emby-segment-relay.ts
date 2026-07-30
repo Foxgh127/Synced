@@ -96,7 +96,8 @@ export interface EmbySegmentManifest {
   evictionRevision: number;
   tombstones: Array<{
     renditionId: string;
-    throughSequence: number;
+    throughSequence?: number;
+    fromSequence?: number;
     evictionRevision: number;
   }>;
   title: string;
@@ -127,6 +128,9 @@ export interface EmbyAbrDiagnostics {
   cacheHits: number;
   networkFetches: number;
   rangeRetries: number;
+  foregroundFetchBytes: number;
+  backgroundFetchBytes: number;
+  cacheStagingBytes: number;
   appendedSegments: number;
   warmedSegments: number;
   prefetchedSegments: number;
@@ -147,6 +151,7 @@ interface SegmentCacheLike {
   put(url: string, data: Uint8Array, headers?: Headers): Promise<void>;
   delete(url: string): Promise<void>;
   close(): Promise<void>;
+  setMemoryBudget?(bytes: number): void;
 }
 
 function finite(value: unknown, fallback = 0): number {
@@ -415,14 +420,27 @@ export function parseEmbySegmentManifest(
       ? input.tombstones
           .map((value) => ({
             renditionId: String(value?.renditionId || ""),
-            throughSequence: Number(value?.throughSequence),
+            ...(value?.throughSequence === undefined
+              ? {}
+              : { throughSequence: Number(value.throughSequence) }),
+            ...(value?.fromSequence === undefined
+              ? {}
+              : { fromSequence: Number(value.fromSequence) }),
             evictionRevision: Number(value?.evictionRevision),
           }))
           .filter(
             (value) =>
               /^[a-z0-9][a-z0-9-]{0,31}$/u.test(value.renditionId) &&
-              Number.isSafeInteger(value.throughSequence) &&
-              value.throughSequence >= 1 &&
+              ((Number.isSafeInteger(value.throughSequence) &&
+                Number(value.throughSequence) >= 1) ||
+                (Number.isSafeInteger(value.fromSequence) &&
+                  Number(value.fromSequence) >= 1)) &&
+              !(
+                Number.isSafeInteger(value.throughSequence) &&
+                Number.isSafeInteger(value.fromSequence) &&
+                Number(value.throughSequence) >=
+                  Number(value.fromSequence)
+              ) &&
               Number.isSafeInteger(value.evictionRevision) &&
               value.evictionRevision >= 1,
           )
@@ -580,7 +598,9 @@ class BrowserSegmentCache implements SegmentCacheLike {
   private readonly entries = new Map<string, CachedEntry>();
   private readonly memory = new Map<string, Uint8Array>();
   private bytes = 0;
+  private memoryBytes = 0;
   private budgetBytes = 256 * MEBIBYTE;
+  private memoryBudgetBytes = 8 * MEBIBYTE;
   private cachePromise?: Promise<Cache | undefined>;
   private metadataPromise?: Promise<IDBDatabase | undefined>;
   private backgroundIndexStarted = false;
@@ -590,6 +610,14 @@ class BrowserSegmentCache implements SegmentCacheLike {
     private readonly cacheStorage: CacheStorage | undefined =
       globalThis.caches,
   ) {}
+
+  setMemoryBudget(bytes: number): void {
+    this.memoryBudgetBytes = Math.max(
+      0,
+      Math.min(64 * MEBIBYTE, Math.floor(finite(bytes))),
+    );
+    void this.evictMemory();
+  }
 
   private openCache(): Promise<Cache | undefined> {
     if (this.cachePromise) return this.cachePromise;
@@ -828,8 +856,28 @@ class BrowserSegmentCache implements SegmentCacheLike {
         new Response(data.slice(), { headers: responseHeaders }),
       );
     } else {
-      this.memory.set(url, data.slice());
+      const previous = this.memory.get(url);
+      if (previous) {
+        this.memoryBytes = Math.max(
+          0,
+          this.memoryBytes - previous.byteLength,
+        );
+      }
+      if (data.byteLength <= this.memoryBudgetBytes) {
+        const retained = data.slice();
+        this.memory.set(url, retained);
+        this.memoryBytes += retained.byteLength;
+      } else {
+        this.memory.delete(url);
+        const entry = this.entries.get(url);
+        if (entry) {
+          this.entries.delete(url);
+          this.bytes = Math.max(0, this.bytes - entry.bytes);
+          await this.deleteMetadata(url);
+        }
+      }
     }
+    await this.evictMemory();
     await this.evict(cache);
   }
 
@@ -839,7 +887,11 @@ class BrowserSegmentCache implements SegmentCacheLike {
       this.entries.delete(url);
       this.bytes = Math.max(0, this.bytes - previous.bytes);
     }
-    this.memory.delete(url);
+    const memory = this.memory.get(url);
+    if (memory) {
+      this.memoryBytes = Math.max(0, this.memoryBytes - memory.byteLength);
+      this.memory.delete(url);
+    }
     const cache = await this.openCache();
     await Promise.all([
       cache?.delete(url),
@@ -867,7 +919,14 @@ class BrowserSegmentCache implements SegmentCacheLike {
       }
       this.entries.delete(key);
       this.bytes = Math.max(0, this.bytes - entry.bytes);
-      this.memory.delete(key);
+      const memory = this.memory.get(key);
+      if (memory) {
+        this.memoryBytes = Math.max(
+          0,
+          this.memoryBytes - memory.byteLength,
+        );
+        this.memory.delete(key);
+      }
       await Promise.all([
         cache?.delete(key),
         this.deleteMetadata(key),
@@ -875,9 +934,24 @@ class BrowserSegmentCache implements SegmentCacheLike {
     }
   }
 
+  private async evictMemory(): Promise<void> {
+    if (this.memoryBytes <= this.memoryBudgetBytes) return;
+    for (const [key, entry] of this.entries) {
+      if (this.memoryBytes <= this.memoryBudgetBytes) break;
+      const memory = this.memory.get(key);
+      if (!memory) continue;
+      this.memory.delete(key);
+      this.memoryBytes = Math.max(0, this.memoryBytes - memory.byteLength);
+      this.entries.delete(key);
+      this.bytes = Math.max(0, this.bytes - entry.bytes);
+      await this.deleteMetadata(key);
+    }
+  }
+
   async close(): Promise<void> {
     this.closed = true;
     this.memory.clear();
+    this.memoryBytes = 0;
     this.entries.clear();
     this.bytes = 0;
     const database = await this.openMetadata();
@@ -921,6 +995,7 @@ export class EmbyAbrSegmentClient {
   private session?: EmbyPlayerSession;
   private controller?: AbortController;
   private mediaFetchController?: AbortController;
+  private backgroundFetchController?: AbortController;
   private unlinkMediaFetchAbort?: () => void;
   private fetchGeneration = 0;
   private currentRendition?: EmbyRenditionManifest;
@@ -946,6 +1021,9 @@ export class EmbyAbrSegmentClient {
   private lastObservedPlaybackTime = 0;
   private lastRebufferAt = performance.now();
   private backgroundCaching = false;
+  private foregroundFetchBytes = 0;
+  private backgroundFetchBytes = 0;
+  private cacheStagingBytes = 0;
   private readonly backgroundCached = new Set<string>();
   private readonly prefetchCursorByRendition = new Map<string, number>();
   private recoveryTargetTime?: number;
@@ -968,6 +1046,9 @@ export class EmbyAbrSegmentClient {
     cacheHits: 0,
     networkFetches: 0,
     rangeRetries: 0,
+    foregroundFetchBytes: 0,
+    backgroundFetchBytes: 0,
+    cacheStagingBytes: 0,
     appendedSegments: 0,
     warmedSegments: 0,
     prefetchedSegments: 0,
@@ -1025,6 +1106,12 @@ export class EmbyAbrSegmentClient {
       this.access,
     );
     this.cache = options.cache || new BrowserSegmentCache();
+    this.cache.setMemoryBudget?.(
+      finite(
+        this.options.player.bufferProfile.cacheStagingLimitBytes,
+        8 * MEBIBYTE,
+      ),
+    );
     this.fetchImpl = options.fetchImpl || fetch;
     this.options.player.addEventListener?.(
       "segmentrecoveryneeded",
@@ -1034,6 +1121,45 @@ export class EmbyAbrSegmentClient {
 
   private readonly cache: SegmentCacheLike;
   private readonly fetchImpl: typeof fetch;
+
+  private playerCanAcceptMediaBytes(bytes: number): boolean {
+    const candidate = this.options.player as EmbyMsePlayer & {
+      canAcceptMediaBytes?: (requestedBytes: number) => boolean;
+    };
+    return typeof candidate.canAcceptMediaBytes !== "function"
+      ? true
+      : candidate.canAcceptMediaBytes(bytes);
+  }
+
+  private syncExternalMediaMemoryUsage(): void {
+    const candidate = this.options.player as EmbyMsePlayer & {
+      setExternalMediaMemoryUsage?: (usage: {
+        foregroundFetchBytes: number;
+        cacheStagingBytes: number;
+      }) => void;
+    };
+    candidate.setExternalMediaMemoryUsage?.({
+      foregroundFetchBytes:
+        this.foregroundFetchBytes + this.backgroundFetchBytes,
+      cacheStagingBytes: this.cacheStagingBytes,
+    });
+  }
+
+  private unifiedMediaBudgetAllows(additionalBytes: number): boolean {
+    const budget = this.options.player.mediaBudget;
+    if (
+      !budget ||
+      !Number.isFinite(budget.budgetBytes) ||
+      !Number.isFinite(budget.estimatedTotalBytes)
+    ) {
+      return true;
+    }
+    return (
+      budget.estimatedTotalBytes +
+        Math.max(0, Math.ceil(finite(additionalBytes))) <=
+      budget.budgetBytes
+    );
+  }
 
   get diagnostics(): EmbyAbrDiagnostics {
     return {
@@ -1047,6 +1173,9 @@ export class EmbyAbrSegmentClient {
       renditionBitrate: this.currentRendition?.bitrate,
       fetchGeneration: this.fetchGeneration,
       stableSince: this.stableSince,
+      foregroundFetchBytes: this.foregroundFetchBytes,
+      backgroundFetchBytes: this.backgroundFetchBytes,
+      cacheStagingBytes: this.cacheStagingBytes,
     };
   }
 
@@ -1088,6 +1217,7 @@ export class EmbyAbrSegmentClient {
     this.forceRenditionResync = false;
     this.diagnosticsState.relayFallbackActive = true;
     this.mediaFetchController?.abort("relay-media-fallback");
+    this.backgroundFetchController?.abort("relay-media-fallback");
   }
 
   resumeHttps(): void {
@@ -1147,10 +1277,16 @@ export class EmbyAbrSegmentClient {
     this.relayRecoveryNotified = false;
     this.forceRenditionResync = false;
     this.currentRendition = undefined;
+    this.backgroundFetchController?.abort("replaced");
+    this.backgroundFetchController = undefined;
     this.stableSince = performance.now();
     this.upgradeHoldUntil = 0;
     this.lastUpgradeAt = 0;
     this.upgradeFailures = 0;
+    this.foregroundFetchBytes = 0;
+    this.backgroundFetchBytes = 0;
+    this.cacheStagingBytes = 0;
+    this.syncExternalMediaMemoryUsage();
     this.lastObservedPlaybackTime = this.options.player.currentTime;
     this.diagnosticsState = {
       active: true,
@@ -1159,6 +1295,9 @@ export class EmbyAbrSegmentClient {
       cacheHits: 0,
       networkFetches: 0,
       rangeRetries: 0,
+      foregroundFetchBytes: 0,
+      backgroundFetchBytes: 0,
+      cacheStagingBytes: 0,
       appendedSegments: 0,
       warmedSegments: 0,
       prefetchedSegments: 0,
@@ -1172,13 +1311,19 @@ export class EmbyAbrSegmentClient {
   stop(closeCache = false): void {
     this.controller?.abort("replaced");
     this.mediaFetchController?.abort("replaced");
+    this.backgroundFetchController?.abort("replaced");
     this.unlinkMediaFetchAbort?.();
     this.mediaFetchController = undefined;
+    this.backgroundFetchController = undefined;
     this.unlinkMediaFetchAbort = undefined;
     this.controller = undefined;
     this.session = undefined;
     this.descriptor = undefined;
     this.currentRendition = undefined;
+    this.foregroundFetchBytes = 0;
+    this.backgroundFetchBytes = 0;
+    this.cacheStagingBytes = 0;
+    this.syncExternalMediaMemoryUsage();
     this.recoveryTargetTime = undefined;
     this.requiresKeyframe = true;
     this.backgroundCaching = false;
@@ -1422,14 +1567,29 @@ export class EmbyAbrSegmentClient {
     signal: AbortSignal,
   ): Promise<void> {
     if (!this.session || !manifest.renditions.length) return;
+    const bufferProfile = this.options.player.bufferProfile;
+    const mediaBudgetPressured =
+      this.options.player.mediaBudget?.pressured === true;
+    if (mediaBudgetPressured) {
+      this.backgroundFetchController?.abort("media-budget-pressure");
+    }
+    const maxSegmentBytes = Math.max(
+      1,
+      finite(bufferProfile.maxSegmentBytes, MAX_SEGMENT_BYTES),
+    );
     const supportedRenditions = manifest.renditions.filter(
       (rendition) =>
-        typeof globalThis.MediaSource === "undefined" ||
-        typeof globalThis.MediaSource.isTypeSupported !== "function" ||
-        globalThis.MediaSource.isTypeSupported(rendition.mimeType),
+        (typeof globalThis.MediaSource === "undefined" ||
+          typeof globalThis.MediaSource.isTypeSupported !== "function" ||
+          globalThis.MediaSource.isTypeSupported(rendition.mimeType)) &&
+        rendition.segments.every(
+          (segment) => segment.bytes <= maxSegmentBytes,
+        ),
     );
     if (!supportedRenditions.length) {
-      throw new Error("当前设备不支持清单中的任何视频编码档位");
+      throw new Error(
+        "当前设备的解码能力或媒体内存预算不支持清单中的任何档位",
+      );
     }
     const now = performance.now();
     const observedPlaybackTime = this.options.player.currentTime;
@@ -1454,7 +1614,7 @@ export class EmbyAbrSegmentClient {
     }
     this.lastObservedPlaybackTime = currentTime;
     const fetchGeneration = this.fetchGeneration;
-    const selected = selectEmbyAbrRendition(supportedRenditions, {
+    let selected = selectEmbyAbrRendition(supportedRenditions, {
       throughputBps: this.throughputBps,
       preferredHeight: this.preferredHeight,
       currentId: this.currentRendition?.id,
@@ -1463,6 +1623,19 @@ export class EmbyAbrSegmentClient {
       upgradeHoldRemainingMs: Math.max(0, this.upgradeHoldUntil - now),
       upgradeFailureCount: this.upgradeFailures,
     });
+    if (mediaBudgetPressured && this.currentRendition) {
+      const ordered = [...supportedRenditions].sort(
+        (left, right) =>
+          left.bitrate - right.bitrate || left.height - right.height,
+      );
+      const currentIndex = ordered.findIndex(
+        (candidate) => candidate.id === this.currentRendition?.id,
+      );
+      selected =
+        currentIndex > 0
+          ? ordered[currentIndex - 1]
+          : ordered[0];
+    }
     if (
       selected.id !== this.currentRendition?.id ||
       selected.epoch !== this.currentRendition?.epoch ||
@@ -1517,8 +1690,14 @@ export class EmbyAbrSegmentClient {
       return;
     }
     const targetSeconds = Math.max(
-      20,
-      Math.min(60, this.options.player.bufferProfile.targetSeconds),
+      1,
+      Math.min(
+        finite(bufferProfile.targetSeconds, 20),
+        finite(
+          bufferProfile.maxSeconds,
+          finite(bufferProfile.targetSeconds, 20) + 2,
+        ) - finite(bufferProfile.safetyMarginSeconds, 1),
+      ),
     );
     const targetMs = (currentTime + targetSeconds) * 1_000;
     const startMs = Math.max(0, currentTime * 1_000 - 1_500);
@@ -1564,12 +1743,22 @@ export class EmbyAbrSegmentClient {
         throw new Error("分片清单存在时间空洞，已停止追加并刷新清单");
       }
       try {
-        await this.appendSegment(
+        if (
+          !(await this.waitForPlayerCapacity(
+            segment.bytes,
+            fetchSignal,
+            fetchGeneration,
+          ))
+        ) {
+          break;
+        }
+        const appended = await this.appendSegment(
           rendition,
           segment,
           fetchSignal,
           fetchGeneration,
         );
+        if (!appended) break;
       } catch (error) {
         if (
           error instanceof EmbyRelayHttpError &&
@@ -1692,6 +1881,12 @@ export class EmbyAbrSegmentClient {
     // codec is compatible, and rebuilds MediaSource only when the P2P
     // emergency stream used a different MIME type.
     this.options.player.configure(this.session);
+    this.cache.setMemoryBudget?.(
+      finite(
+        this.options.player.bufferProfile.cacheStagingLimitBytes,
+        8 * MEBIBYTE,
+      ),
+    );
     if (needsMediaSourceRebuild) {
       this.deliverySequence = 0;
       this.appended.clear();
@@ -1700,9 +1895,50 @@ export class EmbyAbrSegmentClient {
         this.options.player.currentTime * 1_000,
       );
     }
-    this.options.player.appendInit(init);
+    if (
+      !(await this.waitForPlayerCapacity(
+        init.byteLength,
+        signal,
+        fetchGeneration,
+      )) ||
+      this.options.player.appendInit(init) === false
+    ) {
+      throw new Error("媒体追加队列处于背压状态");
+    }
     this.currentRendition = rendition;
     this.requiresKeyframe = true;
+  }
+
+  private async waitForPlayerCapacity(
+    bytes: number,
+    signal: AbortSignal,
+    fetchGeneration: number,
+  ): Promise<boolean> {
+    const requested = Math.max(0, Math.floor(finite(bytes)));
+    if (
+      requested <= 0 ||
+      requested >
+        finite(
+          this.options.player.bufferProfile.maxSegmentBytes,
+          MAX_SEGMENT_BYTES,
+        )
+    ) {
+      return false;
+    }
+    const deadline = performance.now() + 5_000;
+    while (
+      !signal.aborted &&
+      fetchGeneration === this.fetchGeneration &&
+      !this.playerCanAcceptMediaBytes(requested)
+    ) {
+      if (performance.now() >= deadline) return false;
+      await abortableDelay(signal, 50);
+    }
+    return (
+      !signal.aborted &&
+      fetchGeneration === this.fetchGeneration &&
+      this.playerCanAcceptMediaBytes(requested)
+    );
   }
 
   private async appendSegment(
@@ -1710,7 +1946,7 @@ export class EmbyAbrSegmentClient {
     segment: EmbySegmentManifestEntry,
     signal: AbortSignal,
     fetchGeneration: number,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const key = `${rendition.id}:${rendition.epoch}:${segment.sequence}`;
     const url = mediaUrl(this.baseUrl, segment.path);
     const data = await this.fetchMediaBytes(
@@ -1726,7 +1962,16 @@ export class EmbyAbrSegmentClient {
       this.currentRendition?.id !== rendition.id ||
       this.currentRendition?.epoch !== rendition.epoch
     ) {
-      return;
+      return false;
+    }
+    if (
+      !(await this.waitForPlayerCapacity(
+        data.byteLength,
+        signal,
+        fetchGeneration,
+      ))
+    ) {
+      return false;
     }
     const fragment: EmbyTransportFragment = {
       roomId: this.session.roomId,
@@ -1741,7 +1986,7 @@ export class EmbyAbrSegmentClient {
       keyframe: segment.keyframe,
       data,
     };
-    this.options.player.appendFragment(fragment);
+    if (this.options.player.appendFragment(fragment) === false) return false;
     if (this.requiresKeyframe && segment.keyframe) {
       this.requiresKeyframe = false;
     }
@@ -1759,6 +2004,7 @@ export class EmbyAbrSegmentClient {
       }
     }
     this.diagnosticsState.appendedSegments += 1;
+    return true;
   }
 
   private maybeCacheAhead(
@@ -1768,7 +2014,8 @@ export class EmbyAbrSegmentClient {
     if (
       this.backgroundCaching ||
       signal.aborted ||
-      !this.currentRendition
+      !this.currentRendition ||
+      this.options.player.mediaBudget?.pressured === true
     ) {
       return;
     }
@@ -1780,8 +2027,10 @@ export class EmbyAbrSegmentClient {
       `${rendition.id}:${rendition.epoch}:${segment.sequence}`;
     const warmStartMs =
       currentMs +
-      Math.max(15, this.options.player.bufferProfile.targetSeconds) *
-        1_000;
+      Math.max(
+        1,
+        finite(this.options.player.bufferProfile.targetSeconds, 20),
+      ) * 1_000;
     const warmSegment = embySegmentTimelineWindow(
       rendition.segments,
       warmStartMs,
@@ -1825,6 +2074,17 @@ export class EmbyAbrSegmentClient {
     const segment =
       (warmAllowed ? warmSegment : undefined) || prefetchSegment;
     if (!segment) return;
+    const profile = this.options.player.bufferProfile;
+    if (
+      segment.bytes >
+        finite(profile.maxSegmentBytes, MAX_SEGMENT_BYTES) ||
+      this.foregroundFetchBytes +
+        this.backgroundFetchBytes +
+        segment.bytes >
+        finite(profile.foregroundFetchLimitBytes, 32 * MEBIBYTE)
+    ) {
+      return;
+    }
     const priority = segment.timelineTimeMs <= warmEndMs ? "warm" : "prefetch";
     const prefetchRateLimitBps =
       priority === "prefetch"
@@ -1834,17 +2094,25 @@ export class EmbyAbrSegmentClient {
               PREFETCH_BANDWIDTH_SHARE,
           )
         : undefined;
+    const backgroundController = new AbortController();
+    const unlinkBackgroundAbort = linkAbort(
+      signal,
+      backgroundController,
+    );
+    this.backgroundFetchController?.abort("background-replaced");
+    this.backgroundFetchController = backgroundController;
     this.backgroundCaching = true;
     void this.fetchMediaBytes(
       mediaUrl(this.baseUrl, segment.path),
       segment,
-      signal,
+      backgroundController.signal,
       false,
       prefetchRateLimitBps,
+      true,
     )
       .then(async () => {
         if (
-          signal.aborted ||
+          backgroundController.signal.aborted ||
           fetchGeneration !== this.fetchGeneration
         ) {
           return;
@@ -1864,6 +2132,10 @@ export class EmbyAbrSegmentClient {
       })
       .catch(() => undefined)
       .finally(() => {
+        unlinkBackgroundAbort();
+        if (this.backgroundFetchController === backgroundController) {
+          this.backgroundFetchController = undefined;
+        }
         this.backgroundCaching = false;
       });
   }
@@ -1921,14 +2193,42 @@ export class EmbyAbrSegmentClient {
     signal: AbortSignal,
     init: boolean,
     maxReadBps?: number,
+    background = false,
   ): Promise<Uint8Array> {
+    const profile = this.options.player.bufferProfile;
+    const maxSegmentBytes = Math.max(
+      1,
+      finite(profile.maxSegmentBytes, MAX_SEGMENT_BYTES),
+    );
+    const foregroundFetchLimitBytes = Math.max(
+      maxSegmentBytes * 2,
+      finite(profile.foregroundFetchLimitBytes, 32 * MEBIBYTE),
+    );
+    const cacheStagingLimitBytes = Math.max(
+      0,
+      finite(profile.cacheStagingLimitBytes, 8 * MEBIBYTE),
+    );
+    const expectedBytes = Math.max(0, finite(segment?.bytes));
+    if (
+      expectedBytes > maxSegmentBytes ||
+      (expectedBytes > 0 &&
+        this.foregroundFetchBytes +
+          this.backgroundFetchBytes +
+          expectedBytes >
+          foregroundFetchLimitBytes) ||
+      (expectedBytes > 0 &&
+        !this.unifiedMediaBudgetAllows(expectedBytes))
+    ) {
+      throw new Error("媒体分片超过当前设备的前台拉取预算");
+    }
     const cacheKey = url.toString();
     const cached = await this.cache.get(cacheKey);
     if (cached) {
       const sizeValid =
-        !segment?.bytes ||
-        segment.bytes <= 0 ||
-        cached.byteLength === segment.bytes;
+        cached.byteLength <= maxSegmentBytes &&
+        (!segment?.bytes ||
+          segment.bytes <= 0 ||
+          cached.byteLength === segment.bytes);
       const hashValid =
         !segment?.sha256 ||
         (await sha256Hex(cached)) === segment.sha256;
@@ -1943,143 +2243,222 @@ export class EmbyAbrSegmentClient {
     const startedAt = performance.now();
     const chunks: Uint8Array[] = [];
     let received = 0;
+    let accountedBytes = 0;
     let responseHeaders: Headers | undefined;
-    for (let attempt = 0; attempt <= FETCH_RANGE_RETRIES; attempt += 1) {
-      if (signal.aborted) throw signal.reason;
-      const headers: Record<string, string> = {
-        authorization: `Bearer ${this.access.token}`,
-        accept: init ? "video/mp4" : "video/iso.segment",
-      };
-      if (received > 0) headers.range = `bytes=${received}-`;
-      try {
-        await this.withResponseDeadlines(
-          url,
-          { headers, cache: "no-store" },
-          signal,
-          async (response, controller) => {
-            if (response.status === 401 || response.status === 403) {
-              this.options.onTokenExpiring?.();
-              throw new Error("分片访问凭证已过期");
-            }
-            if (response.status === 404) {
-              throw new EmbyRelayHttpError(404, "segment");
-            }
-            if (received > 0 && response.status === 200) {
-              // Some otherwise valid HTTP caches ignore Range. Restart from
-              // byte zero instead of concatenating a duplicate prefix.
-              chunks.length = 0;
-              received = 0;
-            } else if (received > 0 && response.status !== 206) {
-              throw new Error(`分片续传被拒绝（${response.status}）`);
-            }
-            if (!response.ok) {
-              throw new EmbyRelayHttpError(response.status, "segment");
-            }
-            responseHeaders = response.headers;
-            const receivedBeforeBody = received;
-            const reader = response.body?.getReader();
-            if (!reader) {
-              const data = new Uint8Array(await response.arrayBuffer());
-              chunks.push(data);
-              received += data.byteLength;
-            } else {
-              try {
-                while (true) {
-                  const read = await this.readWithIdleDeadline(
-                    reader,
-                    controller.signal,
-                    controller,
-                  );
-                  if (read.done) break;
-                  if (read.value?.byteLength) {
-                    chunks.push(read.value);
-                    received += read.value.byteLength;
-                    if (received > MAX_SEGMENT_BYTES) {
-                      throw new Error("媒体分片异常过大");
-                    }
-                    if (
-                      maxReadBps !== undefined &&
-                      Number.isFinite(maxReadBps) &&
-                      maxReadBps > 0
-                    ) {
-                      const targetElapsedMs =
-                        (received * 8 * 1_000) / maxReadBps;
-                      let delayMs =
-                        targetElapsedMs -
-                        (performance.now() - startedAt);
-                      while (delayMs > 1 && !controller.signal.aborted) {
-                        await abortableDelay(
-                          controller.signal,
-                          Math.min(1_000, delayMs),
-                        );
-                        delayMs =
+    const adjustFetchBytes = (delta: number): void => {
+      accountedBytes = Math.max(0, accountedBytes + delta);
+      if (background) {
+        this.backgroundFetchBytes = Math.max(
+          0,
+          this.backgroundFetchBytes + delta,
+        );
+      } else {
+        this.foregroundFetchBytes = Math.max(
+          0,
+          this.foregroundFetchBytes + delta,
+        );
+      }
+      this.syncExternalMediaMemoryUsage();
+    };
+    const releaseChunks = (): void => {
+      if (accountedBytes > 0) adjustFetchBytes(-accountedBytes);
+      chunks.length = 0;
+    };
+    const retainChunk = (chunk: Uint8Array): void => {
+      if (
+        received + chunk.byteLength > maxSegmentBytes ||
+        this.foregroundFetchBytes +
+          this.backgroundFetchBytes +
+          chunk.byteLength >
+          foregroundFetchLimitBytes ||
+        !this.unifiedMediaBudgetAllows(chunk.byteLength)
+      ) {
+        throw new Error("媒体分片超过当前设备的前台拉取预算");
+      }
+      chunks.push(chunk);
+      received += chunk.byteLength;
+      adjustFetchBytes(chunk.byteLength);
+    };
+    try {
+      for (let attempt = 0; attempt <= FETCH_RANGE_RETRIES; attempt += 1) {
+        if (signal.aborted) throw signal.reason;
+        const headers: Record<string, string> = {
+          authorization: `Bearer ${this.access.token}`,
+          accept: init ? "video/mp4" : "video/iso.segment",
+        };
+        if (received > 0) headers.range = `bytes=${received}-`;
+        try {
+          await this.withResponseDeadlines(
+            url,
+            { headers, cache: "no-store" },
+            signal,
+            async (response, controller) => {
+              if (response.status === 401 || response.status === 403) {
+                this.options.onTokenExpiring?.();
+                throw new Error("分片访问凭证已过期");
+              }
+              if (response.status === 404) {
+                throw new EmbyRelayHttpError(404, "segment");
+              }
+              if (received > 0 && response.status === 200) {
+                // Some otherwise valid HTTP caches ignore Range. Restart from
+                // byte zero instead of concatenating a duplicate prefix.
+                releaseChunks();
+                received = 0;
+              } else if (received > 0 && response.status !== 206) {
+                throw new Error(`分片续传被拒绝（${response.status}）`);
+              }
+              if (!response.ok) {
+                throw new EmbyRelayHttpError(response.status, "segment");
+              }
+              responseHeaders = response.headers;
+              const receivedBeforeBody = received;
+              const declaredHeader =
+                response.headers.get("content-length");
+              const declaredBytes =
+                declaredHeader === null
+                  ? undefined
+                  : Number(declaredHeader);
+              if (
+                Number.isSafeInteger(declaredBytes) &&
+                Number(declaredBytes) >= 0 &&
+                received + Number(declaredBytes) > maxSegmentBytes
+              ) {
+                throw new Error("媒体分片响应超过当前设备预算");
+              }
+              const reader = response.body?.getReader();
+              if (!reader) {
+                retainChunk(
+                  new Uint8Array(await response.arrayBuffer()),
+                );
+              } else {
+                try {
+                  while (true) {
+                    const read = await this.readWithIdleDeadline(
+                      reader,
+                      controller.signal,
+                      controller,
+                    );
+                    if (read.done) break;
+                    if (read.value?.byteLength) {
+                      retainChunk(read.value);
+                      if (
+                        maxReadBps !== undefined &&
+                        Number.isFinite(maxReadBps) &&
+                        maxReadBps > 0
+                      ) {
+                        const targetElapsedMs =
+                          (received * 8 * 1_000) / maxReadBps;
+                        let delayMs =
                           targetElapsedMs -
                           (performance.now() - startedAt);
+                        while (
+                          delayMs > 1 &&
+                          !controller.signal.aborted
+                        ) {
+                          await abortableDelay(
+                            controller.signal,
+                            Math.min(1_000, delayMs),
+                          );
+                          delayMs =
+                            targetElapsedMs -
+                            (performance.now() - startedAt);
+                        }
                       }
                     }
                   }
+                } finally {
+                  reader.releaseLock();
                 }
-              } finally {
-                reader.releaseLock();
               }
-            }
-            const declaredHeader =
-              response.headers.get("content-length");
-            const declaredBytes =
-              declaredHeader === null
-                ? undefined
-                : Number(declaredHeader);
-            if (
-              declaredBytes !== undefined &&
-              Number.isSafeInteger(declaredBytes) &&
-              declaredBytes >= 0 &&
-              received - receivedBeforeBody !== declaredBytes
-            ) {
-              throw new Error("媒体分片响应体长度不完整");
-            }
-          },
-        );
-        break;
-      } catch (error) {
-        if (
-          signal.aborted ||
-          attempt >= FETCH_RANGE_RETRIES ||
-          (error instanceof EmbyRelayHttpError && error.status === 404)
-        ) {
-          throw error;
+              if (
+                declaredBytes !== undefined &&
+                Number.isSafeInteger(declaredBytes) &&
+                declaredBytes >= 0 &&
+                received - receivedBeforeBody !== declaredBytes
+              ) {
+                throw new Error("媒体分片响应体长度不完整");
+              }
+            },
+          );
+          break;
+        } catch (error) {
+          if (
+            signal.aborted ||
+            attempt >= FETCH_RANGE_RETRIES ||
+            (error instanceof EmbyRelayHttpError && error.status === 404)
+          ) {
+            throw error;
+          }
+          this.diagnosticsState.rangeRetries += 1;
         }
-        this.diagnosticsState.rangeRetries += 1;
       }
+      if (expectedBytes > 0 && received !== expectedBytes) {
+        throw new Error("媒体分片长度不完整");
+      }
+      // The coalescing allocation overlaps with the chunk list. Its peak is
+      // included in the foreground slice before the chunks are released.
+      if (
+        this.foregroundFetchBytes +
+          this.backgroundFetchBytes +
+          received >
+          foregroundFetchLimitBytes ||
+        !this.unifiedMediaBudgetAllows(received)
+      ) {
+        throw new Error("媒体分片合并超过当前设备预算");
+      }
+      const data = new Uint8Array(received);
+      let offset = 0;
+      for (const chunk of chunks) {
+        data.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+      // The chunk allocations can be released now, but keep their accounting
+      // lease until this method returns because the coalesced output owns the
+      // same number of foreground bytes during hashing and cache staging.
+      chunks.length = 0;
+      if (segment?.sha256 && (await sha256Hex(data)) !== segment.sha256) {
+        throw new Error("媒体分片校验失败");
+      }
+      const elapsedMs = Math.max(1, performance.now() - startedAt);
+      const measuredBps = (data.byteLength * 8 * 1_000) / elapsedMs;
+      // Deep prefetch is intentionally paced to a fraction of residual
+      // bandwidth. Feeding that artificial ceiling back into ABR would make a
+      // fast link appear slower after every background fetch and eventually
+      // downgrade healthy playback.
+      this.throughputBps = updateEmbyThroughputEstimate(
+        this.throughputBps,
+        measuredBps,
+        maxReadBps !== undefined,
+      );
+      this.diagnosticsState.networkFetches += 1;
+      // CacheStorage writes clone their body. Only stage a cache write when
+      // that copy fits its dedicated slice; playback itself never waits for
+      // an oversized best-effort cache allocation.
+      if (
+        data.byteLength <= cacheStagingLimitBytes &&
+        this.cacheStagingBytes + data.byteLength <=
+          cacheStagingLimitBytes &&
+        this.unifiedMediaBudgetAllows(data.byteLength)
+      ) {
+        this.cacheStagingBytes += data.byteLength;
+        this.syncExternalMediaMemoryUsage();
+        try {
+          await this.cache
+            .put(cacheKey, data, responseHeaders)
+            .catch(() => undefined);
+        } finally {
+          this.cacheStagingBytes = Math.max(
+            0,
+            this.cacheStagingBytes - data.byteLength,
+          );
+          this.syncExternalMediaMemoryUsage();
+        }
+      }
+      return data;
+    } finally {
+      releaseChunks();
     }
-    const expectedBytes = segment?.bytes;
-    if (expectedBytes !== undefined && expectedBytes > 0 && received !== expectedBytes) {
-      throw new Error("媒体分片长度不完整");
-    }
-    const data = new Uint8Array(received);
-    let offset = 0;
-    for (const chunk of chunks) {
-      data.set(chunk, offset);
-      offset += chunk.byteLength;
-    }
-    if (segment?.sha256 && (await sha256Hex(data)) !== segment.sha256) {
-      throw new Error("媒体分片校验失败");
-    }
-    const elapsedMs = Math.max(1, performance.now() - startedAt);
-    const measuredBps = (data.byteLength * 8 * 1_000) / elapsedMs;
-    // Deep prefetch is intentionally paced to a fraction of residual
-    // bandwidth. Feeding that artificial ceiling back into ABR would make a
-    // fast link appear slower after every background fetch and eventually
-    // downgrade healthy playback.
-    this.throughputBps = updateEmbyThroughputEstimate(
-      this.throughputBps,
-      measuredBps,
-      maxReadBps !== undefined,
-    );
-    this.diagnosticsState.networkFetches += 1;
-    // Playback must not fail merely because the browser denied a best-effort
-    // persistent cache write or another origin consumed the shared quota.
-    await this.cache.put(cacheKey, data, responseHeaders).catch(() => undefined);
-    return data;
   }
 
   private async withResponseDeadlines<T>(

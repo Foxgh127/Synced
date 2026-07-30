@@ -76,6 +76,7 @@ export interface EmbySenderStats {
   bufferedBytes: number;
   queuedMessages: number;
   droppedFragments: number;
+  recoveryGeneration: number;
   queuedDurationMs: number;
   bufferedDurationMs: number;
   totalQueuedDurationMs: number;
@@ -285,12 +286,34 @@ export type EmbyControlMessage =
     }
   | {
       type: "segment-fallback-request";
+      requestId: string;
       sessionId: string;
       mediaVersion: number;
+      transportEpoch: number;
       targetTime: number;
     }
   | {
+      type: "segment-fallback-offer";
+      requestId: string;
+      sessionId: string;
+      mediaVersion: number;
+      transportEpoch: number;
+      mimeType: string;
+      videoCodec: "h264" | "hevc";
+      audioCodec: "aac";
+      plan: EmbyStreamPlan;
+      targetTime: number;
+    }
+  | {
+      type: "segment-fallback-ready";
+      requestId: string;
+      sessionId: string;
+      mediaVersion: number;
+      transportEpoch: number;
+    }
+  | {
       type: "segment-fallback-ack";
+      requestId: string;
       sessionId: string;
       mediaVersion: number;
       transportEpoch: number;
@@ -729,6 +752,7 @@ export class EmbyFragmentCache {
       )
       .sort((left, right) => left.sequence - right.sequence);
     if (!candidates.length) return [];
+    if (!candidates.some((fragment) => fragment.keyframe)) return [];
     let start = candidates.findIndex(
       (fragment) => fragment.mediaTimeMs >= mediaTimeMs,
     );
@@ -789,6 +813,7 @@ interface QueuedPacket {
   chunkIndex?: number;
   mediaTimeMs?: number;
   trackType?: EmbyTrackType;
+  keyframe?: boolean;
   priority: boolean;
   packetKey?: string;
   fragmentKey?: string;
@@ -800,6 +825,7 @@ interface QueuedFragment {
   activeItems: number;
   mediaTimeMs?: number;
   mediaBytes: number;
+  keyframe: boolean;
 }
 
 const COALESCED_CONTROL_TYPES = new Set<EmbyControlMessage["type"]>([
@@ -837,6 +863,9 @@ export class EmbyPeerSender {
   >();
   private queuedControlBytes = 0;
   private droppedFragments = 0;
+  private recoveryGeneration = 0;
+  private mediaRecoveryRequired = false;
+  private awaitingRecoveryKeyframe = false;
   private pumping = false;
   private closed = false;
   private mediaClosed = false;
@@ -939,6 +968,19 @@ export class EmbyPeerSender {
     } = {},
   ): void {
     if (this.closed || this.mediaClosed) return;
+    if (
+      !options.onlyChunks &&
+      fragment.trackType === "muxed" &&
+      fragment.sequence > 0 &&
+      this.awaitingRecoveryKeyframe
+    ) {
+      if (!fragment.keyframe) {
+        this.droppedFragments += 1;
+        this.publishStats();
+        return;
+      }
+      this.awaitingRecoveryKeyframe = false;
+    }
     const onlyChunks = options.onlyChunks
       ? new Set(options.onlyChunks)
       : undefined;
@@ -963,6 +1005,7 @@ export class EmbyPeerSender {
         chunkIndex: header.chunkIndex,
         mediaTimeMs: fragment.mediaTimeMs,
         trackType: fragment.trackType,
+        keyframe: fragment.keyframe,
         priority: options.priority === true,
       });
     }
@@ -996,7 +1039,12 @@ export class EmbyPeerSender {
     this.publishStats();
   }
 
-  clearMediaQueue(): void {
+  clearMediaQueue(
+    options: { waitForKeyframe?: boolean } = {},
+  ): void {
+    this.mediaRecoveryRequired = false;
+    this.awaitingRecoveryKeyframe =
+      options.waitForKeyframe === true;
     this.forEachQueuedPacket((item) => {
       if (item.mediaVersion !== undefined) this.deactivatePacket(item);
     });
@@ -1024,6 +1072,7 @@ export class EmbyPeerSender {
       bufferedBytes: this.mediaClosed ? 0 : this.channel.bufferedAmount,
       queuedMessages: this.queuedMessages,
       droppedFragments: this.droppedFragments,
+      recoveryGeneration: this.recoveryGeneration,
       queuedDurationMs,
       bufferedDurationMs,
       totalQueuedDurationMs: queuedDurationMs + bufferedDurationMs,
@@ -1133,6 +1182,7 @@ export class EmbyPeerSender {
           activeItems: 0,
           mediaTimeMs: isTimedMedia ? item.mediaTimeMs : undefined,
           mediaBytes: 0,
+          keyframe: item.keyframe === true,
         };
         this.queuedFragments.set(item.fragmentKey, fragment);
         this.fragmentOrder.push(item.fragmentKey);
@@ -1160,12 +1210,39 @@ export class EmbyPeerSender {
       8 * 1024 * 1024,
       Math.floor(maxQueued * 0.65),
     );
-    while (this.queuedBytes > lowWater) {
+    let removedFragments = 0;
+    while (true) {
       const fragmentKey = this.nextQueuedFragmentKey();
       if (!fragmentKey) break;
+      const fragment = this.queuedFragments.get(fragmentKey);
+      if (
+        this.queuedBytes <= lowWater &&
+        fragment?.keyframe === true
+      ) {
+        // Keep the first complete GOP boundary after the discarded backlog.
+        // nextQueuedFragmentKey() advanced the cursor, so rewind this one item
+        // and let normal pumping start exactly at the keyframe.
+        this.fragmentOrderHead = Math.max(
+          0,
+          this.fragmentOrderHead - 1,
+        );
+        break;
+      }
       if (this.cancelFragment(fragmentKey)) {
         this.droppedFragments += 1;
+        removedFragments += 1;
       }
+    }
+    if (removedFragments > 0) {
+      // Do not send a decodable-looking tail before the controller has
+      // advanced the transport epoch, sent resync + init, and re-primed from
+      // the retained keyframe. If no keyframe was queued, the media queue is
+      // intentionally empty until the controller supplies the next GOP.
+      this.mediaRecoveryRequired = true;
+      this.recoveryGeneration = Math.min(
+        Number.MAX_SAFE_INTEGER,
+        this.recoveryGeneration + 1,
+      );
     }
     if (this.queuedBytes > maxQueued) {
       // Only init/control packets can remain here. A legitimate init segment
@@ -1182,6 +1259,7 @@ export class EmbyPeerSender {
       this.pumping ||
       this.closed ||
       this.mediaClosed ||
+      this.mediaRecoveryRequired ||
       this.channel.readyState !== "open"
     ) {
       return;
@@ -1549,10 +1627,19 @@ export interface EmbyAssemblyAbandonment {
   reason: "capacity" | "header-conflict" | "repair-exhausted";
 }
 
+export interface EmbyFragmentAssemblerLimits {
+  maxPendingBytes?: number;
+  maxFragmentBytes?: number;
+  maxPendingAssemblies?: number;
+}
+
 export class EmbyFragmentAssembler {
   private pending = new Map<string, PendingAssembly>();
   private pendingDeclaredBytes = 0;
   private activeTransportEpoch: number;
+  private readonly maxPendingBytes: number;
+  private readonly maxFragmentBytes: number;
+  private readonly maxPendingAssemblies: number;
 
   constructor(
     private readonly expected: {
@@ -1573,6 +1660,7 @@ export class EmbyFragmentAssembler {
     private readonly onAbandoned?: (
       detail: EmbyAssemblyAbandonment,
     ) => void,
+    limits: EmbyFragmentAssemblerLimits = {},
   ) {
     const initialEpoch = Number(expected.transportEpoch ?? 0);
     this.activeTransportEpoch =
@@ -1581,6 +1669,34 @@ export class EmbyFragmentAssembler {
       initialEpoch <= 1_000_000_000
         ? initialEpoch
         : 0;
+    this.maxPendingBytes = Math.max(
+      EMBY_CHUNK_BYTES,
+      Math.min(
+        MAX_PENDING_ASSEMBLY_BYTES,
+        Number.isFinite(limits.maxPendingBytes)
+          ? Math.floor(Number(limits.maxPendingBytes))
+          : MAX_PENDING_ASSEMBLY_BYTES,
+      ),
+    );
+    this.maxFragmentBytes = Math.max(
+      EMBY_CHUNK_BYTES,
+      Math.min(
+        MAX_FRAGMENT_BYTES,
+        this.maxPendingBytes,
+        Number.isFinite(limits.maxFragmentBytes)
+          ? Math.floor(Number(limits.maxFragmentBytes))
+          : MAX_FRAGMENT_BYTES,
+      ),
+    );
+    this.maxPendingAssemblies = Math.max(
+      1,
+      Math.min(
+        MAX_PENDING_ASSEMBLIES,
+        Number.isFinite(limits.maxPendingAssemblies)
+          ? Math.floor(Number(limits.maxPendingAssemblies))
+          : MAX_PENDING_ASSEMBLIES,
+      ),
+    );
   }
 
   get transportEpoch(): number {
@@ -1589,6 +1705,10 @@ export class EmbyFragmentAssembler {
 
   get hasPending(): boolean {
     return this.pending.size > 0;
+  }
+
+  get pendingBytes(): number {
+    return this.pendingDeclaredBytes;
   }
 
   advanceTransportEpoch(transportEpoch: number): boolean {
@@ -1620,20 +1740,42 @@ export class EmbyFragmentAssembler {
       this.reset();
       this.activeTransportEpoch = header.transportEpoch;
     }
+    if (header.dataLength > this.maxFragmentBytes) {
+      this.onAbandoned?.({
+        mediaVersion: header.mediaVersion,
+        fragmentSeq: header.fragmentSeq,
+        trackType: header.trackType,
+        transportEpoch: header.transportEpoch,
+        keyframe: header.keyframe,
+        reason: "capacity",
+      });
+      return;
+    }
     const key =
       `${header.mediaVersion}:${header.transportEpoch}:` +
       `${header.trackType}:${header.fragmentSeq}`;
     let assembly = this.pending.get(key);
     if (!assembly) {
       while (
-        this.pending.size >= MAX_PENDING_ASSEMBLIES ||
+        this.pending.size >= this.maxPendingAssemblies ||
         (this.pending.size > 0 &&
           this.pendingDeclaredBytes + header.dataLength >
-            MAX_PENDING_ASSEMBLY_BYTES)
+            this.maxPendingBytes)
       ) {
         const oldest = this.pending.keys().next().value as string | undefined;
         if (oldest) this.abandonAssembly(oldest, "capacity");
         else break;
+      }
+      if (this.pendingDeclaredBytes + header.dataLength > this.maxPendingBytes) {
+        this.onAbandoned?.({
+          mediaVersion: header.mediaVersion,
+          fragmentSeq: header.fragmentSeq,
+          trackType: header.trackType,
+          transportEpoch: header.transportEpoch,
+          keyframe: header.keyframe,
+          reason: "capacity",
+        });
+        return;
       }
       assembly = {
         header,

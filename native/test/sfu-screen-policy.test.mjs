@@ -74,6 +74,43 @@ test("1440p SFU subscription policy maps every viewer rung explicitly", async ()
   );
 });
 
+test("SFU emergency publication requires verified 480p track settings", async () => {
+  const { isVerifiedEmergencyTrackSettings } = await loadModule("src/sfu.ts");
+  assert.equal(
+    isVerifiedEmergencyTrackSettings({
+      width: 854,
+      height: 480,
+      frameRate: 24,
+    }),
+    true,
+  );
+  assert.equal(
+    isVerifiedEmergencyTrackSettings({
+      width: 2560,
+      height: 1440,
+      frameRate: 24,
+    }),
+    false,
+    "a driver that ignores clone constraints cannot be labelled 480p",
+  );
+  assert.equal(
+    isVerifiedEmergencyTrackSettings({
+      width: 854,
+      height: 480,
+    }),
+    false,
+    "frame rate must be measured rather than inferred from the publication name",
+  );
+  assert.equal(
+    isVerifiedEmergencyTrackSettings({
+      width: 854,
+      height: 480,
+      frameRate: 30,
+    }),
+    false,
+  );
+});
+
 test("one weak viewer degrades within two seconds without changing peers", async () => {
   const { AdaptivePlaybackController } = await loadModule(
     "src/adaptive-playback.ts",

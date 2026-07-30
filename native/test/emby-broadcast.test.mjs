@@ -1296,7 +1296,7 @@ test("viewer handshake separates control traffic and synchronizes initial play",
   await controller.destroy();
 });
 
-test("CMAF viewers keep media idle until a viewer-scoped partial-reliability fallback request", async (t) => {
+test("CMAF fallback waits for an exact profile offer and viewer-ready barrier", async (t) => {
   const {
     EMBY_CONTROL_CHANNEL_LABEL,
     EMBY_DATA_CHANNEL_LABEL,
@@ -1391,15 +1391,17 @@ test("CMAF viewers keep media idle until a viewer-scoped partial-reliability fal
     new MessageEvent("message", {
       data: JSON.stringify({
         type: "segment-fallback-request",
+        requestId: "request-fallback-0001",
         sessionId: controller.sessionId,
         mediaVersion: 1,
+        transportEpoch: 0,
         targetTime: 0,
       }),
     }),
   );
   assert.equal(
     controller.peers.get("viewer-segment-fallback")
-      .pendingMediaFallbackTarget,
+      .mediaFallbackOffer.targetTime,
     0,
     "a request that races ahead of session-ready is retained",
   );
@@ -1414,13 +1416,34 @@ test("CMAF viewers keep media idle until a viewer-scoped partial-reliability fal
       }),
     }),
   );
-  await new Promise((resolve) => setTimeout(resolve, 60));
+  const fallbackOffer = control.sent
+    .filter((value) => typeof value === "string")
+    .map((value) => JSON.parse(value))
+    .find((message) => message.type === "segment-fallback-offer");
+  assert.equal(fallbackOffer.requestId, "request-fallback-0001");
+  assert.equal(fallbackOffer.transportEpoch, 1);
+  assert.equal(fallbackOffer.mimeType, controller.mimeType);
+  assert.equal(fallbackOffer.videoCodec, "h264");
+  assert.equal(media.sent.length, 0, "media cannot outrun viewer readiness");
+  control.dispatchEvent(
+    new MessageEvent("message", {
+      data: JSON.stringify({
+        type: "segment-fallback-ready",
+        requestId: fallbackOffer.requestId,
+        sessionId: controller.sessionId,
+        mediaVersion: 1,
+        transportEpoch: fallbackOffer.transportEpoch,
+      }),
+    }),
+  );
+  await new Promise((resolve) => setTimeout(resolve, 10));
   const fallbackAck = control.sent
     .filter((value) => typeof value === "string")
     .map((value) => JSON.parse(value))
     .find((message) => message.type === "segment-fallback-ack");
   assert.deepEqual(fallbackAck, {
     type: "segment-fallback-ack",
+    requestId: "request-fallback-0001",
     sessionId: controller.sessionId,
     mediaVersion: 1,
     transportEpoch: 1,
@@ -1439,6 +1462,36 @@ test("CMAF viewers keep media idle until a viewer-scoped partial-reliability fal
   assert.equal(
     controller.peers.get("viewer-segment-fallback").mediaFallbackActive,
     true,
+  );
+  const acknowledgementsBeforeRetry = control.sent
+    .filter((value) => typeof value === "string")
+    .map((value) => JSON.parse(value))
+    .filter((message) => message.type === "segment-fallback-ack").length;
+  control.dispatchEvent(
+    new MessageEvent("message", {
+      data: JSON.stringify({
+        type: "segment-fallback-request",
+        requestId: "request-fallback-0001",
+        sessionId: controller.sessionId,
+        mediaVersion: 1,
+        transportEpoch: 0,
+        targetTime: 0,
+      }),
+    }),
+  );
+  const retryMessages = control.sent
+    .filter((value) => typeof value === "string")
+    .map((value) => JSON.parse(value));
+  assert.ok(
+    retryMessages.filter(
+      (message) => message.type === "segment-fallback-ack",
+    ).length > acknowledgementsBeforeRetry,
+    "a lost ACK is idempotently retransmitted for the same request",
+  );
+  assert.equal(
+    controller.peers.get("viewer-segment-fallback").transportEpoch,
+    1,
+    "a duplicate request never advances the epoch twice",
   );
 
   control.dispatchEvent(

@@ -585,6 +585,10 @@ test("active-session LRU trims only expired history and exposes a coordinated to
     const coordinatedBody = Buffer.from(
       JSON.stringify(coordinatedManifest),
     );
+    // The hard cap is deliberately one byte below the pre-eviction store.
+    // Make room for the larger coordinated manifest itself after asserting
+    // that the cold segment was reclaimed.
+    relay.store.maxDiskBytes += 4 * 1024;
     const resumed = await fetch(
       `${server.baseUrl}${ROOT}/manifest.json`,
       {
@@ -604,6 +608,177 @@ test("active-session LRU trims only expired history and exposes a coordinated to
     ).json();
     assert.equal(finalManifest.playbackTimeMs, 102_000);
     assert.equal(finalManifest.ended, true);
+  } finally {
+    await server.close();
+    await relay.close();
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("active relay reclaims a far-future suffix and rejects writes past its hard cap", async () => {
+  const rootDir = await mkdtemp(path.join(tmpdir(), "synced-relay-suffix-"));
+  const relay = createSegmentRelay({
+    rootDir,
+    secret: "fixture-secret-with-enough-entropy-for-tests",
+  });
+  const server = await listen(relay);
+  try {
+    const publish = relay.issueToken({
+      room: ROOM,
+      clientId: "host",
+      scope: "publish",
+    });
+    const read = relay.issueToken({
+      room: ROOM,
+      clientId: "viewer",
+      scope: "read",
+    });
+    relay.activateSession(ROOM, SESSION);
+    const initPath = `${ROOT}/renditions/720p4/init.mp4`;
+    const segmentPath = (sequence) =>
+      `${ROOT}/renditions/720p4/segments/${sequence}.m4s`;
+    const init = await fetch(`${server.baseUrl}${initPath}`, {
+      method: "PUT",
+      headers: {
+        ...authorization(publish.token),
+        "content-length": "4",
+      },
+      body: "init",
+    });
+    assert.equal(init.status, 201);
+    const timeline = [80_000, 100_000, 200_000, 400_000, 600_000];
+    const segmentBytes = 1024 * 1024;
+    for (let index = 0; index < timeline.length; index += 1) {
+      const sequence = index + 1;
+      const body = Buffer.alloc(segmentBytes, sequence);
+      const response = await fetch(
+        `${server.baseUrl}${segmentPath(sequence)}`,
+        {
+          method: "PUT",
+          headers: {
+            ...authorization(publish.token),
+            "content-length": String(body.length),
+            "x-synced-media-time-ms": String(timeline[index]),
+            "x-synced-timeline-time-ms": String(timeline[index]),
+            "x-synced-duration-ms": "2000",
+            "x-synced-keyframe": "true",
+          },
+          body,
+        },
+      );
+      assert.equal(response.status, 201);
+    }
+    const manifest = {
+      protocol: "synced-cmaf-v1",
+      segmentEncoding: "tuple-v1",
+      roomId: ROOM,
+      sessionId: SESSION,
+      assetId: ASSET,
+      mediaVersion: VERSION,
+      revision: 1,
+      evictionRevision: 0,
+      acknowledgedEvictionRevision: 0,
+      tombstones: [],
+      title: "Suffix fixture",
+      startTimeTicks: 0,
+      playbackTimeMs: 100_000,
+      ended: true,
+      updatedAt: Date.now(),
+      renditions: [
+        {
+          id: "720p4",
+          bitrate: 4_000_000,
+          mimeType: 'video/mp4; codecs="avc1.64001f,mp4a.40.2"',
+          initPath,
+          ended: true,
+          finalSequence: 5,
+          finalTimelineEndMs: 602_000,
+          segments: timeline.map((time, index) => [
+            index + 1,
+            time,
+            time,
+            2_000,
+            1,
+            segmentBytes,
+          ]),
+        },
+      ],
+    };
+    const body = Buffer.from(JSON.stringify(manifest));
+    const uploaded = await fetch(`${server.baseUrl}${ROOT}/manifest.json`, {
+      method: "PUT",
+      headers: {
+        ...authorization(publish.token),
+        "content-length": String(body.length),
+      },
+      body,
+    });
+    assert.equal(uploaded.status, 201);
+
+    relay.store.maxDiskBytes = relay.snapshot().diskBytes - 1;
+    relay.store.evict();
+    assert.ok(
+      relay.snapshot().diskBytes <= relay.store.maxDiskBytes,
+      "eviction returns the active store to its configured hard ceiling",
+    );
+    for (const sequence of [1, 2, 3]) {
+      const current = await fetch(
+        `${server.baseUrl}${segmentPath(sequence)}`,
+        { headers: authorization(read.token) },
+      );
+      assert.equal(current.status, 200);
+    }
+    for (const sequence of [4, 5]) {
+      const farFuture = await fetch(
+        `${server.baseUrl}${segmentPath(sequence)}`,
+        { headers: authorization(read.token) },
+      );
+      assert.equal(farFuture.status, 404);
+    }
+    const trimmed = await (
+      await fetch(`${server.baseUrl}${ROOT}/manifest.json`, {
+        headers: authorization(read.token),
+      })
+    ).json();
+    assert.deepEqual(
+      trimmed.renditions[0].segments.map((segment) => segment[0]),
+      [1, 2, 3],
+    );
+    assert.equal(trimmed.ended, false);
+    assert.equal(trimmed.renditions[0].ended, false);
+    assert.deepEqual(trimmed.tombstones, [
+      {
+        renditionId: "720p4",
+        fromSequence: 4,
+        evictionRevision: 1,
+      },
+    ]);
+
+    const beforeRejectedWrite = relay.snapshot().diskBytes;
+    relay.store.maxDiskBytes = beforeRejectedWrite + segmentBytes / 2;
+    const rejectedBody = Buffer.alloc(segmentBytes, 6);
+    const rejected = await fetch(
+      `${server.baseUrl}${segmentPath(6)}`,
+      {
+        method: "PUT",
+        headers: {
+          ...authorization(publish.token),
+          "content-length": String(rejectedBody.length),
+          "x-synced-media-time-ms": "700000",
+          "x-synced-timeline-time-ms": "700000",
+          "x-synced-duration-ms": "2000",
+          "x-synced-keyframe": "true",
+        },
+        body: rejectedBody,
+      },
+    );
+    assert.equal(rejected.status, 507);
+    assert.equal(rejected.headers.get("x-synced-storage-pressure"), "true");
+    const pressure = await rejected.json();
+    assert.equal(pressure.code, "storage-capacity-exceeded");
+    assert.equal(pressure.storagePressure, true);
+    assert.equal(relay.snapshot().diskBytes, beforeRejectedWrite);
+    assert.ok(relay.snapshot().diskBytes <= relay.store.maxDiskBytes);
   } finally {
     await server.close();
     await relay.close();

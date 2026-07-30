@@ -1073,6 +1073,113 @@ function normalizedIp(value) {
   return isIP(normalized) ? normalized : undefined;
 }
 
+function ipValue(value) {
+  const normalized = normalizedIp(value);
+  const version = isIP(normalized || "");
+  if (version === 4) {
+    const octets = normalized.split(".").map(Number);
+    if (
+      octets.length !== 4 ||
+      octets.some(
+        (octet) =>
+          !Number.isInteger(octet) || octet < 0 || octet > 255,
+      )
+    ) {
+      return undefined;
+    }
+    return {
+      version,
+      bits: 32,
+      value: octets.reduce(
+        (result, octet) => (result << 8n) | BigInt(octet),
+        0n,
+      ),
+    };
+  }
+  if (version !== 6) return undefined;
+  const halves = normalized.toLowerCase().split("::");
+  if (halves.length > 2) return undefined;
+  const expand = (part) => {
+    if (!part) return [];
+    return part.split(":").flatMap((word) => {
+      if (!word.includes(".")) return [word];
+      const embedded = ipValue(word);
+      if (!embedded || embedded.version !== 4) return [];
+      return [
+        Number((embedded.value >> 16n) & 0xffffn).toString(16),
+        Number(embedded.value & 0xffffn).toString(16),
+      ];
+    });
+  };
+  const left = expand(halves[0]);
+  const right = halves.length === 2 ? expand(halves[1]) : [];
+  const missing = 8 - left.length - right.length;
+  if (
+    left.length + right.length > 8 ||
+    (halves.length === 1 && missing !== 0) ||
+    (halves.length === 2 && missing < 1)
+  ) {
+    return undefined;
+  }
+  const words = [
+    ...left,
+    ...Array.from({ length: Math.max(0, missing) }, () => "0"),
+    ...right,
+  ];
+  if (
+    words.length !== 8 ||
+    words.some((word) => !/^[0-9a-f]{1,4}$/i.test(word))
+  ) {
+    return undefined;
+  }
+  return {
+    version,
+    bits: 128,
+    value: words.reduce(
+      (result, word) => (result << 16n) | BigInt(`0x${word}`),
+      0n,
+    ),
+  };
+}
+
+function ipInCidr(value, cidr) {
+  const [networkText, prefixText, extra] = String(cidr || "")
+    .trim()
+    .split("/");
+  if (!networkText || extra !== undefined) return false;
+  const address = ipValue(value);
+  const network = ipValue(networkText);
+  if (!address || !network || address.version !== network.version) {
+    return false;
+  }
+  const prefix =
+    prefixText === undefined || prefixText === ""
+      ? network.bits
+      : Number(prefixText);
+  if (
+    !Number.isInteger(prefix) ||
+    prefix < 0 ||
+    prefix > network.bits
+  ) {
+    return false;
+  }
+  const shift = BigInt(network.bits - prefix);
+  return address.value >> shift === network.value >> shift;
+}
+
+function trustedProxy(request, env) {
+  if (env.TRUST_PROXY !== "true") return false;
+  const directIp = normalizedIp(request.socket.remoteAddress);
+  if (!directIp) return false;
+  const configured = String(
+    env.TRUSTED_PROXY_CIDRS || "127.0.0.1/32,::1/128",
+  )
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+  return configured.some((cidr) => ipInCidr(directIp, cidr));
+}
+
 function ipv6Prefix64(value) {
   const convertPart = (part) => {
     if (!part.includes(".")) return [part];
@@ -1128,10 +1235,7 @@ function rateLimitKey(ip) {
 
 function requestIp(request, env) {
   const directIp = normalizedIp(request.socket.remoteAddress) || "unknown";
-  const localProxy =
-    directIp === "127.0.0.1" ||
-    directIp === "::1";
-  if (env.TRUST_PROXY === "true" && localProxy) {
+  if (trustedProxy(request, env)) {
     const forwardedHeader = request.headers["x-forwarded-for"];
     const forwardedValues = (
       Array.isArray(forwardedHeader)
@@ -1554,16 +1658,80 @@ export function createSignalServer(options = {}) {
       .map(participantFor);
   }
 
-  function broadcastRoom(room, payload, exceptId) {
+  const participantStateTypes = new Set([
+    "participant:joined",
+    "participant:updated",
+    "participant:left",
+    "voice:joined",
+    "voice:left",
+    "moderation:microphone",
+    "moderation:kicked",
+  ]);
+  const broadcastStateTypes = new Set([
+    "broadcast:granted",
+    "broadcast:started",
+    "broadcast:stopped",
+    "broadcast:capabilities",
+  ]);
+
+  function advanceRoomState(room, type) {
+    room.roomRevision = Math.min(
+      Number.MAX_SAFE_INTEGER,
+      Math.max(0, Number(room.roomRevision) || 0) + 1,
+    );
+    if (participantStateTypes.has(type)) {
+      room.participantRevision = Math.min(
+        Number.MAX_SAFE_INTEGER,
+        Math.max(0, Number(room.participantRevision) || 0) + 1,
+      );
+    }
+    if (broadcastStateTypes.has(type)) {
+      room.broadcastRevision = Math.min(
+        Number.MAX_SAFE_INTEGER,
+        Math.max(0, Number(room.broadcastRevision) || 0) + 1,
+      );
+    }
+  }
+
+  function roomStateEnvelope(room, payload) {
+    return {
+      ...payload,
+      roomRevision: Math.max(0, Number(room.roomRevision) || 0),
+      participantRevision: Math.max(
+        0,
+        Number(room.participantRevision) || 0,
+      ),
+      broadcastRevision: Math.max(
+        0,
+        Number(room.broadcastRevision) || 0,
+      ),
+    };
+  }
+
+  function broadcastRoom(
+    room,
+    payload,
+    exceptId,
+    { advance = true } = {},
+  ) {
+    if (
+      advance &&
+      (participantStateTypes.has(payload?.type) ||
+        broadcastStateTypes.has(payload?.type))
+    ) {
+      advanceRoomState(room, payload.type);
+    }
+    const envelope = roomStateEnvelope(room, payload);
     for (const id of getRoomClientIds(room)) {
       if (id === exceptId) {
         continue;
       }
       const client = clients.get(id);
       if (client) {
-        send(client.socket, payload);
+        send(client.socket, envelope);
       }
     }
+    return envelope;
   }
 
   function iceConfigurationFor(roomCode, clientId) {
@@ -2565,6 +2733,9 @@ export function createSignalServer(options = {}) {
             broadcasterId: undefined,
             broadcastCapabilities: undefined,
             segmentSessionId: undefined,
+            roomRevision: 0,
+            participantRevision: 0,
+            broadcastRevision: 0,
             networkAdviceRevision: 0,
             networkAdviceByRecipient: new Map(),
             lastNetworkAdviceAt: 0,
@@ -2688,25 +2859,29 @@ export function createSignalServer(options = {}) {
           metrics.resumedConnectionsTotal += 1;
           clearTimeout(joinTimer);
           resumeClient.socket.terminate();
-          send(socket, {
-            type: "channel:joined",
-            ...signalCompatibility(),
-            room: roomCode,
-            clientId,
-            created: false,
-            resumed: true,
-            channelName: room.channelName,
-            broadcasterId: room.broadcasterId,
-            broadcastCapabilities: room.broadcastCapabilities,
-            participants: getRoomParticipants(room),
-            segmentRelay: segmentRelayAccess(
-              state,
-              room.broadcasterId === clientId && state.broadcasting
-                ? "publish"
-                : "read",
-            ),
-            ...clientIceConfiguration(state),
-          });
+          advanceRoomState(room, "participant:updated");
+          send(
+            socket,
+            roomStateEnvelope(room, {
+              type: "channel:joined",
+              ...signalCompatibility(),
+              room: roomCode,
+              clientId,
+              created: false,
+              resumed: true,
+              channelName: room.channelName,
+              broadcasterId: room.broadcasterId,
+              broadcastCapabilities: room.broadcastCapabilities,
+              participants: getRoomParticipants(room),
+              segmentRelay: segmentRelayAccess(
+                state,
+                room.broadcasterId === clientId && state.broadcasting
+                  ? "publish"
+                  : "read",
+              ),
+              ...clientIceConfiguration(state),
+            }),
+          );
           broadcastRoom(
             room,
             {
@@ -2714,6 +2889,7 @@ export function createSignalServer(options = {}) {
               participant: participantFor(state),
             },
             clientId,
+            { advance: false },
           );
           broadcastNetworkAdvice(room);
           if (room.broadcasterId === clientId) {
@@ -2763,24 +2939,28 @@ export function createSignalServer(options = {}) {
         );
         room.members.add(clientId);
         clearTimeout(joinTimer);
-        send(socket, {
-          type: "channel:joined",
-          ...signalCompatibility(),
-          room: roomCode,
-          clientId,
-          created,
-          channelName: room.channelName,
-          broadcasterId: room.broadcasterId,
-          broadcastCapabilities: room.broadcastCapabilities,
-          participants: getRoomParticipants(room),
-          segmentRelay: segmentRelayAccess(
-            state,
-            room.broadcasterId === clientId && state.broadcasting
-              ? "publish"
-              : "read",
-          ),
-          ...clientIceConfiguration(state),
-        });
+        advanceRoomState(room, "participant:joined");
+        send(
+          socket,
+          roomStateEnvelope(room, {
+            type: "channel:joined",
+            ...signalCompatibility(),
+            room: roomCode,
+            clientId,
+            created,
+            channelName: room.channelName,
+            broadcasterId: room.broadcasterId,
+            broadcastCapabilities: room.broadcastCapabilities,
+            participants: getRoomParticipants(room),
+            segmentRelay: segmentRelayAccess(
+              state,
+              room.broadcasterId === clientId && state.broadcasting
+                ? "publish"
+                : "read",
+            ),
+            ...clientIceConfiguration(state),
+          }),
+        );
         broadcastRoom(
           room,
           {
@@ -2788,6 +2968,7 @@ export function createSignalServer(options = {}) {
             participant: participantFor(state),
           },
           clientId,
+          { advance: false },
         );
         broadcastNetworkAdvice(room);
         return;
@@ -2829,6 +3010,9 @@ export function createSignalServer(options = {}) {
           broadcasterId: clientId,
           broadcastCapabilities: undefined,
           segmentSessionId: undefined,
+          roomRevision: 0,
+          participantRevision: 0,
+          broadcastRevision: 0,
           networkAdviceRevision: 0,
           networkAdviceByRecipient: new Map(),
           lastNetworkAdviceAt: 0,
@@ -3204,20 +3388,24 @@ export function createSignalServer(options = {}) {
             member.sfuViewerActive = false;
           }
         }
-        send(socket, {
-          type: "broadcast:granted",
-          broadcasterId: clientId,
-          broadcastCapabilities,
-          segmentRelay: segmentRelayAccess(state, "publish"),
-          // Channel-protocol viewers explicitly announce when their RTCPeerConnection
-          // is ready. Keeping eager offers only for legacy viewers avoids overlapping
-          // SDP negotiations during join/start races.
-          viewerIds: getRoomClientIds(room).filter(
-            (id) =>
-              id !== clientId &&
-              clients.get(id)?.state.protocol === "legacy-viewer",
-          ),
-        });
+        advanceRoomState(room, "broadcast:started");
+        send(
+          socket,
+          roomStateEnvelope(room, {
+            type: "broadcast:granted",
+            broadcasterId: clientId,
+            broadcastCapabilities,
+            segmentRelay: segmentRelayAccess(state, "publish"),
+            // Channel-protocol viewers explicitly announce when their RTCPeerConnection
+            // is ready. Keeping eager offers only for legacy viewers avoids overlapping
+            // SDP negotiations during join/start races.
+            viewerIds: getRoomClientIds(room).filter(
+              (id) =>
+                id !== clientId &&
+                clients.get(id)?.state.protocol === "legacy-viewer",
+            ),
+          }),
+        );
         broadcastRoom(
           room,
           {
@@ -3228,6 +3416,7 @@ export function createSignalServer(options = {}) {
             sessionId: nextSegmentSessionId,
           },
           clientId,
+          { advance: false },
         );
         broadcastNetworkAdvice(room);
         return;
@@ -3751,12 +3940,16 @@ export function createSignalServer(options = {}) {
           if (disabled) {
             target.state.microphoneMuted = true;
           }
-          send(target.socket, {
-            type: "moderation:microphone",
-            target: targetId,
-            disabled,
-            from: clientId,
-          });
+          advanceRoomState(room, "moderation:microphone");
+          send(
+            target.socket,
+            roomStateEnvelope(room, {
+              type: "moderation:microphone",
+              target: targetId,
+              disabled,
+              from: clientId,
+            }),
+          );
           broadcastRoom(room, {
             type: "participant:updated",
             participant: participantFor(target.state),
@@ -3775,11 +3968,15 @@ export function createSignalServer(options = {}) {
         }
 
         target.state.resumeToken = undefined;
-        send(target.socket, {
-          type: "moderation:kicked",
-          from: clientId,
-          message: "你已被频道主移出频道",
-        });
+        advanceRoomState(room, "moderation:kicked");
+        send(
+          target.socket,
+          roomStateEnvelope(room, {
+            type: "moderation:kicked",
+            from: clientId,
+            message: "你已被频道主移出频道",
+          }),
+        );
         try {
           target.socket.close(4003, "kicked by host");
         } catch {

@@ -2523,6 +2523,7 @@ class CmafRelayCoordinator {
     state.dormant = false;
     state.firstSegmentSequence = state.nextGlobalSequence;
     state.contiguousUploadedSequence = undefined;
+    state.suffixRecoveryFrom = undefined;
     state.segments.clear();
     state.uploadedDescriptors.clear();
     state.descriptors.clear();
@@ -2675,6 +2676,7 @@ class CmafRelayCoordinator {
         descriptors: new Map(),
         firstSegmentSequence: undefined,
         contiguousUploadedSequence: undefined,
+        suffixRecoveryFrom: undefined,
         pending: [],
         pendingHead: 0,
         spooling: false,
@@ -3135,7 +3137,7 @@ class CmafRelayCoordinator {
           if (recoveryProbe) this.retryFailedRecords(true);
         })
         .catch((error) => {
-          this.markRecordFailed(record);
+          this.markRecordFailed(record, error);
           this.sendEvent({
             type: "warning",
             code: "segment-relay-upload-failed",
@@ -3178,7 +3180,7 @@ class CmafRelayCoordinator {
     );
   }
 
-  markRecordFailed(record) {
+  markRecordFailed(record, error) {
     if (record.retired || record.uploaded || this.closed) return;
     record.failed = true;
     record.retryAttempts = Math.min(
@@ -3193,7 +3195,13 @@ class CmafRelayCoordinator {
         )
       ];
     const jitter = 0.8 + Math.max(0, Math.min(1, this.retryRandom())) * 0.4;
-    record.nextRetryAt = Date.now() + Math.round(baseDelay * jitter);
+    const serverRetryDelay =
+      error instanceof SegmentRelayHttpError && error.status === 507
+        ? Math.max(0, this.serverPressureUntil - Date.now())
+        : 0;
+    record.nextRetryAt =
+      Date.now() +
+      Math.max(Math.round(baseDelay * jitter), serverRetryDelay);
     this.failedRecords.add(record);
     this.scheduleFailedRetry();
   }
@@ -3292,6 +3300,25 @@ class CmafRelayCoordinator {
         ? state.firstSegmentSequence
         : state.contiguousUploadedSequence + 1;
     if (!Number.isSafeInteger(next)) return;
+    if (
+      Number.isSafeInteger(state.suffixRecoveryFrom) &&
+      !state.uploadedDescriptors.has(next)
+    ) {
+      const restart = [...state.uploadedDescriptors.entries()]
+        .filter(
+          ([sequence, descriptor]) =>
+            sequence >= state.suffixRecoveryFrom &&
+            descriptor?.keyframe === true,
+        )
+        .sort((left, right) => left[0] - right[0])[0];
+      if (restart) {
+        this.retireLocalPrefix(state, restart[0] - 1);
+        state.firstSegmentSequence = restart[0];
+        state.contiguousUploadedSequence = undefined;
+        state.suffixRecoveryFrom = undefined;
+        next = restart[0];
+      }
+    }
     while (state.uploadedDescriptors.has(next)) {
       const descriptor = state.uploadedDescriptors.get(next);
       state.uploadedDescriptors.delete(next);
@@ -3461,6 +3488,14 @@ class CmafRelayCoordinator {
         stream.destroy();
         if (
           error instanceof SegmentRelayHttpError &&
+          error.status === 507
+        ) {
+          this.noteServerStoragePressure(error.details);
+          this.reconcileManifestConflict(error);
+          break;
+        }
+        if (
+          error instanceof SegmentRelayHttpError &&
           error.status >= 400 &&
           error.status < 500 &&
           ![408, 425, 429].includes(error.status)
@@ -3478,6 +3513,27 @@ class CmafRelayCoordinator {
       }
     }
     throw lastError || new Error("HTTPS 分片上传失败");
+  }
+
+  noteServerStoragePressure(details) {
+    const retryAfterMs = Math.max(
+      15_000,
+      Math.min(5 * 60_000, Number(details?.retryAfterMs) || 60_000),
+    );
+    const wasPressured = Date.now() < this.serverPressureUntil;
+    this.serverPressureUntil = Math.max(
+      this.serverPressureUntil,
+      Date.now() + retryAfterMs,
+    );
+    if (!wasPressured) {
+      this.sendEvent({
+        type: "warning",
+        code: "segment-relay-storage-pressure",
+        message:
+          "HTTPS 分片缓存已达到硬上限，发布已暂停并收敛到 120 秒前向窗口",
+      });
+    }
+    this.updatePressure();
   }
 
   retireLocalPrefix(state, throughSequence) {
@@ -3525,6 +3581,58 @@ class CmafRelayCoordinator {
     return changed;
   }
 
+  retireLocalSuffix(state, fromSequence) {
+    const from = Number(fromSequence);
+    if (!Number.isSafeInteger(from) || from < 1) return false;
+    let changed = false;
+    for (const collection of [
+      state.descriptors,
+      state.uploadedDescriptors,
+      state.segments,
+    ]) {
+      for (const sequence of [...collection.keys()]) {
+        if (sequence < from) continue;
+        collection.delete(sequence);
+        changed = true;
+      }
+    }
+    if (
+      state.contiguousUploadedSequence !== undefined &&
+      state.contiguousUploadedSequence >= from
+    ) {
+      const retained = [...state.segments.keys()]
+        .filter((sequence) => sequence < from)
+        .sort((left, right) => left - right);
+      state.contiguousUploadedSequence = retained.at(-1);
+    }
+    state.suffixRecoveryFrom =
+      state.suffixRecoveryFrom === undefined
+        ? from
+        : Math.min(state.suffixRecoveryFrom, from);
+    state.ended = false;
+    for (const [key, record] of this.records) {
+      if (
+        record.renditionId !== state.id ||
+        record.kind !== "segment" ||
+        Number(record.sequence) < from
+      ) {
+        continue;
+      }
+      record.retired = true;
+      record.failed = false;
+      record.recoveryQueued = false;
+      this.failedRecords.delete(record);
+      this.records.delete(key);
+      this.diskBytes = Math.max(0, this.diskBytes - record.bytes);
+      void fsp.unlink(record.filePath).catch(() => undefined);
+      changed = true;
+    }
+    state.recoveryQueue = state.recoveryQueue.filter(
+      (record) => !record.retired,
+    );
+    return changed;
+  }
+
   queueMissingRecord(state, record) {
     if (
       !record ||
@@ -3568,13 +3676,16 @@ class CmafRelayCoordinator {
   reconcileManifestConflict(error) {
     if (
       !(error instanceof SegmentRelayHttpError) ||
-      error.status !== 409 ||
+      ![409, 507].includes(error.status) ||
       !error.details ||
       typeof error.details !== "object"
     ) {
       return false;
     }
     const details = error.details;
+    if (error.status === 507) {
+      this.noteServerStoragePressure(details);
+    }
     const evictionRevision = Number(details.evictionRevision);
     const revision = Number(details.revision);
     if (Number.isSafeInteger(revision) && revision >= 0) {
@@ -3599,38 +3710,94 @@ class CmafRelayCoordinator {
           32,
         ).toLowerCase();
         const throughSequence = Number(value?.throughSequence);
+        const fromSequence = Number(value?.fromSequence);
+        const hasThrough =
+          Number.isSafeInteger(throughSequence) &&
+          throughSequence >= 1;
+        const hasFrom =
+          Number.isSafeInteger(fromSequence) &&
+          fromSequence >= 1;
         if (
           !/^[a-z0-9][a-z0-9-]{0,31}$/.test(renditionId) ||
-          !Number.isSafeInteger(throughSequence) ||
-          throughSequence < 1
+          (!hasThrough && !hasFrom) ||
+          (hasThrough && hasFrom && throughSequence >= fromSequence)
         ) {
           continue;
         }
         const prior = this.serverTombstones.get(renditionId);
+        const incomingTombstoneRevision = Math.max(
+          Number(value?.evictionRevision) || evictionRevision,
+          0,
+        );
+        const newerTombstoneRevision =
+          !prior ||
+          incomingTombstoneRevision >
+            Number(prior.evictionRevision || 0);
+        const applyThrough =
+          hasThrough &&
+          (newerTombstoneRevision ||
+            throughSequence >
+              Number(prior?.throughSequence || 0));
+        const applyFrom =
+          hasFrom &&
+          (newerTombstoneRevision ||
+            fromSequence <
+              Number(
+                prior?.fromSequence ||
+                  Number.MAX_SAFE_INTEGER,
+              ));
         const next = {
           renditionId,
-          throughSequence: Math.max(
-            Number(prior?.throughSequence) || 0,
-            throughSequence,
-          ),
+          ...(hasThrough || Number.isSafeInteger(prior?.throughSequence)
+            ? {
+                throughSequence: Math.max(
+                  Number(prior?.throughSequence) || 0,
+                  hasThrough ? throughSequence : 0,
+                ),
+              }
+            : {}),
+          ...(hasFrom || Number.isSafeInteger(prior?.fromSequence)
+            ? {
+                fromSequence: Math.min(
+                  Number(prior?.fromSequence) ||
+                    Number.MAX_SAFE_INTEGER,
+                  hasFrom ? fromSequence : Number.MAX_SAFE_INTEGER,
+                ),
+              }
+            : {}),
           evictionRevision: Math.max(
-            Number(value?.evictionRevision) || evictionRevision,
+            incomingTombstoneRevision,
             Number(prior?.evictionRevision) || 0,
           ),
         };
         this.serverTombstones.set(renditionId, next);
         changed =
           !prior ||
-          next.throughSequence >
-            Number(prior.throughSequence) ||
+          Number(next.throughSequence) >
+            Number(prior.throughSequence || 0) ||
+          Number(next.fromSequence || Number.MAX_SAFE_INTEGER) <
+            Number(prior.fromSequence || Number.MAX_SAFE_INTEGER) ||
           next.evictionRevision >
             Number(prior.evictionRevision) ||
           changed;
         const state = this.renditions.get(renditionId);
         if (state) {
-          changed =
-            this.retireLocalPrefix(state, next.throughSequence) ||
-            changed;
+          if (
+            applyThrough &&
+            Number.isSafeInteger(next.throughSequence)
+          ) {
+            changed =
+              this.retireLocalPrefix(state, next.throughSequence) ||
+              changed;
+          }
+          if (
+            applyFrom &&
+            Number.isSafeInteger(next.fromSequence)
+          ) {
+            changed =
+              this.retireLocalSuffix(state, next.fromSequence) ||
+              changed;
+          }
         }
       }
     }
@@ -3698,11 +3865,19 @@ class CmafRelayCoordinator {
         changed = this.retireLocalPrefix(state, sequence) || changed;
       }
     }
-    if (!changed && details.code === "manifest-revision-conflict") {
+    if (
+      !changed &&
+      ["manifest-revision-conflict", "storage-capacity-exceeded"].includes(
+        details.code,
+      )
+    ) {
       changed = true;
     }
     if (!changed) return false;
-    this.serverPressureUntil = Date.now() + 60_000;
+    this.serverPressureUntil = Math.max(
+      this.serverPressureUntil,
+      Date.now() + 60_000,
+    );
     this.sendEvent({
       type: "warning",
       code: "segment-manifest-reconciled",
@@ -3710,7 +3885,7 @@ class CmafRelayCoordinator {
         "已与 HTTPS 中继的淘汰版本重新同步，后续播放锚点将继续发布",
       evictionRevision: this.acknowledgedEvictionRevision,
     });
-    this.pumpUploads();
+    if (error.status !== 507) this.pumpUploads();
     this.updatePressure();
     return true;
   }
@@ -3741,10 +3916,17 @@ class CmafRelayCoordinator {
           message: cleanText(error?.message || error, 500),
         });
         if (!this.closed && !this.manifestRetryTimer) {
-          const retryMs = Math.min(
-            15_000,
-            500 * 2 ** Math.min(5, this.manifestRetryAttempts - 1),
-          );
+          const retryMs =
+            error instanceof SegmentRelayHttpError && error.status === 507
+              ? Math.max(
+                  1_000,
+                  this.serverPressureUntil - Date.now(),
+                )
+              : Math.min(
+                  15_000,
+                  500 *
+                    2 ** Math.min(5, this.manifestRetryAttempts - 1),
+                );
           this.manifestRetryTimer = setTimeout(() => {
             this.manifestRetryTimer = undefined;
             this.scheduleManifest();
@@ -3899,7 +4081,12 @@ class CmafRelayCoordinator {
         }
       } catch (error) {
         this.manifestDirty = true;
-        if (this.reconcileManifestConflict(error)) continue;
+        if (this.reconcileManifestConflict(error)) {
+          if (error instanceof SegmentRelayHttpError && error.status === 507) {
+            throw error;
+          }
+          continue;
+        }
         throw error;
       }
     }
@@ -3930,9 +4117,11 @@ class CmafRelayCoordinator {
 
   updatePressure() {
     const storagePressured =
+      Date.now() < this.serverPressureUntil ||
       this.memoryQueuedBytes >= RELAY_MEMORY_HIGH_WATER_BYTES ||
       this.diskBytes >= this.maxDiskBytes;
     const storageRecovered =
+      Date.now() >= this.serverPressureUntil &&
       this.memoryQueuedBytes <= RELAY_MEMORY_LOW_WATER_BYTES &&
       this.diskBytes < this.maxDiskBytes * 0.9;
     const forwardWindowMs = this.forwardWindowMs();

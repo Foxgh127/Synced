@@ -44,6 +44,8 @@ const MIN_DISK_BYTES = 64 * 1024 * 1024;
 const MAX_DISK_BYTES = 5 * 1024 * 1024 * 1024;
 const INDEX_WRITE_DELAY_MS = 250;
 const ACTIVE_REWIND_PIN_MS = 30_000;
+const ACTIVE_FORWARD_PIN_MS = 120_000;
+const UNADVERTISED_UPLOAD_GRACE_MS = 15_000;
 const ROOM_PATTERN = /^[23456789A-HJ-NP-Z]{8}$/;
 const SESSION_PATTERN = /^[a-z0-9-]{8,128}$/i;
 const ASSET_PATTERN = /^[a-f0-9]{24,64}$/;
@@ -316,9 +318,10 @@ function validateManifest(bytes, route) {
       typeof tombstone !== "object" ||
       !RENDITION_PATTERN.test(String(tombstone.renditionId || "")) ||
       tombstoneRenditions.has(tombstone.renditionId) ||
-      hasThrough === hasFrom ||
+      (!hasThrough && !hasFrom) ||
       (hasThrough && (throughSequence < 1 || throughSequence > 0xffffffff)) ||
       (hasFrom && (fromSequence < 1 || fromSequence > 0xffffffff)) ||
+      (hasThrough && hasFrom && throughSequence >= fromSequence) ||
       !Number.isSafeInteger(Number(tombstone.evictionRevision)) ||
       Number(tombstone.evictionRevision) < 1 ||
       Number(tombstone.evictionRevision) > manifest.evictionRevision
@@ -498,6 +501,7 @@ export class SegmentRelayStore {
     this.memoryBytes = 0;
     this.indexTimer = undefined;
     this.mutationQueue = Promise.resolve();
+    this.lastAdmissionRejectedAt = 0;
     this.closed = false;
     this.loadIndex();
   }
@@ -543,6 +547,25 @@ export class SegmentRelayStore {
           buffer: undefined,
           manifest: undefined,
           lastAccess: Number(value.lastAccess) || Date.now(),
+          uploadedAt:
+            Number(value.uploadedAt) ||
+            Number(value.lastAccess) ||
+            Date.now(),
+          firstAdvertisedRevision:
+            Number.isSafeInteger(value.firstAdvertisedRevision) &&
+            value.firstAdvertisedRevision >= 1
+              ? value.firstAdvertisedRevision
+              : undefined,
+          lastAdvertisedRevision:
+            Number.isSafeInteger(value.lastAdvertisedRevision) &&
+            value.lastAdvertisedRevision >= 1
+              ? value.lastAdvertisedRevision
+              : undefined,
+          advertisedAt:
+            Number.isFinite(Number(value.advertisedAt)) &&
+            Number(value.advertisedAt) > 0
+              ? Number(value.advertisedAt)
+              : undefined,
         };
         if (record.kind === "manifest") {
           try {
@@ -556,6 +579,11 @@ export class SegmentRelayStore {
         }
         this.records.set(record.key, record);
         this.diskBytes += record.bytes;
+      }
+      for (const record of this.records.values()) {
+        if (record.kind === "manifest") {
+          this.markManifestObjectsAdvertised(record);
+        }
       }
       this.evict();
     } catch {
@@ -588,7 +616,7 @@ export class SegmentRelayStore {
 
   async commitLocked(route, temporaryPath, bytes, metadata) {
     if (this.closed) throw new Error("segment-store-closed");
-    const existing = this.records.get(route.key);
+    let existing = this.records.get(route.key);
     if (route.kind === "manifest") {
       if (existing && existing.sha256 === metadata.sha256) {
         await unlink(temporaryPath).catch(() => undefined);
@@ -614,6 +642,32 @@ export class SegmentRelayStore {
       this.records.delete(route.key);
       this.records.set(route.key, existing);
       return existing;
+    }
+    const protectedForAdmission = new Set([route.key]);
+    if (route.kind === "manifest") {
+      for (const key of this.manifestObjectKeys(route, metadata.manifest)) {
+        protectedForAdmission.add(key);
+      }
+    }
+    this.ensureCapacity(
+      route,
+      bytes,
+      existing?.bytes || 0,
+      protectedForAdmission,
+    );
+    // Capacity reclamation can advance a coordinated manifest revision.
+    // Re-read and revalidate under the same mutation lock before replacing it.
+    existing = this.records.get(route.key);
+    if (route.kind === "manifest") {
+      if (existing && existing.sha256 === metadata.sha256) {
+        await unlink(temporaryPath).catch(() => undefined);
+        existing.lastAccess = Date.now();
+        this.records.delete(route.key);
+        this.records.set(route.key, existing);
+        return existing;
+      }
+      this.validateManifestRevision(route, metadata.manifest, existing);
+      this.validateManifestObjects(route, metadata.manifest);
     }
     const fileName =
       `${safeRecordName(route.key)}.${recordExtension(route.kind)}`;
@@ -669,6 +723,10 @@ export class SegmentRelayStore {
       fileName,
       filePath,
       lastAccess: Date.now(),
+      uploadedAt: Date.now(),
+      firstAdvertisedRevision: undefined,
+      lastAdvertisedRevision: undefined,
+      advertisedAt: undefined,
       buffer: undefined,
       manifest:
         route.kind === "manifest" ? metadata.manifest : undefined,
@@ -684,10 +742,47 @@ export class SegmentRelayStore {
         record.buffer = undefined;
       }
     }
-    if (record.kind === "manifest") this.noteManifest(record);
+    if (record.kind === "manifest") {
+      this.noteManifest(record);
+      this.markManifestObjectsAdvertised(record);
+    }
     this.evict();
     this.scheduleIndex();
     return record;
+  }
+
+  ensureCapacity(route, incomingBytes, replacingBytes, protectedKeys) {
+    const delta = Math.max(
+      0,
+      Math.max(0, Number(incomingBytes) || 0) -
+        Math.max(0, Number(replacingBytes) || 0),
+    );
+    if (delta <= 0) return;
+    const targetBeforeCommit = this.maxDiskBytes - delta;
+    if (targetBeforeCommit >= 0 && this.diskBytes > targetBeforeCommit) {
+      this.evict(targetBeforeCommit, protectedKeys);
+    }
+    if (
+      targetBeforeCommit >= 0 &&
+      this.diskBytes <= targetBeforeCommit
+    ) {
+      return;
+    }
+    this.lastAdmissionRejectedAt = Date.now();
+    throw Object.assign(new Error("storage-capacity-exceeded"), {
+      statusCode: 507,
+      relayBody: {
+        ...this.manifestCoordination(
+          route,
+          "storage-capacity-exceeded",
+        ),
+        storagePressure: true,
+        maxDiskBytes: this.maxDiskBytes,
+        diskBytes: this.diskBytes,
+        incomingBytes: Math.max(0, Number(incomingBytes) || 0),
+        retryAfterMs: UNADVERTISED_UPLOAD_GRACE_MS,
+      },
+    });
   }
 
   manifestCoordination(route, code, missing = []) {
@@ -827,6 +922,45 @@ export class SegmentRelayStore {
     }
   }
 
+  manifestObjectKeys(route, manifest) {
+    const root =
+      `${route.room}/${route.sessionId}/${route.assetId}/` +
+      `${route.mediaVersion}`;
+    const keys = new Set();
+    if (manifest.subtitle) keys.add(`${root}/subtitle`);
+    for (const rendition of manifest.renditions) {
+      keys.add(
+        rendition.epoch === undefined
+          ? `${root}/${rendition.id}/init`
+          : `${root}/${rendition.id}/epoch/${rendition.epoch}/init`,
+      );
+      for (const segment of rendition.segments) {
+        const sequence = Number(
+          Array.isArray(segment) ? segment[0] : segment.sequence,
+        );
+        keys.add(`${root}/${rendition.id}/${sequence}`);
+      }
+    }
+    return keys;
+  }
+
+  markManifestObjectsAdvertised(manifestRecord) {
+    const manifest = manifestRecord?.manifest;
+    if (!manifest) return;
+    const revision = Math.max(1, Number(manifest.revision) || 1);
+    const advertisedAt = Date.now();
+    manifestRecord.firstAdvertisedRevision ??= revision;
+    manifestRecord.lastAdvertisedRevision = revision;
+    manifestRecord.advertisedAt = advertisedAt;
+    for (const key of this.manifestObjectKeys(manifestRecord, manifest)) {
+      const record = this.records.get(key);
+      if (!record) continue;
+      record.firstAdvertisedRevision ??= revision;
+      record.lastAdvertisedRevision = revision;
+      record.advertisedAt = advertisedAt;
+    }
+  }
+
   get(key) {
     const record = this.records.get(key);
     if (!record) return undefined;
@@ -903,8 +1037,20 @@ export class SegmentRelayStore {
     }
   }
 
-  protectedActiveKeys(now = Date.now()) {
-    const protectedKeys = new Set();
+  protectedActiveKeys(now = Date.now(), extraKeys = new Set()) {
+    const protectedKeys = new Set(extraKeys);
+    // Uploading an immutable object and advertising it in the next manifest
+    // are separate requests. A short, persisted grace period closes that race
+    // without pinning an unlimited unpublished future forever.
+    for (const [key, record] of this.records) {
+      if (
+        !Number.isSafeInteger(record.firstAdvertisedRevision) &&
+        now - Math.max(0, Number(record.uploadedAt) || 0) <=
+          UNADVERTISED_UPLOAD_GRACE_MS
+      ) {
+        protectedKeys.add(key);
+      }
+    }
     for (const entry of this.activeSessions.values()) {
       for (const [version, expiresAt] of entry.previousVersions) {
         if (expiresAt <= now) entry.previousVersions.delete(version);
@@ -913,61 +1059,16 @@ export class SegmentRelayStore {
       if (Number.isSafeInteger(entry.mediaVersion)) {
         versions.add(entry.mediaVersion);
       }
-      let newestInFlightVersion;
-      for (const record of this.records.values()) {
+      for (const [key, manifestRecord] of this.records) {
         if (
-          record.room === entry.room &&
-          record.sessionId === entry.sessionId &&
-          (!Number.isSafeInteger(newestInFlightVersion) ||
-            record.mediaVersion > newestInFlightVersion)
+          manifestRecord.room !== entry.room ||
+          manifestRecord.sessionId !== entry.sessionId ||
+          manifestRecord.kind !== "manifest" ||
+          (versions.size && !versions.has(manifestRecord.mediaVersion))
         ) {
-          newestInFlightVersion = record.mediaVersion;
+          continue;
         }
-      }
-      if (Number.isSafeInteger(newestInFlightVersion)) {
-        versions.add(newestInFlightVersion);
-      }
-      const matchingManifests = [];
-      for (const [key, record] of this.records) {
-        if (
-          record.room === entry.room &&
-          record.sessionId === entry.sessionId &&
-          record.kind === "manifest" &&
-          (!versions.size || versions.has(record.mediaVersion))
-        ) {
-          protectedKeys.add(key);
-          matchingManifests.push(record);
-        }
-      }
-      if (!matchingManifests.length) {
-        // Before the first manifest lands, retain the small in-flight object
-        // set for the explicitly active session. A subsequent manifest gives
-        // eviction an exact advertised window and playback anchor.
-        for (const [key, record] of this.records) {
-          if (
-            record.room === entry.room &&
-            record.sessionId === entry.sessionId &&
-            (!versions.size || versions.has(record.mediaVersion))
-          ) {
-            protectedKeys.add(key);
-          }
-        }
-        continue;
-      }
-      const manifestedVersions = new Set(
-        matchingManifests.map((record) => record.mediaVersion),
-      );
-      for (const [key, record] of this.records) {
-        if (
-          record.room === entry.room &&
-          record.sessionId === entry.sessionId &&
-          versions.has(record.mediaVersion) &&
-          !manifestedVersions.has(record.mediaVersion)
-        ) {
-          protectedKeys.add(key);
-        }
-      }
-      for (const manifestRecord of matchingManifests) {
+        protectedKeys.add(key);
         let manifest = manifestRecord.manifest;
         if (!manifest) {
           try {
@@ -987,6 +1088,10 @@ export class SegmentRelayStore {
           Number.isFinite(Number(manifest.playbackTimeMs))
             ? Number(manifest.playbackTimeMs)
             : Math.max(0, Number(manifest.startTimeTicks) || 0) / 10_000;
+        const protectedStart =
+          playbackTimeMs - ACTIVE_REWIND_PIN_MS;
+        const protectedEnd =
+          playbackTimeMs + ACTIVE_FORWARD_PIN_MS;
         for (const rendition of manifest.renditions) {
           protectedKeys.add(
             rendition.epoch === undefined
@@ -1009,37 +1114,11 @@ export class SegmentRelayStore {
               ) || 1,
             );
             if (
-              timelineTimeMs + durationMs >=
-              playbackTimeMs - ACTIVE_REWIND_PIN_MS
+              timelineTimeMs + durationMs >= protectedStart &&
+              timelineTimeMs <= protectedEnd
             ) {
               protectedKeys.add(`${root}/${rendition.id}/${sequence}`);
             }
-          }
-        }
-        // A segment can finish uploading immediately before the next
-        // manifest. Protect every in-flight/current-or-future object in the
-        // active version as well; otherwise eviction between the segment PUT
-        // and manifest PUT creates a missing-object race.
-        for (const [key, record] of this.records) {
-          if (
-            record.room !== manifestRecord.room ||
-            record.sessionId !== manifestRecord.sessionId ||
-            record.assetId !== manifestRecord.assetId ||
-            record.mediaVersion !== manifestRecord.mediaVersion
-          ) {
-            continue;
-          }
-          if (record.kind === "init" || record.kind === "subtitle") {
-            protectedKeys.add(key);
-            continue;
-          }
-          if (
-            record.kind === "segment" &&
-            Number(record.timelineTimeMs) +
-              Math.max(1, Number(record.durationMs) || 1) >=
-              playbackTimeMs - ACTIVE_REWIND_PIN_MS
-          ) {
-            protectedKeys.add(key);
           }
         }
       }
@@ -1065,6 +1144,7 @@ export class SegmentRelayStore {
       }
     }
     let removed = false;
+    const discardedSequences = new Set();
     const playbackTimeMs =
       Number.isFinite(Number(manifest.playbackTimeMs))
         ? Number(manifest.playbackTimeMs)
@@ -1097,11 +1177,12 @@ export class SegmentRelayStore {
       segmentTimelineTimeMs +
         Math.max(1, segmentDurationMs || 1) <
       playbackTimeMs - ACTIVE_REWIND_PIN_MS;
-    // An active publisher can safely acknowledge removal of expired rewind
-    // history. Never punch a hole in current or future media: if storage
-    // remains pressured, producers receive an explicit pressure signal and
-    // reduce their forward window instead.
-    if (!trimPrefix) return false;
+    const trimSuffix =
+      segmentTimelineTimeMs >
+      playbackTimeMs + ACTIVE_FORWARD_PIN_MS;
+    // Keep the currently playable window contiguous. Capacity reclamation may
+    // advance either edge, but it never punches a hole through the middle.
+    if (!trimPrefix && !trimSuffix) return false;
     const targetReferenced = targetRendition?.segments.some(
       (entry) =>
         Number(Array.isArray(entry) ? entry[0] : entry.sequence) ===
@@ -1114,11 +1195,25 @@ export class SegmentRelayStore {
       (item) => item.renditionId === segment.rendition,
     );
     const tombstone = {
+      ...(priorTombstone || {}),
       renditionId: segment.rendition,
-      throughSequence: Math.max(
-        Number(priorTombstone?.throughSequence) || 0,
-        segment.sequence,
-      ),
+      ...(trimPrefix
+        ? {
+            throughSequence: Math.max(
+              Number(priorTombstone?.throughSequence) || 0,
+              segment.sequence,
+            ),
+          }
+        : {}),
+      ...(trimSuffix
+        ? {
+            fromSequence: Math.min(
+              Number(priorTombstone?.fromSequence) ||
+                Number.MAX_SAFE_INTEGER,
+              segment.sequence,
+            ),
+          }
+        : {}),
       evictionRevision,
     };
     const nextManifest = {
@@ -1129,6 +1224,7 @@ export class SegmentRelayStore {
         Math.max(1, Number(manifest.revision) || 1) + 1,
       ),
       evictionRevision,
+      ...(trimSuffix ? { ended: false } : {}),
       tombstones: [
         ...(manifest.tombstones || []).filter(
           (item) => item.renditionId !== segment.rendition,
@@ -1139,13 +1235,25 @@ export class SegmentRelayStore {
         if (rendition.id !== segment.rendition) return rendition;
         const segments = rendition.segments.filter((entry) => {
           const sequence = Number(Array.isArray(entry) ? entry[0] : entry.sequence);
-          const discard = sequence <= segment.sequence;
-          if (discard) removed = true;
+          const discard = trimPrefix
+            ? sequence <= segment.sequence
+            : sequence >= segment.sequence;
+          if (discard) {
+            removed = true;
+            discardedSequences.add(sequence);
+          }
           return !discard;
         });
         return {
           ...rendition,
           segments,
+          ...(trimSuffix
+            ? {
+                ended: false,
+                finalSequence: undefined,
+                finalTimelineEndMs: undefined,
+              }
+            : {}),
         };
       }),
     };
@@ -1175,6 +1283,35 @@ export class SegmentRelayStore {
     manifestRecord.buffer = body;
     manifestRecord.manifest = nextManifest;
     this.memoryBytes += body.byteLength;
+    this.markManifestObjectsAdvertised(manifestRecord);
+    for (const [key, record] of [...this.records]) {
+      if (
+        key === segment.key ||
+        record.kind !== "segment" ||
+        record.room !== segment.room ||
+        record.sessionId !== segment.sessionId ||
+        record.assetId !== segment.assetId ||
+        record.mediaVersion !== segment.mediaVersion ||
+        record.rendition !== segment.rendition ||
+        !discardedSequences.has(record.sequence)
+      ) {
+        continue;
+      }
+      this.records.delete(key);
+      this.diskBytes = Math.max(0, this.diskBytes - record.bytes);
+      if (record.buffer) {
+        this.memoryBytes = Math.max(
+          0,
+          this.memoryBytes - record.buffer.byteLength,
+        );
+      }
+      try {
+        unlinkSync(record.filePath);
+      } catch {
+        // The coordinated tombstone already removed this immutable object
+        // from the manifest; an open reader may retain its descriptor.
+      }
+    }
     return true;
   }
 
@@ -1198,7 +1335,7 @@ export class SegmentRelayStore {
     return true;
   }
 
-  evict() {
+  evict(targetBytes, extraProtectedKeys = new Set()) {
     if (this.memoryBytes > this.maxMemoryBytes) {
       for (const record of this.records.values()) {
         if (this.memoryBytes <= this.maxMemoryBytes) break;
@@ -1207,18 +1344,28 @@ export class SegmentRelayStore {
         record.buffer = undefined;
       }
     }
-    if (this.diskBytes <= this.maxDiskBytes) return;
-    const targetBytes = Math.floor(this.maxDiskBytes * 0.9);
-    const protectedKeys = this.protectedActiveKeys();
+    const target = Number.isFinite(Number(targetBytes))
+      ? Math.max(
+          0,
+          Math.min(this.maxDiskBytes, Math.floor(Number(targetBytes))),
+        )
+      : Math.floor(this.maxDiskBytes * 0.9);
+    if (this.diskBytes <= this.maxDiskBytes && this.diskBytes <= target) {
+      return;
+    }
+    const protectedKeys = this.protectedActiveKeys(
+      Date.now(),
+      extraProtectedKeys,
+    );
     for (const [key, record] of this.records) {
-      if (this.diskBytes <= targetBytes) break;
+      if (this.diskBytes <= target) break;
       if (record.kind === "manifest" || record.kind === "init") continue;
       this.removeRecord(key, record, protectedKeys);
     }
     // Inactive sessions may be deleted as a unit. Active session identity,
     // rather than a mutable lastAccess guess, controls protection.
     for (const [key, record] of this.records) {
-      if (this.diskBytes <= targetBytes) break;
+      if (this.diskBytes <= target) break;
       this.removeRecord(key, record, protectedKeys);
     }
     this.scheduleIndex();
@@ -1292,7 +1439,11 @@ export class SegmentRelayStore {
   }
 
   isStoragePressured() {
-    return this.diskBytes > this.maxDiskBytes;
+    return (
+      this.diskBytes >= this.maxDiskBytes ||
+      Date.now() - this.lastAdmissionRejectedAt <=
+        UNADVERTISED_UPLOAD_GRACE_MS
+    );
   }
 
   async close() {
@@ -1638,7 +1789,8 @@ export function createSegmentRelay(options = {}) {
               ),
             ),
             "x-synced-storage-pressure": String(
-              store.isStoragePressured(),
+              error.relayBody.storagePressure === true ||
+                store.isStoragePressured(),
             ),
           });
         } else {

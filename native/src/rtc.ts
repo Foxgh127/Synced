@@ -80,6 +80,9 @@ export interface SignalEnvelope {
   participantId?: string;
   participant?: RoomParticipant;
   participants?: RoomParticipant[];
+  roomRevision?: number;
+  participantRevision?: number;
+  broadcastRevision?: number;
   target?: string;
   from?: string;
   disabled?: boolean;

@@ -180,7 +180,9 @@ SFU、coturn、HTTPS CMAF 分片缓存与 Nginx。普通屏幕默认经 SFU 分�
    明文网络流量，代理或运营商也不能篡改信令内容。
 4. 旧版 `host:create`/`viewer:join` 默认关闭，避免绕过创建者凭证抢占频道码。
 5. Nginx 部署设置 `TRUST_PROXY=true`，服务端只接受来自本机反向代理的
-   `X-Forwarded-For`，使每 IP 限流作用于真实用户；Docker 直连模式保持为 `false`。
+   `X-Forwarded-For`，使每 IP 限流作用于真实用户；Docker Compose 只把
+   `8787` 绑定到宿主机 loopback，并通过显式 `TRUSTED_PROXY_CIDRS` 信任专用
+   bridge gateway。生产环境拒绝缺少 Origin 的 WebSocket。
 
 首次从没有私有频道主凭证的旧版本升级时，应用会轮换一次频道码。之后频道码与
 本机私有凭证稳定绑定；仅复制/扫码频道码不会泄露频道主身份。

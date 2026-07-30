@@ -30,11 +30,19 @@ function finite(value: unknown, fallback = 0): number {
   return Number.isFinite(number) ? number : fallback;
 }
 
+function createSegmentFallbackRequestId(): string {
+  const generated = globalThis.crypto?.randomUUID?.();
+  if (generated) return generated;
+  return (
+    `${Date.now().toString(36)}-` +
+    `${Math.floor(Math.random() * Number.MAX_SAFE_INTEGER).toString(36)}`
+  ).slice(0, 64);
+}
+
 const MEBIBYTE = 1024 * 1024;
 const BUFFER_TIME_EPSILON_SECONDS = 0.075;
 const EMBY_REORDER_WAIT_MS = 1_200;
 const EMBY_MAX_REORDER_FRAGMENTS = 64;
-const EMBY_MAX_REORDER_BYTES = 32 * 1024 * 1024;
 const EMBY_TRANSPORT_SILENCE_TIMEOUT_MS = 15_000;
 const EMBY_CATCH_UP_MIN_INTERVAL_MS = 1_200;
 const EMBY_CATCH_UP_MAX_INTERVAL_MS = 8_000;
@@ -48,7 +56,18 @@ export interface EmbyAdaptiveBufferProfile {
   initialSeconds: number;
   targetSeconds: number;
   maxSeconds: number;
+  safetyMarginSeconds: number;
   memoryBudgetBytes: number;
+  mseBudgetBytes: number;
+  appendQueueHighWaterBytes: number;
+  appendQueueHardLimitBytes: number;
+  appendQueueMaxItems: number;
+  pendingFragmentLimitBytes: number;
+  p2pAssemblerLimitBytes: number;
+  foregroundFetchLimitBytes: number;
+  cacheStagingLimitBytes: number;
+  gpuWorkingSetBytes: number;
+  maxSegmentBytes: number;
 }
 
 export function planEmbyAdaptiveBufferProfile(
@@ -59,6 +78,8 @@ export function planEmbyAdaptiveBufferProfile(
     initialSeconds?: number;
     targetSeconds?: number;
     maxSeconds?: number;
+    width?: number;
+    height?: number;
   } = {},
 ): EmbyAdaptiveBufferProfile {
   const host = input.host === true;
@@ -83,41 +104,121 @@ export function planEmbyAdaptiveBufferProfile(
     500_000,
     Math.min(100_000_000, finite(input.bitrate, 8_000_000)),
   );
-  // SourceBuffer bookkeeping, MP4 box overhead and a fragment currently being
-  // appended all live outside the raw media byte count. Reserve 18% instead
-  // of sizing the timeline right up to the process memory budget.
+  const width = Math.max(1, Math.min(7_680, finite(input.width, 1_920)));
+  const height = Math.max(1, Math.min(4_320, finite(input.height, 1_080)));
+  // Three decoded YUV frames plus enhancement scratch space are resident
+  // independently of encoded MSE bytes. Cap the estimate so one misleading
+  // capture setting cannot consume the whole media budget.
+  const gpuWorkingSetBytes = Math.min(
+    Math.floor(memoryBudgetBytes * 0.18),
+    Math.max(6 * MEBIBYTE, Math.ceil(width * height * 1.5 * 3)),
+  );
+  const appendQueueHardLimitBytes = Math.max(
+    4 * MEBIBYTE,
+    Math.floor(memoryBudgetBytes * 0.1),
+  );
+  const appendQueueHighWaterBytes = Math.max(
+    3 * MEBIBYTE,
+    Math.floor(appendQueueHardLimitBytes * 0.7),
+  );
+  const pendingFragmentLimitBytes = Math.max(
+    3 * MEBIBYTE,
+    Math.floor(memoryBudgetBytes * 0.06),
+  );
+  const p2pAssemblerLimitBytes = Math.max(
+    4 * MEBIBYTE,
+    Math.floor(memoryBudgetBytes * 0.08),
+  );
+  const foregroundFetchLimitBytes = Math.max(
+    8 * MEBIBYTE,
+    Math.floor(memoryBudgetBytes * 0.16),
+  );
+  const cacheStagingLimitBytes = Math.max(
+    2 * MEBIBYTE,
+    Math.floor(memoryBudgetBytes * 0.03),
+  );
+  const reservedBytes =
+    gpuWorkingSetBytes +
+    appendQueueHardLimitBytes +
+    pendingFragmentLimitBytes +
+    p2pAssemblerLimitBytes +
+    foregroundFetchLimitBytes +
+    cacheStagingLimitBytes;
+  const mseBudgetBytes = Math.max(
+    12 * MEBIBYTE,
+    memoryBudgetBytes - reservedBytes,
+  );
+  const maxSegmentBytes = Math.max(
+    1 * MEBIBYTE,
+    Math.min(
+      Math.floor(foregroundFetchLimitBytes / 2),
+      Math.floor(appendQueueHardLimitBytes * 0.85),
+      // Completing an SCTP assembly briefly retains both its received chunks
+      // and the contiguous output buffer. Keep one fragment below half of the
+      // assembler slice so that unavoidable copy cannot escape the budget.
+      Math.floor(p2pAssemblerLimitBytes * 0.45),
+    ),
+  );
+  const estimatedFragmentBytes = Math.max(
+    256 * 1024,
+    Math.min(maxSegmentBytes, Math.ceil(bitrate / 8)),
+  );
+  const appendQueueMaxItems = Math.max(
+    4,
+    Math.min(
+      64,
+      Math.floor(appendQueueHardLimitBytes / estimatedFragmentBytes),
+    ),
+  );
+  // The MSE time window is derived only from its own slice of the unified
+  // budget; append/reorder/fetch/cache/GPU allocations cannot be borrowed.
   const capacitySeconds = Math.floor(
-    (memoryBudgetBytes * 8 * 0.82) / bitrate,
+    (mseBudgetBytes * 8 * 0.9) / bitrate,
   );
   const requestedInitial = Math.max(
-    4,
+    1,
     finite(input.initialSeconds, host ? 10 : 10),
   );
   const hardMax = Math.max(
-    6,
+    2,
     finite(input.maxSeconds, host ? 90 : 72),
   );
   const maxSeconds = Math.min(
     hardMax,
-    Math.max(6, capacitySeconds),
+    Math.max(2, capacitySeconds),
+  );
+  const safetyMarginSeconds = Math.max(
+    0.5,
+    Math.min(2, maxSeconds * 0.15),
   );
   const initialSeconds = Math.max(
-    4,
-    Math.min(requestedInitial, maxSeconds - 2),
+    1,
+    Math.min(requestedInitial, maxSeconds - safetyMarginSeconds),
   );
   const requestedTarget = Math.max(
-    initialSeconds + 1,
+    initialSeconds + 0.5,
     finite(input.targetSeconds, host ? 64 : 52),
   );
   const targetSeconds = Math.max(
-    initialSeconds + 1,
-    Math.min(requestedTarget, maxSeconds - 1),
+    initialSeconds,
+    Math.min(requestedTarget, maxSeconds - safetyMarginSeconds),
   );
   return {
     initialSeconds,
     targetSeconds,
     maxSeconds,
+    safetyMarginSeconds,
     memoryBudgetBytes,
+    mseBudgetBytes,
+    appendQueueHighWaterBytes,
+    appendQueueHardLimitBytes,
+    appendQueueMaxItems,
+    pendingFragmentLimitBytes,
+    p2pAssemblerLimitBytes,
+    foregroundFetchLimitBytes,
+    cacheStagingLimitBytes,
+    gpuWorkingSetBytes,
+    maxSegmentBytes,
   };
 }
 
@@ -574,6 +675,15 @@ export interface EmbyMseDiagnostics {
   appendQueueBytes: number;
   pendingMediaItems: number;
   pendingMediaBytes: number;
+  p2pAssemblerBytes: number;
+  foregroundFetchBytes: number;
+  cacheStagingBytes: number;
+  estimatedMseBytes: number;
+  mediaBudgetBytes: number;
+  estimatedTotalMediaBytes: number;
+  appendQueueHighWaterBytes: number;
+  appendQueueHardLimitBytes: number;
+  mediaQueuePressured: boolean;
   readyState: number;
   networkState: number;
   mediaErrorCode: number;
@@ -589,6 +699,27 @@ export interface EmbyMseDiagnostics {
   paused: boolean;
   seeking: boolean;
   started: boolean;
+}
+
+export interface EmbyMediaBudgetSnapshot {
+  budgetBytes: number;
+  estimatedMseBytes: number;
+  appendQueueBytes: number;
+  pendingFragmentBytes: number;
+  p2pAssemblerBytes: number;
+  retainedInitBytes: number;
+  foregroundFetchBytes: number;
+  cacheStagingBytes: number;
+  gpuWorkingSetBytes: number;
+  estimatedTotalBytes: number;
+  appendQueueHighWaterBytes: number;
+  appendQueueHardLimitBytes: number;
+  appendQueueMaxItems: number;
+  pendingFragmentLimitBytes: number;
+  foregroundFetchLimitBytes: number;
+  cacheStagingLimitBytes: number;
+  maxSegmentBytes: number;
+  pressured: boolean;
 }
 
 export class EmbyMsePlayer extends EventTarget {
@@ -636,11 +767,15 @@ export class EmbyMsePlayer extends EventTarget {
   private initRequestTimer?: number;
   private segmentFallbackRetryTimer?: number;
   private segmentFallbackRequest?: {
+    requestId: string;
     sessionId: string;
     mediaVersion: number;
     transportEpoch: number;
     targetTime: number;
     retryIndex: number;
+    offeredTransportEpoch?: number;
+    offeredSignature?: string;
+    readySent?: boolean;
   };
   private mediaSourceOpenTimer?: number;
   private appendWatchdogTimer?: number;
@@ -648,6 +783,8 @@ export class EmbyMsePlayer extends EventTarget {
   private receivedInitKey = "";
   private pendingMediaFragments = new Map<number, EmbyTransportFragment>();
   private pendingMediaBytes = 0;
+  private externalForegroundFetchBytes = 0;
+  private externalCacheStagingBytes = 0;
   private nextMediaSequence?: number;
   private lastDeliveredMediaSequence?: number;
   private lastMediaTimeMs = 0;
@@ -800,6 +937,7 @@ export class EmbyMsePlayer extends EventTarget {
     this.syncHeld = true;
     this.video.pause();
     this.segmentFallbackRequest = {
+      requestId: createSegmentFallbackRequestId(),
       sessionId: session.sessionId,
       mediaVersion: session.mediaVersion,
       transportEpoch: session.transportEpoch ?? 0,
@@ -843,19 +981,172 @@ export class EmbyMsePlayer extends EventTarget {
     }
     const sent = this.sendControl({
       type: "segment-fallback-request",
+      requestId: request.requestId,
       sessionId: request.sessionId,
       mediaVersion: request.mediaVersion,
+      transportEpoch: request.transportEpoch,
       targetTime: request.targetTime,
     });
     const retryDelays = [500, 1_000, 2_000] as const;
-    if (request.retryIndex < retryDelays.length) {
-      const delay = retryDelays[request.retryIndex];
-      request.retryIndex += 1;
-      this.segmentFallbackRetryTimer = window.setTimeout(() => {
-        this.segmentFallbackRetryTimer = undefined;
-        this.sendSegmentFallbackRequest();
-      }, delay);
+    const retryIndex = Math.min(
+      request.retryIndex,
+      retryDelays.length - 1,
+    );
+    const delay = retryDelays[retryIndex];
+    request.retryIndex = Math.min(
+      retryDelays.length - 1,
+      request.retryIndex + 1,
+    );
+    this.segmentFallbackRetryTimer = window.setTimeout(() => {
+      this.segmentFallbackRetryTimer = undefined;
+      this.sendSegmentFallbackRequest();
+    }, delay);
+    return sent;
+  }
+
+  private acceptSegmentFallbackOffer(
+    message: Extract<
+      EmbyControlMessage,
+      { type: "segment-fallback-offer" }
+    >,
+  ): void {
+    const request = this.segmentFallbackRequest;
+    const session = this.session;
+    const plan = message.plan;
+    const planFrameRate = Number(plan?.frameRate ?? 30);
+    const normalizedMimeType = String(message.mimeType || "").toLowerCase();
+    const codecMatchesMime =
+      message.audioCodec === "aac" &&
+      /\bmp4a\./i.test(normalizedMimeType) &&
+      (message.videoCodec === "h264"
+        ? /\bavc[13]\./i.test(normalizedMimeType)
+        : message.videoCodec === "hevc" &&
+          /\b(?:hvc1|hev1)\./i.test(normalizedMimeType));
+    const offerSignature = JSON.stringify({
+      transportEpoch: message.transportEpoch,
+      mimeType: message.mimeType,
+      videoCodec: message.videoCodec,
+      audioCodec: message.audioCodec,
+      targetTime: message.targetTime,
+      itemId: plan?.itemId,
+      mediaSourceId: plan?.mediaSourceId,
+      playSessionId: plan?.playSessionId,
+      method: plan?.method,
+      runtimeTicks: plan?.runtimeTicks,
+      subtitleMode: plan?.subtitleMode,
+      localAudioTranscode: plan?.localAudioTranscode,
+      localVideoEncoder: plan?.localVideoEncoder,
+      startTimeTicks: plan?.startTimeTicks,
+      width: plan?.width,
+      height: plan?.height,
+      frameRate: planFrameRate,
+      bitrate: plan?.bitrate,
+    });
+    if (
+      !request ||
+      !session ||
+      message.requestId !== request.requestId ||
+      message.sessionId !== request.sessionId ||
+      message.mediaVersion !== request.mediaVersion ||
+      !Number.isSafeInteger(message.transportEpoch) ||
+      message.transportEpoch <= request.transportEpoch ||
+      message.transportEpoch > 1_000_000_000 ||
+      !Number.isFinite(message.targetTime) ||
+      message.targetTime < 0 ||
+      message.targetTime > 30 * 24 * 60 * 60 ||
+      typeof message.mimeType !== "string" ||
+      message.mimeType.length > 180 ||
+      !/^video\/mp4;\s*codecs="[-a-z0-9., ]+"$/i.test(
+        message.mimeType,
+      ) ||
+      !plan ||
+      typeof plan !== "object" ||
+      !["h264", "hevc"].includes(message.videoCodec) ||
+      message.audioCodec !== "aac" ||
+      plan.videoCodec !== message.videoCodec ||
+      plan.audioCodec !== message.audioCodec ||
+      !codecMatchesMime ||
+      plan.itemId !== session.plan.itemId ||
+      plan.mediaSourceId !== session.plan.mediaSourceId ||
+      plan.playSessionId !== session.plan.playSessionId ||
+      Number(plan.startTimeTicks) !==
+        Number(session.plan.startTimeTicks) ||
+      !Number.isFinite(plan.width) ||
+      plan.width < 1 ||
+      plan.width > 7_680 ||
+      !Number.isFinite(plan.height) ||
+      plan.height < 1 ||
+      plan.height > 4_320 ||
+      !Number.isFinite(planFrameRate) ||
+      planFrameRate < 1 ||
+      planFrameRate > 60 ||
+      !Number.isFinite(plan.bitrate) ||
+      plan.bitrate < 1 ||
+      plan.bitrate > 100_000_000
+    ) {
+      return;
     }
+    if (
+      request.offeredSignature !== undefined &&
+      request.offeredSignature !== offerSignature
+    ) {
+      return;
+    }
+    const duplicate =
+      request.offeredTransportEpoch === message.transportEpoch;
+    request.offeredTransportEpoch = message.transportEpoch;
+    request.offeredSignature = offerSignature;
+    request.readySent = false;
+    request.targetTime = Math.max(0, message.targetTime);
+    this.pendingCatchUpTarget = request.targetTime;
+    this.syncHeld = true;
+    this.video.pause();
+    if (!duplicate) {
+      this.externalSegmentTransport = false;
+      this.configure({
+        ...session,
+        transportEpoch: message.transportEpoch,
+        mimeType: message.mimeType,
+        plan: { ...plan, frameRate: planFrameRate },
+      });
+      if (
+        !this.session ||
+        this.session.sessionId !== request.sessionId ||
+        this.session.mediaVersion !== request.mediaVersion ||
+        (this.session.transportEpoch ?? 0) !==
+          message.transportEpoch ||
+        this.session.mimeType !== message.mimeType
+      ) {
+        return;
+      }
+      this.resetPendingMediaReception(true);
+      this.installFragmentAssembler(this.session);
+    }
+    this.sendSegmentFallbackReady();
+  }
+
+  private sendSegmentFallbackReady(): boolean {
+    const request = this.segmentFallbackRequest;
+    const session = this.session;
+    const offeredTransportEpoch = request?.offeredTransportEpoch;
+    if (
+      !request ||
+      !session ||
+      !Number.isSafeInteger(offeredTransportEpoch) ||
+      (session.transportEpoch ?? 0) !== offeredTransportEpoch ||
+      !this.sourceBuffer ||
+      (this.mediaSource && this.mediaSource.readyState !== "open")
+    ) {
+      return false;
+    }
+    const sent = this.sendControl({
+      type: "segment-fallback-ready",
+      requestId: request.requestId,
+      sessionId: request.sessionId,
+      mediaVersion: request.mediaVersion,
+      transportEpoch: offeredTransportEpoch,
+    });
+    request.readySent = sent;
     return sent;
   }
 
@@ -894,6 +1185,11 @@ export class EmbyMsePlayer extends EventTarget {
           nextEpoch,
         ),
       (detail) => this.handleAssemblyAbandonment(detail),
+      {
+        maxPendingBytes: this.bufferProfile.p2pAssemblerLimitBytes,
+        maxFragmentBytes: this.bufferProfile.maxSegmentBytes,
+        maxPendingAssemblies: EMBY_MAX_REORDER_FRAGMENTS,
+      },
     );
   }
 
@@ -1001,9 +1297,114 @@ export class EmbyMsePlayer extends EventTarget {
   get bufferProfile(): EmbyAdaptiveBufferProfile {
     return planEmbyAdaptiveBufferProfile({
       bitrate: this.session?.plan.bitrate,
+      width: this.session?.plan.width,
+      height: this.session?.plan.height,
       host: this.host,
       ...this.requestedBufferProfile,
     });
+  }
+
+  get mediaBudget(): EmbyMediaBudgetSnapshot {
+    const profile = this.bufferProfile;
+    let bufferedSeconds = 0;
+    try {
+      for (let index = 0; index < this.video.buffered.length; index += 1) {
+        bufferedSeconds += Math.max(
+          0,
+          finite(this.video.buffered.end(index)) -
+            finite(this.video.buffered.start(index)),
+        );
+      }
+    } catch {
+      bufferedSeconds = Math.max(0, this.bufferedAhead);
+    }
+    const bitrate = Math.max(
+      500_000,
+      Math.min(
+        100_000_000,
+        finite(this.session?.plan.bitrate, 8_000_000),
+      ),
+    );
+    const estimatedMseBytes = Math.ceil(
+      (bufferedSeconds * bitrate * 1.1) / 8,
+    );
+    const p2pAssemblerBytes = this.assembler?.pendingBytes ?? 0;
+    const retainedInitBytes = this.lastInitData?.byteLength ?? 0;
+    const estimatedTotalBytes =
+      estimatedMseBytes +
+      this.queuedAppendBytes +
+      this.pendingMediaBytes +
+      p2pAssemblerBytes +
+      retainedInitBytes +
+      this.externalForegroundFetchBytes +
+      this.externalCacheStagingBytes +
+      profile.gpuWorkingSetBytes;
+    const pressured =
+      this.appendQueue.length >= profile.appendQueueMaxItems ||
+      this.queuedAppendBytes >= profile.appendQueueHighWaterBytes ||
+      this.pendingMediaBytes >= profile.pendingFragmentLimitBytes ||
+      p2pAssemblerBytes >= profile.p2pAssemblerLimitBytes ||
+      estimatedMseBytes >= profile.mseBudgetBytes ||
+      estimatedTotalBytes >= profile.memoryBudgetBytes * 0.92;
+    return {
+      budgetBytes: profile.memoryBudgetBytes,
+      estimatedMseBytes,
+      appendQueueBytes: this.queuedAppendBytes,
+      pendingFragmentBytes: this.pendingMediaBytes,
+      p2pAssemblerBytes,
+      retainedInitBytes,
+      foregroundFetchBytes: this.externalForegroundFetchBytes,
+      cacheStagingBytes: this.externalCacheStagingBytes,
+      gpuWorkingSetBytes: profile.gpuWorkingSetBytes,
+      estimatedTotalBytes,
+      appendQueueHighWaterBytes: profile.appendQueueHighWaterBytes,
+      appendQueueHardLimitBytes: profile.appendQueueHardLimitBytes,
+      appendQueueMaxItems: profile.appendQueueMaxItems,
+      pendingFragmentLimitBytes: profile.pendingFragmentLimitBytes,
+      foregroundFetchLimitBytes: profile.foregroundFetchLimitBytes,
+      cacheStagingLimitBytes: profile.cacheStagingLimitBytes,
+      maxSegmentBytes: profile.maxSegmentBytes,
+      pressured,
+    };
+  }
+
+  setExternalMediaMemoryUsage(usage: {
+    foregroundFetchBytes?: number;
+    cacheStagingBytes?: number;
+  }): void {
+    const profile = this.bufferProfile;
+    this.externalForegroundFetchBytes = Math.max(
+      0,
+      Math.min(
+        profile.foregroundFetchLimitBytes,
+        Math.floor(finite(usage.foregroundFetchBytes)),
+      ),
+    );
+    this.externalCacheStagingBytes = Math.max(
+      0,
+      Math.min(
+        profile.cacheStagingLimitBytes,
+        Math.floor(finite(usage.cacheStagingBytes)),
+      ),
+    );
+  }
+
+  canAcceptMediaBytes(bytes: number): boolean {
+    const requested = Math.max(0, Math.ceil(finite(bytes)));
+    const budget = this.mediaBudget;
+    if (
+      requested <= 0 ||
+      requested > budget.maxSegmentBytes ||
+      this.appendQueue.length >= budget.appendQueueMaxItems ||
+      budget.appendQueueBytes + requested >
+        budget.appendQueueHardLimitBytes ||
+      budget.pendingFragmentBytes + requested >
+        budget.pendingFragmentLimitBytes ||
+      budget.estimatedTotalBytes + requested > budget.budgetBytes
+    ) {
+      return false;
+    }
+    return !budget.pressured;
   }
 
   get diagnostics(): EmbyMseDiagnostics {
@@ -1014,6 +1415,7 @@ export class EmbyMsePlayer extends EventTarget {
         end: finite(this.video.buffered.end(index)),
       }),
     );
+    const mediaBudget = this.mediaBudget;
     return {
       configured: Boolean(this.session && this.mediaSource),
       mimeType: this.session?.mimeType || "",
@@ -1025,6 +1427,17 @@ export class EmbyMsePlayer extends EventTarget {
       appendQueueBytes: this.queuedAppendBytes,
       pendingMediaItems: this.pendingMediaFragments.size,
       pendingMediaBytes: this.pendingMediaBytes,
+      p2pAssemblerBytes: mediaBudget.p2pAssemblerBytes,
+      foregroundFetchBytes: mediaBudget.foregroundFetchBytes,
+      cacheStagingBytes: mediaBudget.cacheStagingBytes,
+      estimatedMseBytes: mediaBudget.estimatedMseBytes,
+      mediaBudgetBytes: mediaBudget.budgetBytes,
+      estimatedTotalMediaBytes: mediaBudget.estimatedTotalBytes,
+      appendQueueHighWaterBytes:
+        mediaBudget.appendQueueHighWaterBytes,
+      appendQueueHardLimitBytes:
+        mediaBudget.appendQueueHardLimitBytes,
+      mediaQueuePressured: mediaBudget.pressured,
       readyState: finite(this.video.readyState),
       networkState: finite(this.video.networkState),
       mediaErrorCode: finite(this.video.error?.code),
@@ -1057,6 +1470,8 @@ export class EmbyMsePlayer extends EventTarget {
     };
     const bufferProfile = planEmbyAdaptiveBufferProfile({
       bitrate: normalizedSession.plan.bitrate,
+      width: normalizedSession.plan.width,
+      height: normalizedSession.plan.height,
       host: this.host,
       ...this.requestedBufferProfile,
     });
@@ -1185,6 +1600,7 @@ export class EmbyMsePlayer extends EventTarget {
               this.pendingQuotaRecovery = false;
               this.quotaRecoveryAttempts = 0;
             }
+            this.flushPendingMedia(false);
             this.pumpAppendQueue();
             this.inspectBuffer();
           });
@@ -1205,6 +1621,7 @@ export class EmbyMsePlayer extends EventTarget {
             this.mediaSource.duration =
               normalizedSession.plan.runtimeTicks / 10_000_000;
           }
+          this.sendSegmentFallbackReady();
           this.pumpAppendQueue();
         } catch (error) {
           this.emitError(
@@ -1362,9 +1779,20 @@ export class EmbyMsePlayer extends EventTarget {
     }
   }
 
-  appendInit(data: Uint8Array): void {
+  appendInit(data: Uint8Array): boolean {
     const session = this.session;
-    if (this.awaitingMediaVersion !== undefined && !this.host) return;
+    if (this.awaitingMediaVersion !== undefined && !this.host) return false;
+    const profile = this.bufferProfile;
+    if (
+      data.byteLength <= 0 ||
+      data.byteLength > profile.maxSegmentBytes ||
+      this.appendQueue.length >= profile.appendQueueMaxItems ||
+      this.queuedAppendBytes + data.byteLength >
+        profile.appendQueueHardLimitBytes
+    ) {
+      this.emitMediaQueuePressure("init", data.byteLength);
+      return false;
+    }
     if (session) {
       this.receivedInitKey = this.initKey(
         session.sessionId,
@@ -1373,18 +1801,20 @@ export class EmbyMsePlayer extends EventTarget {
       );
     }
     if (!this.appendQueue.length) this.appendQueueBytes = 0;
-    this.appendQueue.unshift(data.slice());
+    const retained = data.slice();
+    this.appendQueue.unshift(retained);
     this.appendTimestampOffsets.unshift(undefined);
     this.appendRetryCounts.unshift(0);
     this.appendQueueBytes += data.byteLength;
-    this.lastInitData = data.slice();
+    this.lastInitData = retained;
     this.emitAppendQueueChange();
     this.pumpAppendQueue();
     this.flushPendingMedia(false);
     this.maybeEndStream();
+    return true;
   }
 
-  appendFragment(fragment: EmbyTransportFragment): void {
+  appendFragment(fragment: EmbyTransportFragment): boolean {
     const fragmentEpoch = fragment.transportEpoch ?? 0;
     if (
       this.awaitingMediaVersion !== undefined ||
@@ -1393,7 +1823,7 @@ export class EmbyMsePlayer extends EventTarget {
       fragment.mediaVersion !== this.session.mediaVersion ||
       fragmentEpoch !== (this.session.transportEpoch ?? 0)
     ) {
-      return;
+      return false;
     }
     if (fragment.trackType === "muxed" && fragment.sequence === 0) {
       const initKey = this.initKey(
@@ -1401,13 +1831,12 @@ export class EmbyMsePlayer extends EventTarget {
         fragment.mediaVersion,
         fragmentEpoch,
       );
-      if (this.receivedInitKey === initKey) return;
+      if (this.receivedInitKey === initKey) return true;
       if (this.initRequestTimer !== undefined) {
         window.clearTimeout(this.initRequestTimer);
         this.initRequestTimer = undefined;
       }
-      this.appendInit(fragment.data);
-      return;
+      return this.appendInit(fragment.data);
     }
     const fragmentPlaybackTimeMs = Number.isFinite(fragment.timelineTimeMs)
       ? Number(fragment.timelineTimeMs)
@@ -1422,13 +1851,13 @@ export class EmbyMsePlayer extends EventTarget {
       // zero even when the movie is already tens of seconds in. Compare the
       // repaired movie clock, not that raw clock, or every fragment following
       // the startup burst is mistaken for a stale retransmission and dropped.
-      return;
+      return false;
     }
     if (fragment.trackType === "subtitle") {
       this.applySubtitle(new TextDecoder().decode(fragment.data));
-      return;
+      return true;
     }
-    this.queuePendingMedia(fragment);
+    return this.queuePendingMedia(fragment);
   }
 
   private initKey(
@@ -1439,21 +1868,51 @@ export class EmbyMsePlayer extends EventTarget {
     return `${sessionId}:${mediaVersion}:${transportEpoch}`;
   }
 
-  private queuePendingMedia(fragment: EmbyTransportFragment): void {
+  private queuePendingMedia(fragment: EmbyTransportFragment): boolean {
+    const profile = this.bufferProfile;
     if (
-      fragment.data.byteLength > EMBY_MAX_REORDER_BYTES ||
+      fragment.data.byteLength > profile.maxSegmentBytes ||
       this.pendingMediaFragments.has(fragment.sequence) ||
       (this.nextMediaSequence !== undefined &&
         fragment.sequence < this.nextMediaSequence)
     ) {
-      return;
+      if (fragment.data.byteLength > profile.maxSegmentBytes) {
+        this.emitMediaQueuePressure("fragment-too-large", fragment.data.byteLength);
+        this.requestCatchUp(
+          Math.max(
+            0,
+            finite(this.video.currentTime),
+            finite(this.latestHostTarget),
+          ),
+          "media-budget-fragment-too-large",
+        );
+      }
+      return false;
+    }
+    if (
+      this.pendingMediaFragments.size >= EMBY_MAX_REORDER_FRAGMENTS ||
+      this.pendingMediaBytes + fragment.data.byteLength >
+        profile.pendingFragmentLimitBytes ||
+      this.mediaBudget.estimatedTotalBytes + fragment.data.byteLength >
+        profile.memoryBudgetBytes
+    ) {
+      this.emitMediaQueuePressure("pending-fragments", fragment.data.byteLength);
+      this.requestCatchUp(
+        Math.max(
+          0,
+          finite(this.video.currentTime),
+          finite(this.latestHostTarget),
+        ),
+        "media-budget-pending-fragments",
+      );
+      return false;
     }
     this.missingFragmentRepairAttempts.delete(fragment.sequence);
     this.pendingMediaFragments.set(fragment.sequence, fragment);
     this.pendingMediaBytes += fragment.data.byteLength;
     while (
       this.pendingMediaFragments.size > EMBY_MAX_REORDER_FRAGMENTS ||
-      this.pendingMediaBytes > EMBY_MAX_REORDER_BYTES
+      this.pendingMediaBytes > profile.pendingFragmentLimitBytes
     ) {
       const highestSequence = Math.max(
         ...this.pendingMediaFragments.keys(),
@@ -1466,8 +1925,9 @@ export class EmbyMsePlayer extends EventTarget {
         this.pendingMediaBytes - removed.data.byteLength,
       );
     }
-    if (!this.hasCurrentInit()) return;
+    if (!this.hasCurrentInit()) return true;
     this.flushPendingMedia(this.host);
+    return true;
   }
 
   private hasCurrentInit(): boolean {
@@ -1519,6 +1979,19 @@ export class EmbyMsePlayer extends EventTarget {
         fragment = this.pendingMediaFragments.get(this.nextMediaSequence);
       }
       if (!fragment) break;
+      const profile = this.bufferProfile;
+      if (
+        this.appendQueue.length >= profile.appendQueueMaxItems ||
+        this.queuedAppendBytes >= profile.appendQueueHighWaterBytes ||
+        this.queuedAppendBytes + fragment.data.byteLength >
+          profile.appendQueueHardLimitBytes
+      ) {
+        this.emitMediaQueuePressure(
+          "append-queue",
+          fragment.data.byteLength,
+        );
+        break;
+      }
       this.pendingMediaFragments.delete(fragment.sequence);
       this.pendingMediaBytes = Math.max(
         0,
@@ -1804,16 +2277,21 @@ export class EmbyMsePlayer extends EventTarget {
       return;
     }
     const message = parsed as EmbyControlMessage;
+    if (message.type === "segment-fallback-offer") {
+      this.acceptSegmentFallbackOffer(message);
+      return;
+    }
     if (message.type === "segment-fallback-ack") {
       const request = this.segmentFallbackRequest;
       const session = this.session;
       if (
         !request ||
         !session ||
+        message.requestId !== request.requestId ||
         message.sessionId !== request.sessionId ||
         message.mediaVersion !== request.mediaVersion ||
         !Number.isSafeInteger(message.transportEpoch) ||
-        message.transportEpoch <= request.transportEpoch ||
+        message.transportEpoch !== request.offeredTransportEpoch ||
         message.transportEpoch > 1_000_000_000
       ) {
         return;
@@ -1822,6 +2300,7 @@ export class EmbyMsePlayer extends EventTarget {
       this.dispatchEvent(
         new CustomEvent("segmentfallbackack", {
           detail: {
+            requestId: message.requestId,
             sessionId: message.sessionId,
             mediaVersion: message.mediaVersion,
             transportEpoch: message.transportEpoch,
@@ -2194,6 +2673,15 @@ export class EmbyMsePlayer extends EventTarget {
       transportEpoch <= (session.transportEpoch ?? 0) ||
       transportEpoch > 1_000_000_000
     ) {
+      return false;
+    }
+    if (
+      this.segmentFallbackRequest &&
+      this.segmentFallbackRequest.offeredTransportEpoch !== transportEpoch
+    ) {
+      // During HTTPS→P2P negotiation, media is not authoritative until a
+      // MIME/profile offer has been accepted. This blocks a different SCTP
+      // stream from advancing the epoch before the control-plane handshake.
       return false;
     }
     this.session = { ...session, transportEpoch };
@@ -2978,6 +3466,18 @@ export class EmbyMsePlayer extends EventTarget {
     this.dispatchEvent(
       new CustomEvent("appendqueuechange", {
         detail: { queuedBytes: this.queuedAppendBytes },
+      }),
+    );
+  }
+
+  private emitMediaQueuePressure(reason: string, requestedBytes: number): void {
+    this.dispatchEvent(
+      new CustomEvent("mediaqueuepressure", {
+        detail: {
+          reason,
+          requestedBytes: Math.max(0, Math.ceil(finite(requestedBytes))),
+          ...this.mediaBudget,
+        },
       }),
     );
   }

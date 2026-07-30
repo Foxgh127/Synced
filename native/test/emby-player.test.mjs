@@ -356,13 +356,123 @@ test("adaptive Emby buffering uses bitrate and device memory as a hard byte budg
       target: constrained4kViewer.targetSeconds,
       maximum: constrained4kViewer.maxSeconds,
     },
-    { initial: 4, target: 5, maximum: 6 },
+    { initial: 2.5, target: 2.5, maximum: 3 },
   );
   assert.ok(
-    constrained4kViewer.maxSeconds * 100_000_000 / 8 <=
-      constrained4kViewer.memoryBudgetBytes,
-    "the time target may shrink but cannot exceed its encoded-byte budget",
+    constrained4kViewer.targetSeconds <=
+      constrained4kViewer.maxSeconds -
+        constrained4kViewer.safetyMarginSeconds,
+    "the fetch target stays below the MSE ceiling by a safety margin",
   );
+  assert.ok(
+    constrained4kViewer.maxSegmentBytes * 2 <=
+      constrained4kViewer.foregroundFetchLimitBytes,
+    "chunk coalescing cannot exceed the dedicated fetch allocation",
+  );
+  assert.ok(
+    constrained4kViewer.appendQueueHighWaterBytes <
+      constrained4kViewer.appendQueueHardLimitBytes,
+    "append backpressure engages before the hard byte ceiling",
+  );
+});
+
+test("the unified media budget includes active fetch and cache staging bytes", async (t) => {
+  const { EmbyMsePlayer } = await loadModule();
+  globalThis.window ||= globalThis;
+  const video = Object.assign(new EventTarget(), {
+    currentTime: 0,
+    playbackRate: 1,
+    buffered: { length: 0, start: () => 0, end: () => 0 },
+    pause() {},
+    play: async () => {},
+    removeAttribute() {},
+    load() {},
+    querySelectorAll: () => [],
+  });
+  const player = new EmbyMsePlayer({
+    video,
+    deviceMemoryGb: 2,
+  });
+  t.after(() => player.destroy());
+  const baseline = player.mediaBudget.estimatedTotalBytes;
+  player.setExternalMediaMemoryUsage({
+    foregroundFetchBytes: 2 * 1024 * 1024,
+    cacheStagingBytes: 1024 * 1024,
+  });
+  const active = player.mediaBudget;
+  assert.equal(active.foregroundFetchBytes, 2 * 1024 * 1024);
+  assert.equal(active.cacheStagingBytes, 1024 * 1024);
+  assert.equal(
+    active.estimatedTotalBytes,
+    baseline + 3 * 1024 * 1024,
+  );
+  assert.equal(player.diagnostics.foregroundFetchBytes, 2 * 1024 * 1024);
+  assert.equal(player.diagnostics.cacheStagingBytes, 1024 * 1024);
+});
+
+test("append and reorder queues stop at their device-budget high water marks", async (t) => {
+  const { EmbyMsePlayer } = await loadModule();
+  globalThis.window ||= globalThis;
+  const video = Object.assign(new EventTarget(), {
+    currentTime: 0,
+    playbackRate: 1,
+    buffered: { length: 0, start: () => 0, end: () => 0 },
+    pause() {},
+    play: async () => {},
+    removeAttribute() {},
+    load() {},
+    querySelectorAll: () => [],
+  });
+  const player = new EmbyMsePlayer({
+    video,
+    host: true,
+    deviceMemoryGb: 2,
+  });
+  t.after(() => player.destroy());
+  player.session = {
+    roomId: "ROOM",
+    sessionId: "session_budget_backpressure",
+    mediaVersion: 1,
+    transportEpoch: 0,
+    mimeType: 'video/mp4; codecs="avc1.640028,mp4a.40.2"',
+    plan: {
+      bitrate: 24_000_000,
+      width: 3840,
+      height: 2160,
+    },
+    title: "Budget fixture",
+  };
+  const pressureEvents = [];
+  player.addEventListener("mediaqueuepressure", (event) => {
+    pressureEvents.push(event.detail);
+  });
+  assert.equal(player.appendInit(Uint8Array.of(1, 2, 3)), true);
+  let rejected = false;
+  for (let sequence = 1; sequence <= 64; sequence += 1) {
+    const accepted = player.appendFragment({
+      roomId: "ROOM",
+      sessionId: "session_budget_backpressure",
+      mediaVersion: 1,
+      transportEpoch: 0,
+      sequence,
+      timestampMs: sequence,
+      mediaTimeMs: sequence * 1_000,
+      timelineTimeMs: sequence * 1_000,
+      trackType: "muxed",
+      keyframe: sequence % 2 === 1,
+      data: new Uint8Array(1024 * 1024),
+    });
+    if (!accepted) {
+      rejected = true;
+      break;
+    }
+  }
+  const profile = player.bufferProfile;
+  assert.equal(rejected, true);
+  assert.ok(player.queuedAppendBytes <= profile.appendQueueHardLimitBytes);
+  assert.ok(player.appendQueue.length <= profile.appendQueueMaxItems);
+  assert.ok(player.pendingMediaBytes <= profile.pendingFragmentLimitBytes);
+  assert.ok(pressureEvents.length > 0);
 });
 
 test("a stream transition retains channels but rejects old-version media", async () => {
@@ -816,7 +926,18 @@ test("segment fallback retries until an epoch-scoped ACK arrives", async () => {
     mediaVersion: 6,
     transportEpoch: 0,
     mimeType: 'video/mp4; codecs="avc1.640028,mp4a.40.2"',
-    plan: {},
+    plan: {
+      itemId: "item-fallback",
+      mediaSourceId: "source-fallback",
+      playSessionId: "play-fallback",
+      startTimeTicks: 0,
+      width: 1280,
+      height: 720,
+      frameRate: 30,
+      bitrate: 4_000_000,
+      videoCodec: "h264",
+      audioCodec: "aac",
+    },
     title: "Fixture",
   };
   let acknowledged;
@@ -833,6 +954,9 @@ test("segment fallback retries until an epoch-scoped ACK arrives", async () => {
     ).length,
     1,
   );
+  const request = channel.sent.find(
+    (message) => message.type === "segment-fallback-request",
+  );
   await new Promise((resolve) => setTimeout(resolve, 550));
   assert.equal(
     channel.sent.filter(
@@ -845,6 +969,7 @@ test("segment fallback retries until an epoch-scoped ACK arrives", async () => {
     new MessageEvent("message", {
       data: JSON.stringify({
         type: "segment-fallback-ack",
+        requestId: "stale-request-id",
         sessionId: "session_fallback_ack",
         mediaVersion: 6,
         transportEpoch: 0,
@@ -856,10 +981,49 @@ test("segment fallback retries until an epoch-scoped ACK arrives", async () => {
     undefined,
     "an ACK from the pre-fallback transport epoch is ignored",
   );
+  player.sourceBuffer = {};
+  channel.dispatchEvent(
+    new MessageEvent("message", {
+      data: JSON.stringify({
+        type: "segment-fallback-offer",
+        requestId: request.requestId,
+        sessionId: "session_fallback_ack",
+        mediaVersion: 6,
+        transportEpoch: 1,
+        mimeType: 'video/mp4; codecs="avc1.640028,mp4a.40.2"',
+        videoCodec: "h264",
+        audioCodec: "aac",
+        plan: { ...player.session.plan },
+        targetTime: 12,
+      }),
+    }),
+  );
+  assert.ok(
+    channel.sent.some(
+      (message) =>
+        message.type === "segment-fallback-ready" &&
+        message.requestId === request.requestId &&
+        message.transportEpoch === 1,
+    ),
+    "the viewer installs the offered profile before declaring readiness",
+  );
   channel.dispatchEvent(
     new MessageEvent("message", {
       data: JSON.stringify({
         type: "segment-fallback-ack",
+        requestId: "old-request-arrived-late",
+        sessionId: "session_fallback_ack",
+        mediaVersion: 6,
+        transportEpoch: 1,
+      }),
+    }),
+  );
+  assert.equal(acknowledged, undefined, "a late ACK for another request is ignored");
+  channel.dispatchEvent(
+    new MessageEvent("message", {
+      data: JSON.stringify({
+        type: "segment-fallback-ack",
+        requestId: request.requestId,
         sessionId: "session_fallback_ack",
         mediaVersion: 6,
         transportEpoch: 1,
@@ -867,6 +1031,7 @@ test("segment fallback retries until an epoch-scoped ACK arrives", async () => {
     }),
   );
   assert.deepEqual(acknowledged, {
+    requestId: request.requestId,
     sessionId: "session_fallback_ack",
     mediaVersion: 6,
     transportEpoch: 1,
@@ -879,6 +1044,139 @@ test("segment fallback retries until an epoch-scoped ACK arrives", async () => {
     2,
     "ACK cancels the remaining one- and two-second retries",
   );
+});
+
+test("fallback profile negotiation switches both codec directions and rejects media-first races", async () => {
+  const { EmbyMsePlayer } = await loadModule();
+  globalThis.window ||= globalThis;
+  const cases = [
+    {
+      initialMime: 'video/mp4; codecs="hvc1.1.6.L120.B0,mp4a.40.2"',
+      initialCodec: "hevc",
+      offeredMime: 'video/mp4; codecs="avc1.640028,mp4a.40.2"',
+      offeredCodec: "h264",
+    },
+    {
+      initialMime: 'video/mp4; codecs="avc1.640028,mp4a.40.2"',
+      initialCodec: "h264",
+      offeredMime: 'video/mp4; codecs="hvc1.1.6.L120.B0,mp4a.40.2"',
+      offeredCodec: "hevc",
+    },
+  ];
+  for (const [index, fixture] of cases.entries()) {
+    const video = Object.assign(new EventTarget(), {
+      currentTime: 20,
+      playbackRate: 1,
+      buffered: { length: 0, start: () => 0, end: () => 0 },
+      pause() {},
+      play: async () => {},
+    });
+    const player = new EmbyMsePlayer({ video });
+    const basePlan = {
+      itemId: `item-codec-${index}`,
+      mediaSourceId: `source-codec-${index}`,
+      playSessionId: `play-codec-${index}`,
+      startTimeTicks: 0,
+      width: 1920,
+      height: 1080,
+      frameRate: 30,
+      bitrate: 8_000_000,
+      videoCodec: fixture.initialCodec,
+      audioCodec: "aac",
+    };
+    const initialSession = {
+      roomId: "ROOM",
+      sessionId: `session_codec_${index}`,
+      mediaVersion: 9,
+      transportEpoch: 3,
+      mimeType: fixture.initialMime,
+      plan: basePlan,
+      title: "Codec fixture",
+    };
+    player.session = initialSession;
+    player.segmentFallbackRequest = {
+      requestId: `request-codec-${index}`,
+      sessionId: initialSession.sessionId,
+      mediaVersion: 9,
+      transportEpoch: 3,
+      targetTime: 20,
+      retryIndex: 0,
+    };
+    assert.equal(
+      player.advanceTransportEpochFromMedia(
+        initialSession.sessionId,
+        9,
+        4,
+      ),
+      false,
+      "higher-epoch media cannot preempt the profile offer",
+    );
+    const controls = [];
+    player.sendControl = (message) => {
+      controls.push(message);
+      return true;
+    };
+    let configureCalls = 0;
+    player.configure = (next) => {
+      configureCalls += 1;
+      player.session = { ...next };
+      player.sourceBuffer = {};
+    };
+    const offer = {
+      type: "segment-fallback-offer",
+      requestId: `request-codec-${index}`,
+      sessionId: initialSession.sessionId,
+      mediaVersion: 9,
+      transportEpoch: 4,
+      mimeType: fixture.offeredMime,
+      videoCodec: fixture.offeredCodec,
+      audioCodec: "aac",
+      plan: {
+        ...basePlan,
+        videoCodec: fixture.offeredCodec,
+      },
+      targetTime: 20,
+    };
+    player.acceptSegmentFallbackOffer(offer);
+    assert.equal(player.session.mimeType, fixture.offeredMime);
+    assert.equal(player.session.plan.videoCodec, fixture.offeredCodec);
+    assert.equal(configureCalls, 1);
+    assert.ok(
+      controls.some(
+        (message) =>
+          message.type === "segment-fallback-ready" &&
+          message.requestId === offer.requestId &&
+          message.transportEpoch === 4,
+      ),
+    );
+    player.acceptSegmentFallbackOffer(offer);
+    assert.equal(configureCalls, 1, "an identical offer is idempotent");
+    player.acceptSegmentFallbackOffer({
+      ...offer,
+      mimeType:
+        fixture.offeredCodec === "h264"
+          ? 'video/mp4; codecs="hvc1.1.6.L120.B0,mp4a.40.2"'
+          : 'video/mp4; codecs="avc1.640028,mp4a.40.2"',
+    });
+    assert.equal(
+      configureCalls,
+      1,
+      "the same request and epoch cannot mutate its negotiated profile",
+    );
+    player.acceptSegmentFallbackOffer({
+      ...offer,
+      targetTime: offer.targetTime + 5,
+    });
+    assert.equal(
+      player.pendingCatchUpTarget,
+      offer.targetTime,
+      "a duplicate offer cannot mutate the negotiated playback target",
+    );
+    player.enableExternalSegmentTransport();
+    player.configure(initialSession);
+    assert.equal(player.externalSegmentTransport, true);
+    assert.equal(player.session.mimeType, fixture.initialMime);
+  }
 });
 
 test("seq2 before init still waits for a repaired seq1 before flushing", async () => {

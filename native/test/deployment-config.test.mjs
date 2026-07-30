@@ -7,6 +7,20 @@ function source(relativePath) {
   return readFileSync(path.resolve(relativePath), "utf8");
 }
 
+test("packaged renderer CSP permits the exact official CMAF origin", () => {
+  const index = source("index.html");
+  const policy = index.match(
+    /http-equiv="Content-Security-Policy"\s+content="([^"]+)"/,
+  )?.[1];
+  assert.ok(policy);
+  const connectSource = policy
+    .split(";")
+    .find((directive) => directive.trim().startsWith("connect-src"));
+  assert.match(connectSource, /\bhttps:\/\/synced\.com\.cn\b/);
+  assert.doesNotMatch(connectSource, /(?:^|\s)https:(?:\s|$)/);
+  assert.doesNotMatch(connectSource, /\*/);
+});
+
 test("standby nginx exposes signalling only and overwrites untrusted XFF", () => {
   const nginx = source("deployment/nginx-synced-standby.conf");
   assert.match(nginx, /limit_conn_zone\s+\$binary_remote_addr/);
@@ -54,6 +68,28 @@ test("Docker deployment keeps the TURN secret out of argv and environment", () =
   assert.match(livekitEntrypoint, /bytes_per_sec: -1/);
   assert.match(livekitEntrypoint, /data_channel_max_buffered_amount: 0/);
   assert.match(livekitEntrypoint, /datachannel_data_track_target_latency: 0s/);
+});
+
+test("Docker signalling is loopback-only and trusts only its proxy gateway", () => {
+  const compose = source("deployment/docker-compose.yml");
+  const rootEnvironment = source("deployment/.env.example");
+  const signalEnvironment = source(
+    "deployment/synced-signal.env.example",
+  );
+  assert.match(compose, /-\s*"127\.0\.0\.1:8787:8787"/);
+  assert.match(compose, /TRUST_PROXY:\s*"true"/);
+  assert.match(
+    compose,
+    /TRUSTED_PROXY_CIDRS:\s*"172\.30\.0\.1\/32"/,
+  );
+  assert.match(compose, /ALLOW_NO_ORIGIN:\s*"\$\{ALLOW_NO_ORIGIN:-false\}"/);
+  assert.match(compose, /subnet:\s*172\.30\.0\.0\/28/);
+  assert.match(rootEnvironment, /^ALLOW_NO_ORIGIN=false$/m);
+  assert.match(signalEnvironment, /^ALLOW_NO_ORIGIN=false$/m);
+  assert.match(
+    signalEnvironment,
+    /^TRUSTED_PROXY_CIDRS=127\.0\.0\.1\/32,::1\/128$/m,
+  );
 });
 
 test("standby node has one signalling-only deployment surface", () => {

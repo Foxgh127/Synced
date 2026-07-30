@@ -7,6 +7,9 @@ export interface SchedulableSignalMessage {
   target?: string;
   sessionId?: string;
   attempt?: number;
+  roomRevision?: number;
+  participantRevision?: number;
+  broadcastRevision?: number;
 }
 
 type MessageHandler<T> = (
@@ -23,17 +26,120 @@ export interface SignalMessageSchedulerOptions<T> {
 const LATEST_ONLY_TYPES = new Set([
   "quality:request",
   "network:advice",
-  "broadcast:capabilities",
-  "participant:updated",
 ]);
 
-const LIFECYCLE_TYPES = new Set([
-  "server:hello",
+const ROOM_STATE_TYPES = new Set([
   "channel:joined",
+  "participant:joined",
+  "participant:updated",
+  "participant:left",
   "broadcast:granted",
   "broadcast:started",
   "broadcast:stopped",
+  "broadcast:capabilities",
+  "voice:joined",
+  "voice:left",
+  "moderation:microphone",
   "moderation:kicked",
+]);
+
+const PARTICIPANT_REVISION_TYPES = new Set([
+  "participant:joined",
+  "participant:updated",
+  "participant:left",
+  "voice:joined",
+  "voice:left",
+  "moderation:microphone",
+  "moderation:kicked",
+]);
+
+const BROADCAST_REVISION_TYPES = new Set([
+  "broadcast:granted",
+  "broadcast:started",
+  "broadcast:stopped",
+  "broadcast:capabilities",
+]);
+
+export class RoomStateRevisionGate {
+  private roomRevision = 0;
+  private participantRevision = 0;
+  private broadcastRevision = 0;
+  private initialized = false;
+
+  get current(): {
+    roomRevision: number;
+    participantRevision: number;
+    broadcastRevision: number;
+  } {
+    return {
+      roomRevision: this.roomRevision,
+      participantRevision: this.participantRevision,
+      broadcastRevision: this.broadcastRevision,
+    };
+  }
+
+  reset(): void {
+    this.roomRevision = 0;
+    this.participantRevision = 0;
+    this.broadcastRevision = 0;
+    this.initialized = false;
+  }
+
+  accept(message: SchedulableSignalMessage): boolean {
+    const roomRevision = Number(message.roomRevision);
+    if (!Number.isSafeInteger(roomRevision) || roomRevision < 0) {
+      // Compatibility path for protocol-v2 servers. Ordering is still
+      // provided by the room-state actor, but stale suppression needs v3
+      // revisions.
+      return true;
+    }
+    const participantRevision = Number(message.participantRevision);
+    const broadcastRevision = Number(message.broadcastRevision);
+    if (message.type === "channel:joined") {
+      if (this.initialized && roomRevision <= this.roomRevision) return false;
+      this.initialized = true;
+      this.roomRevision = roomRevision;
+      if (
+        Number.isSafeInteger(participantRevision) &&
+        participantRevision >= 0
+      ) {
+        this.participantRevision = participantRevision;
+      }
+      if (
+        Number.isSafeInteger(broadcastRevision) &&
+        broadcastRevision >= 0
+      ) {
+        this.broadcastRevision = broadcastRevision;
+      }
+      return true;
+    }
+    const participantState = PARTICIPANT_REVISION_TYPES.has(message.type);
+    const broadcastState = BROADCAST_REVISION_TYPES.has(message.type);
+    if (!participantState && !broadcastState) return true;
+    if (roomRevision <= this.roomRevision) return false;
+    if (
+      participantState &&
+      (!Number.isSafeInteger(participantRevision) ||
+        participantRevision <= this.participantRevision)
+    ) {
+      return false;
+    }
+    if (
+      broadcastState &&
+      (!Number.isSafeInteger(broadcastRevision) ||
+        broadcastRevision <= this.broadcastRevision)
+    ) {
+      return false;
+    }
+    this.roomRevision = roomRevision;
+    if (participantState) this.participantRevision = participantRevision;
+    if (broadcastState) this.broadcastRevision = broadcastRevision;
+    return true;
+  }
+}
+
+const LIFECYCLE_TYPES = new Set([
+  "server:hello",
   "error",
 ]);
 
@@ -60,6 +166,10 @@ export class SignalMessageScheduler<
     const generation = this.generation;
     if (message.type === "signal" || message.type === "media:ice-restart") {
       this.enqueueSerial(this.peerKey(message), message, generation);
+      return;
+    }
+    if (ROOM_STATE_TYPES.has(message.type)) {
+      this.enqueueSerial("room-state", message, generation);
       return;
     }
     if (LATEST_ONLY_TYPES.has(message.type)) {

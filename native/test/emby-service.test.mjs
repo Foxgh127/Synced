@@ -1,7 +1,14 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { createReadStream, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import {
+  createReadStream,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -17,6 +24,7 @@ const {
   browserDirectAudioCompatible,
   browserDirectVideoCompatible,
   buildDeviceProfile,
+  CmafRelayCoordinator,
   chooseSource,
   decodeSubtitleBuffer,
   embyApiBaseCandidates,
@@ -31,6 +39,141 @@ const {
   rewriteManifest,
   terminateChildProcess,
 } = require("../electron/emby-service.cjs");
+
+test("relay publisher reconciles 507 prefix and suffix tombstones", async () => {
+  const cacheDir = mkdtempSync(path.join(os.tmpdir(), "synced-relay-507-"));
+  const originalFetch = globalThis.fetch;
+  const warnings = [];
+  globalThis.fetch = async (_url, init) => {
+    for await (const _chunk of init.body) {
+      // A real fetch implementation drains the request body before returning
+      // the HTTP response. Keep that lifecycle guarantee in this stub so the
+      // coordinator has no pending file-open work after the assertion.
+    }
+    return new Response(
+      JSON.stringify({
+        code: "storage-capacity-exceeded",
+        revision: 8,
+        evictionRevision: 4,
+        retryAfterMs: 15_000,
+        storagePressure: true,
+        tombstones: [
+          {
+            renditionId: "720p4",
+            throughSequence: 2,
+            fromSequence: 5,
+            evictionRevision: 4,
+          },
+        ],
+      }),
+      {
+        status: 507,
+        headers: { "content-type": "application/json" },
+      },
+    );
+  };
+  const coordinator = new CmafRelayCoordinator(
+    {
+      roomId: "23456789",
+      sessionId: "session-relay-507",
+      assetId: "0123456789abcdef0123456789abcdef01234567",
+      mediaVersion: 1,
+      baseUrl: "https://relay.example/media/v1/",
+      token: "x".repeat(96),
+    },
+    {
+      cacheDir,
+      sendEvent: (event) => warnings.push(event),
+    },
+  );
+  try {
+    const state = coordinator.ensureRendition("720p4");
+    state.firstSegmentSequence = 1;
+    state.contiguousUploadedSequence = 6;
+    state.plan = { bitrate: 4_000_000 };
+    for (let sequence = 1; sequence <= 6; sequence += 1) {
+      const descriptor = {
+        sequence,
+        timelineTimeMs: sequence * 2_000,
+        durationMs: 2_000,
+        keyframe: true,
+      };
+      state.descriptors.set(sequence, descriptor);
+      state.uploadedDescriptors.set(sequence, descriptor);
+      state.segments.set(sequence, descriptor);
+    }
+    const uploadPath = path.join(cacheDir, "probe.m4s");
+    writeFileSync(uploadPath, Buffer.from("probe"));
+    let capacityError;
+    await assert.rejects(
+      coordinator.uploadFile(
+        new URL("segments/7.m4s", coordinator.config.baseUrl),
+        uploadPath,
+        5,
+        { "content-type": "video/iso.segment" },
+      ),
+      (error) => {
+        capacityError = error;
+        return error?.status === 507;
+      },
+    );
+    assert.deepEqual([...state.segments.keys()], [3, 4]);
+    assert.equal(state.contiguousUploadedSequence, 4);
+    assert.deepEqual(coordinator.serverTombstones.get("720p4"), {
+      renditionId: "720p4",
+      throughSequence: 2,
+      fromSequence: 5,
+      evictionRevision: 4,
+    });
+    assert.ok(coordinator.serverPressureUntil > Date.now());
+    assert.equal(state.pressurePaused, true);
+    const failedRecord = {
+      retired: false,
+      uploaded: false,
+      retryAttempts: 0,
+    };
+    coordinator.markRecordFailed(failedRecord, capacityError);
+    assert.ok(
+      failedRecord.nextRetryAt >= coordinator.serverPressureUntil - 5,
+      "a 507 retry honors the relay admission backoff instead of retrying after one second",
+    );
+    for (let sequence = 5; sequence <= 6; sequence += 1) {
+      const descriptor = {
+        sequence,
+        timelineTimeMs: sequence * 2_000,
+        durationMs: 2_000,
+        keyframe: true,
+      };
+      state.descriptors.set(sequence, descriptor);
+      state.uploadedDescriptors.set(sequence, descriptor);
+      state.segments.set(sequence, descriptor);
+    }
+    state.contiguousUploadedSequence = 6;
+    await assert.rejects(
+      coordinator.uploadFile(
+        new URL("segments/8.m4s", coordinator.config.baseUrl),
+        uploadPath,
+        5,
+        { "content-type": "video/iso.segment" },
+      ),
+      (error) => error?.status === 507,
+    );
+    assert.deepEqual(
+      [...state.segments.keys()],
+      [3, 4, 5, 6],
+      "a duplicate tombstone revision cannot erase the newly recovered suffix",
+    );
+    assert.ok(
+      warnings.some(
+        (event) => event.code === "segment-relay-storage-pressure",
+      ),
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    await coordinator.close();
+    rmSync(cacheDir, { recursive: true, force: true });
+  }
+});
 
 test("read-ahead grows faster for efficient remux while bounding 4K and CPU fallback bursts", () => {
   assert.deepEqual(embyReadAheadProfile(8_000_000, false), {

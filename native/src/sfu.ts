@@ -31,6 +31,53 @@ const SFU_DATA_OUTSTANDING_BYTES = 8 * 1024 * 1024;
 const SCREEN_VIDEO_TRACK = "synced-screen-video";
 const SCREEN_VIDEO_EMERGENCY_TRACK = "synced-screen-video-emergency";
 const SCREEN_AUDIO_TRACK = "synced-screen-audio";
+const EMERGENCY_VIDEO_WIDTH = 854;
+const EMERGENCY_VIDEO_HEIGHT = 480;
+const EMERGENCY_VIDEO_FPS = 24;
+
+export function isVerifiedEmergencyTrackSettings(
+  settings: MediaTrackSettings | undefined,
+): boolean {
+  const width = Number(settings?.width);
+  const height = Number(settings?.height);
+  const frameRate = Number(settings?.frameRate);
+  return (
+    Number.isFinite(width) &&
+    width > 0 &&
+    width <= EMERGENCY_VIDEO_WIDTH &&
+    Number.isFinite(height) &&
+    height > 0 &&
+    height <= EMERGENCY_VIDEO_HEIGHT &&
+    Number.isFinite(frameRate) &&
+    frameRate > 0 &&
+    frameRate <= EMERGENCY_VIDEO_FPS + 0.5
+  );
+}
+
+async function constrainEmergencyTrack(
+  track: MediaStreamTrack,
+  requestedFrameRate = EMERGENCY_VIDEO_FPS,
+): Promise<boolean> {
+  try {
+    await track.applyConstraints({
+      width: {
+        ideal: EMERGENCY_VIDEO_WIDTH,
+        max: EMERGENCY_VIDEO_WIDTH,
+      },
+      height: {
+        ideal: EMERGENCY_VIDEO_HEIGHT,
+        max: EMERGENCY_VIDEO_HEIGHT,
+      },
+      frameRate: {
+        ideal: Math.min(EMERGENCY_VIDEO_FPS, requestedFrameRate),
+        max: Math.min(EMERGENCY_VIDEO_FPS, requestedFrameRate),
+      },
+    });
+  } catch {
+    return false;
+  }
+  return isVerifiedEmergencyTrackSettings(track.getSettings());
+}
 
 export interface SfuAccess {
   url: string;
@@ -53,6 +100,9 @@ export interface SfuScreenReceiverStats {
   framesDecoded: number;
   framesDropped: number;
   framesPerSecond?: number;
+  frameWidth?: number;
+  frameHeight?: number;
+  emergency: boolean;
   jitter?: number;
   currentRoundTripTime?: number;
   availableIncomingBitrate?: number;
@@ -662,16 +712,20 @@ export class SfuSession {
       } else if (role === "emergency") {
         track.contentHint =
           preset.contentMode === "motion" ? "motion" : "detail";
-        await track
-          .applyConstraints({
-            width: { ideal: 854, max: 854 },
-            height: { ideal: 480, max: 480 },
-            frameRate: {
-              ideal: Math.min(24, preset.frameRate),
-              max: Math.min(24, preset.frameRate),
+        if (!(await constrainEmergencyTrack(track, preset.frameRate))) {
+          const actual = track.getSettings();
+          track.stop();
+          this.options.onDiagnostic?.(
+            "sfu-emergency-track-rejected",
+            {
+              reason: "capture-driver-did-not-apply-480p-constraints",
+              width: actual.width,
+              height: actual.height,
+              frameRate: actual.frameRate,
             },
-          })
-          .catch(() => undefined);
+          );
+          continue;
+        }
       }
       const sourceHeight =
         sourceTrack.getSettings().height ||
@@ -771,7 +825,14 @@ export class SfuSession {
       tracks: this.publishedScreenTracks.length,
       maxBitrate: preset.maxBitrate,
       frameRate: Math.min(30, preset.frameRate),
-      simulcastLayers: ["1440p", "1080p", "720p", "480p-emergency"],
+      simulcastLayers: [
+        "1440p",
+        "1080p",
+        "720p",
+        ...(this.publishedScreenRoles.includes("emergency")
+          ? ["480p-emergency-verified"]
+          : ["primary-low-fallback"]),
+      ],
       contentMode: preset.contentMode || "balanced",
     });
   }
@@ -1161,6 +1222,16 @@ export class SfuSession {
         Number(inbound.framesPerSecond) > 0
           ? Number(inbound.framesPerSecond)
           : undefined,
+      frameWidth:
+        Number(inbound.frameWidth) > 0
+          ? Number(inbound.frameWidth)
+          : undefined,
+      frameHeight:
+        Number(inbound.frameHeight) > 0
+          ? Number(inbound.frameHeight)
+          : undefined,
+      emergency:
+        publication?.trackName === SCREEN_VIDEO_EMERGENCY_TRACK,
       jitter:
         Number(inbound.jitter) >= 0 ? Number(inbound.jitter) : undefined,
       currentRoundTripTime:
@@ -1205,7 +1276,21 @@ export class SfuSession {
     if (publication.source !== Track.Source.ScreenShare) return false;
     const emergency =
       publication.trackName === SCREEN_VIDEO_EMERGENCY_TRACK;
-    return emergency === this.screenWantsEmergency(preference);
+    const participant = this.room?.remoteParticipants.get(
+      this.watchingBroadcasterId,
+    );
+    const emergencyAvailable = participant
+      ? [...participant.trackPublications.values()].some(
+          (candidate) =>
+            candidate.kind === Track.Kind.Video &&
+            candidate.source === Track.Source.ScreenShare &&
+            candidate.trackName === SCREEN_VIDEO_EMERGENCY_TRACK,
+        )
+      : false;
+    return (
+      emergency ===
+      (this.screenWantsEmergency(preference) && emergencyAvailable)
+    );
   }
 
   private screenWantsEmergency(
@@ -1491,12 +1576,14 @@ export class SfuSession {
   async replacePublishedScreenTrack(
     sourceTrack: MediaStreamTrack,
   ): Promise<boolean> {
+    const room = this.requireConnectedRoom();
     const indexes = this.publishedScreenPublications
       .map((publication, index) =>
         publication.track?.kind === sourceTrack.kind ? index : -1,
       )
       .filter((index) => index >= 0);
     if (!indexes.length) return false;
+    const rejectedEmergencyIndexes: number[] = [];
     await Promise.all(
       indexes.map(async (index) => {
         const publication = this.publishedScreenPublications[index];
@@ -1504,13 +1591,11 @@ export class SfuSession {
         if (!localTrack) return;
         const replacement = sourceTrack.clone();
         if (this.publishedScreenRoles[index] === "emergency") {
-          await replacement
-            .applyConstraints({
-              width: { ideal: 854, max: 854 },
-              height: { ideal: 480, max: 480 },
-              frameRate: { ideal: 24, max: 24 },
-            })
-            .catch(() => undefined);
+          if (!(await constrainEmergencyTrack(replacement))) {
+            replacement.stop();
+            rejectedEmergencyIndexes.push(index);
+            return;
+          }
         }
         try {
           await withTimeout(
@@ -1529,6 +1614,29 @@ export class SfuSession {
         if (previous && previous !== replacement) previous.stop();
       }),
     );
+    for (const index of rejectedEmergencyIndexes.sort(
+      (left, right) => right - left,
+    )) {
+      const publication = this.publishedScreenPublications[index];
+      const previous = this.publishedScreenTracks[index];
+      if (publication) {
+        await this.discardScreenPublication(
+          room,
+          publication,
+          "invalid emergency track cleanup timed out",
+        );
+      }
+      previous?.stop();
+      this.publishedScreenTracks.splice(index, 1);
+      this.publishedScreenPublications.splice(index, 1);
+      this.publishedScreenRoles.splice(index, 1);
+    }
+    if (rejectedEmergencyIndexes.length) {
+      this.options.onDiagnostic?.("sfu-emergency-track-rejected", {
+        reason: "replacement-track-did-not-apply-480p-constraints",
+        publications: rejectedEmergencyIndexes.length,
+      });
+    }
     this.options.onDiagnostic?.("sfu-screen-track-replaced", {
       kind: sourceTrack.kind,
       trackId: sourceTrack.id,

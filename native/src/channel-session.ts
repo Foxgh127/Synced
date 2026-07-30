@@ -107,6 +107,7 @@ import {
 } from "./playback-continuity";
 import { RoomCompanion, roomSidebarMarkup } from "./room-companion";
 import {
+  isVerifiedEmergencyTrackSettings,
   SfuSession,
   sanitizeSfuAccess,
   type SfuAccess,
@@ -119,7 +120,10 @@ import {
   stableEmbeddedHorizontalBars,
   type EmbeddedHorizontalBars,
 } from "./video-presentation";
-import { SignalMessageScheduler } from "./signal-message-scheduler";
+import {
+  RoomStateRevisionGate,
+  SignalMessageScheduler,
+} from "./signal-message-scheduler";
 import {
   SignalClient,
   applyReceiverPreference,
@@ -454,6 +458,7 @@ export async function openChannelSession(
   const SFU_EMBY_VIEWER_ID = "__sfu__";
 
   const participants = new Map<string, RoomParticipant>();
+  const roomStateRevisionGate = new RoomStateRevisionGate();
   const outboundPeers = new Map<string, OutboundPeer>();
   const failedVideoCodecsByViewer = new Map<string, Set<string>>();
   const receiverPreferences = new Map<
@@ -3820,6 +3825,25 @@ export async function openChannelSession(
     if (!sfuViewerActive || broadcastCapabilities?.mode === "emby") return;
     const stats = await sfuSession.readScreenReceiverStats();
     if (!stats || !sfuViewerActive) return;
+    if (
+      stats.emergency &&
+      stats.framesDecoded > 0 &&
+      !isVerifiedEmergencyTrackSettings({
+        width: stats.frameWidth,
+        height: stats.frameHeight,
+        frameRate: stats.framesPerSecond,
+      })
+    ) {
+      reportPlaybackDiagnostic("sfu-emergency-receiver-invalid", {
+        frameWidth: stats.frameWidth,
+        frameHeight: stats.frameHeight,
+        framesPerSecond: stats.framesPerSecond,
+      });
+      void fallbackFromSfu(
+        "SFU 应急轨实际规格异常，正在切换 P2P 备用链路",
+      );
+      return;
+    }
     const previous = sfuScreenReceiverSnapshot;
     sfuScreenReceiverSnapshot = stats;
     if (!previous || stats.timestamp <= previous.timestamp) return;
@@ -3880,7 +3904,16 @@ export async function openChannelSession(
         decision.direction === "down" ? "neutral" : "ready",
       );
     }
-    const dimensions = `${stats.framesPerSecond ? `${Math.round(stats.framesPerSecond)} fps` : "SFU 分层"}`;
+    const dimensions = [
+      stats.frameWidth && stats.frameHeight
+        ? `${Math.round(stats.frameWidth)}×${Math.round(stats.frameHeight)}`
+        : "SFU 分层",
+      stats.framesPerSecond
+        ? `${Math.round(stats.framesPerSecond)} fps`
+        : "",
+    ]
+      .filter(Boolean)
+      .join(" · ");
     const pressure =
       adaptivePlayback.currentPressure === "healthy"
         ? ""
@@ -5157,6 +5190,7 @@ export async function openChannelSession(
       if (!isActive() || embyViewer !== player) return;
       const detail = (
         event as CustomEvent<{
+          requestId: string;
           sessionId: string;
           mediaVersion: number;
           transportEpoch: number;
@@ -5171,6 +5205,7 @@ export async function openChannelSession(
       reportPlaybackDiagnostic("emby-segment-fallback-acknowledged", {
         mediaVersion: detail.mediaVersion,
         transportEpoch: detail.transportEpoch,
+        requestId: detail.requestId,
       });
     });
     player.addEventListener("segmentrelay", (event) => {
@@ -11740,6 +11775,7 @@ export async function openChannelSession(
       operationSignal?.throwIfAborted();
     };
     if (leaving) return;
+    if (!roomStateRevisionGate.accept(message)) return;
     if (message.type === "server:hello") {
       const advertised = Array.isArray(message.networkProbe?.versions)
         ? message.networkProbe.versions
@@ -13692,6 +13728,7 @@ export async function openChannelSession(
   });
   signal.addEventListener("close", () => {
     signalMessageScheduler.reset();
+    roomStateRevisionGate.reset();
     clearChannelJoinAckTimer();
     networkProbeGeneration += 1;
     networkProbePromise = undefined;

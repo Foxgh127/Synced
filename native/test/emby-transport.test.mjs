@@ -381,6 +381,25 @@ test("fragment cache retains the current version and supports keyframe catch-up"
   assert.equal(cache.get(3, 8), undefined);
 });
 
+test("fragment cache never returns an undecodable tail without a keyframe", async () => {
+  const { EmbyFragmentCache } = await loadModule();
+  const cache = new EmbyFragmentCache(60_000, 4_000_000);
+  for (let sequence = 1; sequence <= 3; sequence += 1) {
+    cache.add({
+      roomId: "ROOM",
+      sessionId: "session_cache_without_keyframe",
+      mediaVersion: 4,
+      sequence,
+      timestampMs: Date.now(),
+      mediaTimeMs: sequence * 1_000,
+      trackType: "muxed",
+      keyframe: false,
+      data: fixtureData(1_000),
+    });
+  }
+  assert.deepEqual(cache.after(4, 0), []);
+});
+
 test("fragment cache excludes the retained init segment from its LRU byte budget", async () => {
   const { EmbyFragmentCache } = await loadModule();
   const cache = new EmbyFragmentCache(60_000, 1_000);
@@ -622,7 +641,7 @@ test("slow drain accounting combines queued JavaScript and SCTP duration", async
   sender.close();
 });
 
-test("4K backlog pruning preserves priority init for a resync epoch", async () => {
+test("4K backlog pruning gates media until a new epoch starts on a keyframe", async () => {
   const { EmbyPeerSender, EMBY_BUFFER_HIGH_WATER, decodeEmbyChunk } =
     await loadModule();
   class BlockedChannel extends EventTarget {
@@ -669,8 +688,52 @@ test("4K backlog pruning preserves priority init for a resync epoch", async () =
     });
   }
   assert.ok(sender.stats.droppedFragments > 0);
+  assert.ok(sender.stats.recoveryGeneration > 0);
   channel.bufferedAmount = 0;
   channel.dispatchEvent(new Event("bufferedamountlow"));
+  assert.equal(
+    channel.sent.filter((packet) => packet instanceof ArrayBuffer).length,
+    0,
+    "the undecodable tail is held until the controller re-primes it",
+  );
+  sender.clearMediaQueue({ waitForKeyframe: true });
+  sender.sendControl({
+    type: "resync",
+    sessionId: base.sessionId,
+    mediaVersion: base.mediaVersion,
+    transportEpoch: 4,
+    targetTime: 24,
+  });
+  sender.sendFragment(
+    {
+      ...base,
+      sequence: 0,
+      mediaTimeMs: 0,
+      keyframe: true,
+      data: fixtureData(900_000),
+    },
+    { priority: true, transportEpoch: 4 },
+  );
+  sender.sendFragment(
+    {
+      ...base,
+      sequence: 33,
+      mediaTimeMs: 24_750,
+      keyframe: false,
+      data: fixtureData(600_000),
+    },
+    { transportEpoch: 4 },
+  );
+  sender.sendFragment(
+    {
+      ...base,
+      sequence: 34,
+      mediaTimeMs: 25_500,
+      keyframe: true,
+      data: fixtureData(600_000),
+    },
+    { transportEpoch: 4 },
+  );
   const headers = channel.sent
     .filter((packet) => packet instanceof ArrayBuffer)
     .map((packet) => decodeEmbyChunk(packet).header);
@@ -678,7 +741,15 @@ test("4K backlog pruning preserves priority init for a resync epoch", async () =
   assert.ok(
     headers
       .filter((header) => header.fragmentSeq === 0)
-      .every((header) => header.transportEpoch === 3),
+      .every((header) => header.transportEpoch === 4),
+  );
+  assert.equal(
+    headers.find((header) => header.fragmentSeq > 0)?.fragmentSeq,
+    34,
+  );
+  assert.equal(
+    headers.find((header) => header.fragmentSeq > 0)?.keyframe,
+    true,
   );
   sender.close();
 });

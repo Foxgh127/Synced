@@ -58,7 +58,11 @@ curl -fsS http://127.0.0.1:7880/
 
 Compose 固定使用 `livekit/livekit-server:v1.13.4` 与
 `coturn/coturn:4.15.0-r0`。LiveKit 使用 host networking；配置由只读 secret
-在容器启动时生成，密钥不会出现在进程参数中。
+在容器启动时生成，密钥不会出现在进程参数中。信令端口固定发布到
+`127.0.0.1:8787`，并位于 `172.30.0.0/28` 的专用 bridge；应用只信任
+`172.30.0.1/32` 这个宿主机代理入口提供的 `X-Forwarded-For`。若修改该网段，
+必须同时更新 `TRUSTED_PROXY_CIDRS`，不能改成任意来源。生产默认
+`ALLOW_NO_ORIGIN=false`。
 
 ## 反向代理与防火墙
 
@@ -79,6 +83,9 @@ Compose 固定使用 `livekit/livekit-server:v1.13.4` 与
 - UDP `32768-65535`：coturn relay
 
 端口 `7880`、`8787` 和 `6789` 只供本机反向代理/监控访问，不应直接暴露公网。
+Nginx 必须覆盖（而不是追加客户端提供的）`X-Forwarded-For`。防火墙还应明确拒绝
+公网直连 `8787`；应用层的 Origin、每 IP、每客户端、每 token 和每房间限制继续
+作为第二道边界。
 部署后从服务器外验证：
 
 ```bash

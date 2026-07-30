@@ -54,6 +54,8 @@ interface PeerState {
   healthyRecoverySamples: number;
   lastPressureReportAt: number;
   observedDroppedFragments: number;
+  observedRecoveryGeneration: number;
+  backlogRecoveryScheduled: boolean;
   transportEpoch: number;
   repairTokens: number;
   repairTokenUpdatedAt: number;
@@ -63,7 +65,12 @@ interface PeerState {
   lastBufferStateAt: number;
   mediaFallbackActive: boolean;
   lastMediaFallbackAt: number;
-  pendingMediaFallbackTarget?: number;
+  mediaFallbackOffer?: {
+    requestId: string;
+    targetTime: number;
+    transportEpoch: number;
+    activated: boolean;
+  };
 }
 
 interface PendingStart {
@@ -532,7 +539,7 @@ export class EmbyBroadcastController {
       state.lastInitRequestAt = 0;
       state.lastBufferStateAt = 0;
       state.mediaFallbackActive = false;
-      state.pendingMediaFallbackTarget = undefined;
+      state.mediaFallbackOffer = undefined;
       const { sender } = state;
       sender.cancelVersionsExcept(this.mediaVersion);
     }
@@ -642,6 +649,7 @@ export class EmbyBroadcastController {
       bufferedBytes: 0,
       queuedMessages: 0,
       droppedFragments: 0,
+      recoveryGeneration: 0,
       queuedDurationMs: 0,
       bufferedDurationMs: 0,
       totalQueuedDurationMs: 0,
@@ -659,6 +667,8 @@ export class EmbyBroadcastController {
       healthyRecoverySamples: 0,
       lastPressureReportAt: 0,
       observedDroppedFragments: 0,
+      observedRecoveryGeneration: 0,
+      backlogRecoveryScheduled: false,
       transportEpoch: 0,
       repairTokens: 128,
       repairTokenUpdatedAt: Date.now(),
@@ -668,13 +678,47 @@ export class EmbyBroadcastController {
       lastBufferStateAt: 0,
       mediaFallbackActive: false,
       lastMediaFallbackAt: 0,
-      pendingMediaFallbackTarget: undefined,
+      mediaFallbackOffer: undefined,
     };
     state.sender = new EmbyPeerSender(
       channel,
       (message) => this.handlePeerControl(viewerId, message),
       (stats) => {
         state.stats = stats;
+        if (
+          stats.recoveryGeneration >
+            state.observedRecoveryGeneration &&
+          !state.backlogRecoveryScheduled
+        ) {
+          state.observedRecoveryGeneration = stats.recoveryGeneration;
+          state.backlogRecoveryScheduled = true;
+          queueMicrotask(() => {
+            state.backlogRecoveryScheduled = false;
+            if (
+              this.peers.get(viewerId) !== state ||
+              !state.sessionReady ||
+              !this.active
+            ) {
+              return;
+            }
+            state.recoveries += 1;
+            state.lastCatchUpAt = Date.now();
+            this.primeMediaForPeer(
+              state,
+              Math.max(0, this.options.video.currentTime || 0),
+              true,
+            );
+            this.bridge.reportDiagnostic(
+              "emby-keyframe-backlog-recovery",
+              {
+                viewerId,
+                mediaVersion: this.mediaVersion,
+                transportEpoch: state.transportEpoch,
+                recoveryGeneration: stats.recoveryGeneration,
+              },
+            );
+          });
+        }
         this.publishStatus();
       },
       controlChannel,
@@ -1646,6 +1690,7 @@ export class EmbyBroadcastController {
     state: PeerState,
     targetTime = this.options.video.currentTime,
     clearQueuedMedia = false,
+    transportEpochOverride?: number,
   ): void {
     if (!state.sessionReady) return;
     if (this.segmentDescriptor && !state.mediaFallbackActive) {
@@ -1656,10 +1701,15 @@ export class EmbyBroadcastController {
     const mediaVersion = this.mediaVersion;
     const sessionId = this.sessionId;
     if (clearQueuedMedia) {
-      state.transportEpoch = Math.min(
-        1_000_000_000,
-        state.transportEpoch + 1,
-      );
+      state.transportEpoch =
+        Number.isSafeInteger(transportEpochOverride) &&
+        Number(transportEpochOverride) > state.transportEpoch &&
+        Number(transportEpochOverride) <= 1_000_000_000
+          ? Number(transportEpochOverride)
+          : Math.min(
+              1_000_000_000,
+              state.transportEpoch + 1,
+            );
     }
     const transportEpoch = state.transportEpoch;
     const sendCachedMedia = (): void => {
@@ -1705,7 +1755,7 @@ export class EmbyBroadcastController {
       if (this.streamHasEnded) this.sendEndedToPeer(state);
     };
     if (clearQueuedMedia) {
-      state.sender.clearMediaQueue();
+      state.sender.clearMediaQueue({ waitForKeyframe: true });
       state.sender.sendControl({
         type: "resync",
         sessionId,
@@ -1713,11 +1763,11 @@ export class EmbyBroadcastController {
         transportEpoch,
         targetTime: Math.max(0, targetTime),
       });
-      // Control and media use separate SCTP streams. Give the tiny resync
-      // envelope a short head start so a new client clears stale assembly and
-      // append queues before replacement fragments arrive. Old clients ignore
-      // the envelope and receive the same compatible cached stream.
-      window.setTimeout(sendCachedMedia, 25);
+      // Normal epoch advancement is safe even when media wins the SCTP race:
+      // the receiver treats the higher-epoch media header as an atomic queue
+      // reset. Segment fallback uses an explicit offer/ready barrier before
+      // this point, so no timing delay is needed on either path.
+      sendCachedMedia();
       return;
     }
     sendCachedMedia();
@@ -1725,60 +1775,166 @@ export class EmbyBroadcastController {
 
   private validMediaFallbackRequest(
     viewerId: string,
-    targetTime: number,
+    message: Extract<
+      EmbyControlMessage,
+      { type: "segment-fallback-request" }
+    >,
   ): boolean {
     return (
       viewerId !== "__sfu__" &&
       Boolean(this.segmentDescriptor) &&
-      Number.isFinite(targetTime) &&
-      targetTime >= 0 &&
-      targetTime <= 30 * 24 * 60 * 60
+      /^[a-z0-9-]{8,64}$/i.test(message.requestId) &&
+      Number.isSafeInteger(message.transportEpoch) &&
+      message.transportEpoch >= 0 &&
+      message.transportEpoch <= 1_000_000_000 &&
+      Number.isFinite(message.targetTime) &&
+      message.targetTime >= 0 &&
+      message.targetTime <= 30 * 24 * 60 * 60
     );
   }
 
-  private acknowledgeMediaFallback(state: PeerState): void {
+  private sendMediaFallbackOffer(state: PeerState): void {
+    const offer = state.mediaFallbackOffer;
+    const normalizedMimeType = this.mimeType.toLowerCase();
+    const mimeMatchesPlan =
+      /\bmp4a\./i.test(normalizedMimeType) &&
+      (this.plan?.videoCodec === "h264"
+        ? /\bavc[13]\./i.test(normalizedMimeType)
+        : this.plan?.videoCodec === "hevc" &&
+          /\b(?:hvc1|hev1)\./i.test(normalizedMimeType));
+    if (
+      !offer ||
+      !this.plan ||
+      !this.mimeType ||
+      !["h264", "hevc"].includes(this.plan.videoCodec) ||
+      this.plan.audioCodec !== "aac" ||
+      !mimeMatchesPlan
+    ) {
+      return;
+    }
+    const videoCodec = this.plan.videoCodec as "h264" | "hevc";
     state.sender.sendControl(
       {
-        type: "segment-fallback-ack",
+        type: "segment-fallback-offer",
+        requestId: offer.requestId,
         sessionId: this.sessionId,
         mediaVersion: this.mediaVersion,
-        transportEpoch: state.transportEpoch,
+        transportEpoch: offer.transportEpoch,
+        mimeType: this.mimeType,
+        videoCodec,
+        audioCodec: "aac",
+        plan: this.plan,
+        targetTime: offer.targetTime,
       },
       true,
     );
   }
 
+  private acknowledgeMediaFallback(
+    state: PeerState,
+    offer: NonNullable<PeerState["mediaFallbackOffer"]>,
+  ): void {
+    state.sender.sendControl(
+      {
+        type: "segment-fallback-ack",
+        requestId: offer.requestId,
+        sessionId: this.sessionId,
+        mediaVersion: this.mediaVersion,
+        transportEpoch: offer.transportEpoch,
+      },
+      true,
+    );
+  }
+
+  private offerMediaFallbackToPeer(
+    viewerId: string,
+    state: PeerState,
+    message: Extract<
+      EmbyControlMessage,
+      { type: "segment-fallback-request" }
+    >,
+  ): void {
+    const existing = state.mediaFallbackOffer;
+    if (existing?.requestId === message.requestId) {
+      if (state.sessionReady) {
+        this.sendMediaFallbackOffer(state);
+        if (existing.activated) {
+          this.acknowledgeMediaFallback(state, existing);
+        }
+      }
+      return;
+    }
+    if (message.transportEpoch !== state.transportEpoch) return;
+    const transportEpoch = Math.min(
+      1_000_000_000,
+      state.transportEpoch + 1,
+    );
+    if (transportEpoch <= state.transportEpoch) return;
+    state.mediaFallbackOffer = {
+      requestId: message.requestId,
+      targetTime: message.targetTime,
+      transportEpoch,
+      activated: false,
+    };
+    if (!state.sessionReady) {
+      return;
+    }
+    this.sendMediaFallbackOffer(state);
+    this.bridge.reportDiagnostic("emby-segment-media-fallback-offered", {
+      viewerId,
+      mediaVersion: this.mediaVersion,
+      requestId: message.requestId,
+      transportEpoch,
+      mimeType: this.mimeType,
+      videoCodec: this.plan?.videoCodec,
+      audioCodec: this.plan?.audioCodec,
+    });
+  }
+
   private activateMediaFallbackForPeer(
     viewerId: string,
     state: PeerState,
-    targetTime: number,
+    message: Extract<
+      EmbyControlMessage,
+      { type: "segment-fallback-ready" }
+    >,
   ): void {
-    if (!state.sessionReady) {
-      state.pendingMediaFallbackTarget = targetTime;
+    const offer = state.mediaFallbackOffer;
+    if (
+      !offer ||
+      offer.requestId !== message.requestId ||
+      offer.transportEpoch !== message.transportEpoch
+    ) {
       return;
     }
-    state.pendingMediaFallbackTarget = undefined;
-    const now = Date.now();
-    const alreadyPrimed =
-      state.mediaFallbackActive &&
-      now - state.lastMediaFallbackAt < 1_000;
-    state.mediaFallbackActive = true;
-    if (!alreadyPrimed) {
-      state.lastMediaFallbackAt = now;
-      this.primeMediaForPeer(state, targetTime, true);
-      this.bridge.reportDiagnostic(
-        "emby-segment-media-fallback-started",
-        {
-          viewerId,
-          mediaVersion: this.mediaVersion,
-          targetTime,
-          transportEpoch: state.transportEpoch,
-        },
-      );
+    if (offer.activated) {
+      this.acknowledgeMediaFallback(state, offer);
+      return;
     }
-    // ACK every duplicate request. If a previous ACK was lost, throttling the
-    // expensive cache prime must not leave the viewer retrying forever.
-    this.acknowledgeMediaFallback(state);
+    const now = Date.now();
+    state.mediaFallbackActive = true;
+    state.lastMediaFallbackAt = now;
+    offer.activated = true;
+    this.primeMediaForPeer(
+      state,
+      offer.targetTime,
+      true,
+      offer.transportEpoch,
+    );
+    this.bridge.reportDiagnostic(
+      "emby-segment-media-fallback-started",
+      {
+        viewerId,
+        mediaVersion: this.mediaVersion,
+        requestId: offer.requestId,
+        targetTime: offer.targetTime,
+        transportEpoch: state.transportEpoch,
+      },
+    );
+    // The ACK is queued after resync/init/media. The media and control SCTP
+    // streams may still interleave, but the viewer's READY guaranteed that
+    // the offered MIME/profile and epoch were installed first.
+    this.acknowledgeMediaFallback(state, offer);
   }
 
   private handlePeerControl(
@@ -1830,8 +1986,31 @@ export class EmbyBroadcastController {
     if (
       "transportEpoch" in message &&
       message.transportEpoch !== undefined &&
-      message.transportEpoch !== state.transportEpoch
+      message.transportEpoch !== state.transportEpoch &&
+      message.type !== "segment-fallback-request" &&
+      message.type !== "segment-fallback-ready"
     ) {
+      return;
+    }
+    if (message.type === "segment-fallback-request") {
+      if (!this.validMediaFallbackRequest(viewerId, message)) {
+        return;
+      }
+      this.offerMediaFallbackToPeer(viewerId, state, message);
+      return;
+    }
+    if (message.type === "segment-fallback-ready") {
+      if (
+        viewerId === "__sfu__" ||
+        !state.sessionReady ||
+        !/^[a-z0-9-]{8,64}$/i.test(message.requestId) ||
+        !Number.isSafeInteger(message.transportEpoch) ||
+        message.transportEpoch < 1 ||
+        message.transportEpoch > 1_000_000_000
+      ) {
+        return;
+      }
+      this.activateMediaFallbackForPeer(viewerId, state, message);
       return;
     }
     if (message.type === "init-request") {
@@ -1852,39 +2031,17 @@ export class EmbyBroadcastController {
       if (state.sessionReady) return;
       state.sessionReady = true;
       state.ready = false;
-      const pendingFallbackTarget =
-        state.pendingMediaFallbackTarget;
-      if (pendingFallbackTarget !== undefined) {
-        this.activateMediaFallbackForPeer(
-          viewerId,
-          state,
-          pendingFallbackTarget,
-        );
+      if (state.mediaFallbackOffer) {
+        this.sendMediaFallbackOffer(state);
       } else {
         this.primeMediaForPeer(state);
       }
       this.publishStatus();
       return;
     }
-    if (message.type === "segment-fallback-request") {
-      if (
-        !this.validMediaFallbackRequest(
-          viewerId,
-          message.targetTime,
-        )
-      ) {
-        return;
-      }
-      this.activateMediaFallbackForPeer(
-        viewerId,
-        state,
-        message.targetTime,
-      );
-      return;
-    }
     if (message.type === "segment-fallback-release") {
       const wasActive = state.mediaFallbackActive;
-      state.pendingMediaFallbackTarget = undefined;
+      state.mediaFallbackOffer = undefined;
       state.mediaFallbackActive = false;
       if (wasActive) {
         state.sender.clearMediaQueue();

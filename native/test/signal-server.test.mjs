@@ -1623,6 +1623,14 @@ test("lets any desktop member start and stop broadcasting in a channel", async (
   const ownerJoined = await ownerJoinedMessage;
   assert.equal(ownerJoined.created, true);
   assert.equal(ownerJoined.broadcasterId, undefined);
+  assert.deepEqual(
+    {
+      room: ownerJoined.roomRevision,
+      participants: ownerJoined.participantRevision,
+      broadcast: ownerJoined.broadcastRevision,
+    },
+    { room: 1, participants: 1, broadcast: 0 },
+  );
 
   const member = await openSocket();
   const memberJoinedMessage = nextMessage(member, "channel:joined");
@@ -1652,6 +1660,14 @@ test("lets any desktop member start and stop broadcasting in a channel", async (
   const memberJoined = await memberJoinedMessage;
   assert.equal(memberJoined.created, false);
   assert.equal(memberJoined.participants.length, 2);
+  assert.deepEqual(
+    {
+      room: memberJoined.roomRevision,
+      participants: memberJoined.participantRevision,
+      broadcast: memberJoined.broadcastRevision,
+    },
+    { room: 2, participants: 2, broadcast: 0 },
+  );
   assert.deepEqual(
     memberJoined.participants.find(
       (participant) => participant.id === memberJoined.clientId,
@@ -1706,6 +1722,10 @@ test("lets any desktop member start and stop broadcasting in a channel", async (
   assert.deepEqual(started.broadcastCapabilities, memberCapabilities);
   assert.deepEqual(granted.broadcastCapabilities, memberCapabilities);
   assert.deepEqual(granted.viewerIds, []);
+  assert.equal(granted.roomRevision, 3);
+  assert.equal(granted.broadcastRevision, 1);
+  assert.equal(started.roomRevision, 3);
+  assert.equal(started.broadcastRevision, 1);
 
   const measuredCapabilities = {
     width: 2560,
@@ -1728,6 +1748,8 @@ test("lets any desktop member start and stop broadcasting in a channel", async (
     capabilitiesUpdate.broadcastCapabilities,
     measuredCapabilities,
   );
+  assert.equal(capabilitiesUpdate.roomRevision, 4);
+  assert.equal(capabilitiesUpdate.broadcastRevision, 2);
 
   const lateViewer = await openSocket();
   const lateViewerJoinedMessage = nextMessage(lateViewer, "channel:joined");
@@ -1746,6 +1768,9 @@ test("lets any desktop member start and stop broadcasting in a channel", async (
     lateViewerJoined.broadcastCapabilities,
     measuredCapabilities,
   );
+  assert.equal(lateViewerJoined.roomRevision, 5);
+  assert.equal(lateViewerJoined.participantRevision, 3);
+  assert.equal(lateViewerJoined.broadcastRevision, 2);
 
   const memberSawReadyViewer = nextMessage(member, "viewer:joined");
   owner.send(
@@ -1861,7 +1886,10 @@ test("lets any desktop member start and stop broadcasting in a channel", async (
 
   const ownerSawStop = nextMessage(owner, "broadcast:stopped");
   member.send(JSON.stringify({ type: "broadcast:stop" }));
-  assert.equal((await ownerSawStop).reason, "stopped");
+  const stopped = await ownerSawStop;
+  assert.equal(stopped.reason, "stopped");
+  assert.equal(stopped.roomRevision, 6);
+  assert.equal(stopped.broadcastRevision, 3);
 
   const betweenBroadcastsViewer = await openSocket();
   const betweenBroadcastsJoinedMessage = nextMessage(
@@ -2090,10 +2118,25 @@ test("lets the channel owner manage microphones, broadcasts, and members", async
       disabled: true,
     }),
   );
-  assert.equal((await memberForcedMute).disabled, true);
+  const forcedMute = await memberForcedMute;
+  assert.equal(forcedMute.disabled, true);
+  assert.ok(
+    forcedMute.roomRevision > memberJoined.roomRevision,
+  );
+  assert.ok(
+    forcedMute.participantRevision >
+      memberJoined.participantRevision,
+  );
   const disabledParticipant = await ownerSawDisabled;
   assert.equal(disabledParticipant.participant.microphoneDisabled, true);
   assert.equal(disabledParticipant.participant.microphoneMuted, true);
+  assert.ok(
+    disabledParticipant.roomRevision > forcedMute.roomRevision,
+  );
+  assert.ok(
+    disabledParticipant.participantRevision >
+      forcedMute.participantRevision,
+  );
 
   const ownerSawStillMuted = nextMessage(owner, "participant:updated");
   member.send(JSON.stringify({ type: "voice:mute", muted: false }));
@@ -2143,8 +2186,23 @@ test("lets the channel owner manage microphones, broadcasts, and members", async
       target: memberJoined.clientId,
     }),
   );
-  assert.match((await kicked).message, /移出频道/);
-  assert.equal((await ownerSawLeave).participantId, memberJoined.clientId);
+  const kickedMessage = await kicked;
+  assert.match(kickedMessage.message, /移出频道/);
+  assert.ok(
+    kickedMessage.roomRevision >
+      disabledParticipant.roomRevision,
+  );
+  assert.ok(
+    kickedMessage.participantRevision >
+      disabledParticipant.participantRevision,
+  );
+  const leftMessage = await ownerSawLeave;
+  assert.equal(leftMessage.participantId, memberJoined.clientId);
+  assert.ok(leftMessage.roomRevision > kickedMessage.roomRevision);
+  assert.ok(
+    leftMessage.participantRevision >
+      kickedMessage.participantRevision,
+  );
 
   owner.close();
 });
@@ -2442,6 +2500,57 @@ test("applies per-IP limits to the real client behind a local trusted proxy", as
     second.close();
     otherIp.close();
     await proxyServer.close();
+  }
+});
+
+test("an untrusted direct peer cannot forge XFF to evade the IP limit", async () => {
+  const proxyServer = createSignalServer({
+    env: {
+      TRUST_PROXY: "true",
+      TRUSTED_PROXY_CIDRS: "10.0.0.0/8",
+      MAX_CLIENTS: "8",
+      MAX_CLIENTS_PER_IP: "2",
+    },
+  });
+  const address = await proxyServer.listen(0, "127.0.0.1");
+  const url = `ws://127.0.0.1:${address.port}/signal`;
+  const first = await openSocket(url, {
+    headers: { "x-forwarded-for": "203.0.113.10" },
+  });
+  const second = await openSocket(url, {
+    headers: { "x-forwarded-for": "203.0.113.11" },
+  });
+  try {
+    await assert.rejects(
+      openSocket(url, {
+        headers: { "x-forwarded-for": "203.0.113.12" },
+      }),
+      /503/,
+    );
+  } finally {
+    first.close();
+    second.close();
+    await proxyServer.close();
+  }
+});
+
+test("production origin mode rejects a WebSocket with no Origin", async () => {
+  const originServer = createSignalServer({
+    env: {
+      ALLOW_NO_ORIGIN: "false",
+      ALLOWED_ORIGINS: "https://synced.com.cn",
+    },
+  });
+  const address = await originServer.listen(0, "127.0.0.1");
+  const url = `ws://127.0.0.1:${address.port}/signal`;
+  try {
+    await assert.rejects(openSocket(url), /403/);
+    const allowed = await openSocket(url, {
+      origin: "https://synced.com.cn",
+    });
+    allowed.close();
+  } finally {
+    await originServer.close();
   }
 });
 

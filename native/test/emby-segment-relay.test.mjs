@@ -164,6 +164,7 @@ test("manifest parser preserves eviction revisions and rendition init epochs", a
         {
           renditionId: "original",
           throughSequence: 41,
+          fromSequence: 100,
           evictionRevision: 3,
         },
       ],
@@ -189,6 +190,7 @@ test("manifest parser preserves eviction revisions and rendition init epochs", a
     {
       renditionId: "original",
       throughSequence: 41,
+      fromSequence: 100,
       evictionRevision: 3,
     },
   ]);

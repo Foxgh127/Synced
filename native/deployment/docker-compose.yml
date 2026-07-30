@@ -38,11 +38,14 @@ services:
       MAX_MESSAGES_PER_MINUTE: "${MAX_MESSAGES_PER_MINUTE:-600}"
       SIGNAL_MAX_BUFFERED_BYTES: "${SIGNAL_MAX_BUFFERED_BYTES:-786432}"
       ALLOWED_ORIGINS: "${ALLOWED_ORIGINS:-file://,http://localhost,https://localhost,capacitor://localhost}"
-      ALLOW_NO_ORIGIN: "${ALLOW_NO_ORIGIN:-true}"
-      TRUST_PROXY: "false"
+      ALLOW_NO_ORIGIN: "${ALLOW_NO_ORIGIN:-false}"
+      TRUST_PROXY: "true"
+      TRUSTED_PROXY_CIDRS: "172.30.0.1/32"
       ALLOW_LEGACY_PROTOCOL: "false"
     ports:
-      - "8787:8787"
+      - "127.0.0.1:8787:8787"
+    networks:
+      - signal_proxy
     secrets:
       - turn_secret
       - livekit_api_secret
@@ -173,3 +176,11 @@ secrets:
 
 volumes:
   segment_relay_cache:
+
+networks:
+  signal_proxy:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/28
+          gateway: 172.30.0.1
