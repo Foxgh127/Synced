@@ -207,6 +207,50 @@ test("an exhausted partial keyframe reports abandonment instead of disappearing 
   ]);
 });
 
+test("throttled repair wake-ups still consume the absolute retry budget", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const transport = await loadModule();
+  globalThis.window ||= globalThis;
+  const packets = transport
+    .chunkEmbyFragment({
+      roomId: "ROOM",
+      sessionId: "session_throttled_repair",
+      mediaVersion: 5,
+      sequence: 21,
+      timestampMs: Date.now(),
+      mediaTimeMs: 15_000,
+      trackType: "muxed",
+      keyframe: true,
+      data: fixtureData(80_000),
+    })
+    .map(({ packet }) => packet);
+  const repairs = [];
+  const abandoned = [];
+  const assembler = new transport.EmbyFragmentAssembler(
+    {
+      roomId: "ROOM",
+      sessionId: "session_throttled_repair",
+      mediaVersion: 5,
+    },
+    () => assert.fail("the incomplete fragment must not be delivered"),
+    (...args) => repairs.push(args),
+    undefined,
+    (detail) => abandoned.push(detail),
+  );
+  assembler.accept(packets[0]);
+
+  for (let attempt = 0; attempt < 6 && assembler.hasPending; attempt += 1) {
+    const assembly = [...assembler.pending.values()][0];
+    assembly.lastRequestAt = Date.now() + 400;
+    t.mock.timers.tick(800);
+  }
+
+  assert.equal(repairs.length, 0);
+  assert.equal(assembler.hasPending, false);
+  assert.equal(abandoned.length, 1);
+  assert.equal(abandoned[0].reason, "repair-exhausted");
+});
+
 test("receiver keeps a wide mobile TURN reorder window without evicting reliable fragments", async () => {
   const transport = await loadModule();
   globalThis.window ||= globalThis;

@@ -92,6 +92,14 @@ test("SFU lifecycle isolates viewer faults and replaces recovered screen tracks 
     channel,
     /onParticipantDisconnected:[\s\S]*?identity === broadcasterId[\s\S]*?fallbackFromSfu/,
   );
+  assert.match(
+    sfu,
+    /const mediaChannel = new SfuRtcDataChannel\(\s*SFU_EMBY_MEDIA_TRACK,\s*undefined,\s*fatal,\s*\)/,
+  );
+  assert.match(
+    sfu,
+    /const controlChannel = new SfuRtcDataChannel\(\s*SFU_EMBY_CONTROL_TRACK,\s*publishViewerControl,\s*fatal,\s*\)/,
+  );
 });
 
 test("SFU readers and watch attempts are cancellation-safe", () => {
