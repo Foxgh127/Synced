@@ -1,33 +1,46 @@
 import { App } from "@capacitor/app";
-import QRCode from "qrcode";
 import "./styles.css";
 import {
-  QUALITY_PRESETS,
-  buildJoinLink,
-  createRoomCode,
-  formatBitrate,
+  forgetRecentChannel,
+  getChannelName,
+  getHostChannelOwnership,
+  getNickname,
+  getRecentChannels,
+  saveChannelName,
+  saveNickname,
+} from "./channel-store";
+import { openChannelSession } from "./channel-session";
+import {
+  describeSignalHost,
+  HOME_SIGNAL_URL,
   normalizeSignalUrl,
   parseJoinLink,
-  type QualityKey,
+  requiresSignalTrust,
 } from "./config";
-import {
-  SignalClient,
-  createPeerConnection,
-  preferVideoCodecs,
-  readOutboundVideoStats,
-  tuneOpus,
-  tuneSenders,
-  type OutboundSnapshot,
-  type SignalEnvelope,
-} from "./rtc";
+import { hideEmbeddedGame } from "./embedded-game";
+import { isNativeAndroid } from "./immersive";
 
-const appRootElement = document.querySelector<HTMLDivElement>("#app");
-if (!appRootElement) {
+const root = document.querySelector<HTMLDivElement>("#app");
+if (!root) {
   throw new Error("Missing application root");
 }
-const appRoot: HTMLDivElement = appRootElement;
+const appRoot: HTMLDivElement = root;
 
-const DEFAULT_SIGNAL_URL = "ws://127.0.0.1:8787/signal";
+const DEFAULT_SIGNAL_URL = HOME_SIGNAL_URL;
+const isDesktop = Boolean(window.roomDesktop);
+
+if (isNativeAndroid()) {
+  document.addEventListener("contextmenu", (event) => {
+    const target = event.target;
+    if (
+      target instanceof Element &&
+      target.closest("input, textarea, [contenteditable='true']")
+    ) {
+      return;
+    }
+    event.preventDefault();
+  });
+}
 
 function escapeHtml(value: string): string {
   return value
@@ -37,8 +50,14 @@ function escapeHtml(value: string): string {
     .replaceAll('"', "&quot;");
 }
 
-function getSavedSignalUrl(): string {
-  return localStorage.getItem("yiqikan:signal") || DEFAULT_SIGNAL_URL;
+function getSignalUrl(): string {
+  const saved = localStorage.getItem("yiqikan:signal");
+  if (!saved) return DEFAULT_SIGNAL_URL;
+  try {
+    return normalizeSignalUrl(saved);
+  } catch {
+    return DEFAULT_SIGNAL_URL;
+  }
 }
 
 function saveSignalUrl(value: string): string {
@@ -47,705 +66,706 @@ function saveSignalUrl(value: string): string {
   return normalized;
 }
 
-function setToast(message: string, tone: "normal" | "error" = "normal"): void {
-  const oldToast = document.querySelector(".toast");
-  oldToast?.remove();
-  const toast = document.createElement("div");
-  toast.className = `toast ${tone === "error" ? "toast-error" : ""}`;
-  toast.textContent = message;
-  document.body.append(toast);
-  window.setTimeout(() => toast.remove(), 3_000);
+type ToastType = "info" | "warn" | "danger";
+
+function getOrCreateToastContainer(): HTMLElement {
+  let container = document.getElementById("toast-container");
+  if (!container) {
+    container = document.createElement("div");
+    container.id = "toast-container";
+    container.setAttribute("aria-label", "通知");
+    document.body.append(container);
+  }
+  return container;
 }
 
-function brandMarkup(role: string): string {
-  return `
-    <header class="topbar">
-      <div class="brand">
-        <span class="brand-mark" aria-hidden="true"><span></span></span>
-        <div>
-          <strong>一起看</strong>
-          <small>${role}</small>
-        </div>
-      </div>
-      <span class="privacy-pill"><i></i> 点对点加密传输</span>
-    </header>
+function removeToast(element: Element | null): void {
+  if (!element?.parentNode) return;
+  const toastElement = element as HTMLElement;
+  toastElement.classList.add("is-leaving");
+  window.setTimeout(() => toastElement.remove(), 160);
+}
+
+function toast(
+  message: string,
+  type: ToastType | boolean = "info",
+): void {
+  const tone: ToastType =
+    type === true ? "danger" : type === false ? "info" : type;
+  const container = getOrCreateToastContainer();
+  const element = document.createElement("div");
+  element.className = `toast toast-${tone}`;
+  element.setAttribute("role", tone === "danger" ? "alert" : "status");
+  element.innerHTML = `
+    <span class="toast-bar" aria-hidden="true"></span>
+    <span class="toast-text">${escapeHtml(message)}</span>
+    <button class="btn btn-ghost btn-icon btn-icon-sm toast-close" type="button" aria-label="关闭通知">
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M6 6l12 12M18 6 6 18"></path>
+      </svg>
+    </button>
   `;
+  element
+    .querySelector(".toast-close")
+    ?.addEventListener("click", () => removeToast(element));
+  container.append(element);
+  const all = container.querySelectorAll(".toast");
+  if (all.length > 3) removeToast(all[0]);
+  window.setTimeout(() => removeToast(element), 5_000);
+}
+
+function confirmExternalInvite(
+  inviteUrl: string,
+): { room: string; signalUrl: string } | undefined {
+  const parsed = parseJoinLink(inviteUrl);
+  if (!parsed.room) {
+    toast("邀请链接无效或已损坏", "danger");
+    return undefined;
+  }
+  let signalUrl: string;
+  try {
+    signalUrl = normalizeSignalUrl(parsed.signal || getSignalUrl());
+  } catch {
+    toast("邀请链接中的信令服务器地址无效", "danger");
+    return undefined;
+  }
+  const untrusted = requiresSignalTrust(signalUrl);
+  // Opening a trusted app invite is already an explicit user gesture. A
+  // native confirm() here can be dismissed while Android is still restoring
+  // the WebView, leaving the user on an empty join screen even though the
+  // deep link was valid. Trusted home/LAN links are safe to join directly
+  // because joining never enables the microphone. Unknown signal hosts still
+  // require an explicit trust decision.
+  if (!untrusted) return { room: parsed.room, signalUrl };
+  const message = [
+    "⚠️ 注意：此邀请使用了陌生的信令服务器",
+    "",
+    `服务器：${describeSignalHost(signalUrl)}`,
+    `频道：${parsed.room}`,
+    "",
+    "只接受你认识的人发来的邀请链接。",
+    "加入后不会自动开启麦克风。",
+  ].join("\n");
+  const accepted = window.confirm(message);
+  return accepted ? { room: parsed.room, signalUrl } : undefined;
+}
+
+function channelInitial(name: string): string {
+  return Array.from(name)[0] || "频";
+}
+
+function recentMarkup(disabled = false): string {
+  const recent = getRecentChannels();
+  if (!recent.length) {
+    return `<p class="recent-empty">加入过的频道会留在这里</p>`;
+  }
+  const actionHint = isDesktop ? "左键进入，右键删除" : "短按进入，长按删除";
+  return recent
+    .map(
+      (channel) => `
+        <button
+          class="recent-channel"
+          data-recent-room="${escapeHtml(channel.room)}"
+          data-recent-name="${escapeHtml(channel.name)}"
+          data-recent-signal="${escapeHtml(channel.signalUrl)}"
+          data-recent-navigation-disabled="${disabled ? "true" : "false"}"
+          aria-label="${escapeHtml(channel.name)}，${actionHint}"
+          aria-disabled="${disabled ? "true" : "false"}"
+          title="${escapeHtml(channel.name)} · ${actionHint}"
+        >
+          <span>${escapeHtml(channelInitial(channel.name))}</span>
+          <b>${escapeHtml(channel.name)}</b>
+          <small>${channel.room}</small>
+        </button>
+      `,
+    )
+    .join("");
+}
+
+function railMarkup(disabled = false): string {
+  return `
+    <aside class="channel-rail">
+      <div class="rail-logo rail-identity" role="img" aria-label="同频">
+        <img src="./brand-mark-dark.svg" width="26" height="26" alt="" aria-hidden="true" />
+      </div>
+      <div class="rail-divider"></div>
+      <div class="recent-list" aria-label="最近加入的频道">
+        ${recentMarkup(disabled)}
+      </div>
+      <button class="rail-add" data-join-button aria-label="加入新频道">＋</button>
+      <div class="rail-spacer"></div>
+      <div class="profile-orb" title="${escapeHtml(getNickname())}">
+        ${escapeHtml(channelInitial(getNickname()))}
+      </div>
+    </aside>
+  `;
+}
+
+function bindRailNavigation(): void {
+  document.querySelector("[data-join-button]")?.addEventListener("click", () => {
+    void renderViewer({ desktop: isDesktop });
+  });
+  bindRecentChannelInteractions();
+}
+
+function requestRecentChannelDeletion(
+  button: HTMLButtonElement,
+): void {
+  if (document.querySelector("[data-recent-delete-dialog]")) {
+    return;
+  }
+  const room = button.dataset.recentRoom;
+  if (!room) {
+    return;
+  }
+  const name = button.dataset.recentName || room;
+  const dialog = document.createElement("dialog");
+  dialog.className = "recent-delete-dialog";
+  dialog.dataset.recentDeleteDialog = "";
+  dialog.innerHTML = `
+    <div class="delete-dialog-icon" aria-hidden="true">−</div>
+    <span class="eyebrow">REMOVE FROM HISTORY</span>
+    <h2>删除这个历史频道？</h2>
+    <p><strong>${escapeHtml(name)}</strong><span>${escapeHtml(room)}</span></p>
+    <small>只会从这台设备的历史记录中移除，不会关闭频道。</small>
+    <div class="delete-dialog-actions">
+      <button class="ghost-button" type="button" data-cancel-recent-delete>取消</button>
+      <button class="delete-confirm-button" type="button" data-confirm-recent-delete>删除</button>
+    </div>
+  `;
+  document.body.append(dialog);
+
+  const closeDialog = (): void => {
+    if (dialog.open) {
+      dialog.close();
+    }
+    dialog.remove();
+  };
+  dialog.addEventListener("cancel", (event) => {
+    event.preventDefault();
+    closeDialog();
+  });
+  dialog
+    .querySelector("[data-cancel-recent-delete]")
+    ?.addEventListener("click", closeDialog);
+  dialog
+    .querySelector("[data-confirm-recent-delete]")
+    ?.addEventListener("click", () => {
+      if (forgetRecentChannel(room)) {
+        const list = button.closest<HTMLElement>(".recent-list");
+        button.remove();
+        if (list && !list.querySelector("[data-recent-room]")) {
+          list.innerHTML = `<p class="recent-empty">加入过的频道会留在这里</p>`;
+        }
+        toast(`已从历史记录删除频道 ${room}`);
+      }
+      closeDialog();
+    });
+  dialog.showModal();
+  dialog
+    .querySelector<HTMLButtonElement>("[data-cancel-recent-delete]")
+    ?.focus();
+}
+
+function bindRecentChannelInteractions(): void {
+  document.querySelectorAll<HTMLButtonElement>("[data-recent-room]").forEach((button) => {
+    let longPressTimer: number | undefined;
+    let suppressNextClick = false;
+    let pointerStart = { x: 0, y: 0 };
+
+    const cancelLongPress = (): void => {
+      if (longPressTimer !== undefined) {
+        window.clearTimeout(longPressTimer);
+        longPressTimer = undefined;
+      }
+      button.classList.remove("is-long-pressing");
+    };
+
+    button.addEventListener("pointerdown", (event) => {
+      if (isDesktop) {
+        return;
+      }
+      if (event.pointerType === "mouse" && event.button !== 0) {
+        return;
+      }
+      cancelLongPress();
+      pointerStart = { x: event.clientX, y: event.clientY };
+      button.setPointerCapture?.(event.pointerId);
+      button.classList.add("is-long-pressing");
+      longPressTimer = window.setTimeout(() => {
+        longPressTimer = undefined;
+        suppressNextClick = true;
+        button.classList.remove("is-long-pressing");
+        const room = button.dataset.recentRoom;
+        if (!room) {
+          suppressNextClick = false;
+          return;
+        }
+        navigator.vibrate?.(35);
+        requestRecentChannelDeletion(button);
+      }, 650);
+    });
+    button.addEventListener("pointermove", (event) => {
+      if (
+        Math.hypot(
+          event.clientX - pointerStart.x,
+          event.clientY - pointerStart.y,
+        ) > 10
+      ) {
+        cancelLongPress();
+      }
+    });
+    const finishLongPress = (): void => {
+      cancelLongPress();
+      if (suppressNextClick) {
+        window.setTimeout(() => {
+          suppressNextClick = false;
+        });
+      }
+    };
+    button.addEventListener("pointerup", finishLongPress);
+    button.addEventListener("pointercancel", finishLongPress);
+    button.addEventListener("lostpointercapture", cancelLongPress);
+    button.addEventListener("contextmenu", (event) => {
+      event.preventDefault();
+      if (isDesktop) {
+        requestRecentChannelDeletion(button);
+      }
+    });
+    button.addEventListener("click", (event) => {
+      if (suppressNextClick) {
+        suppressNextClick = false;
+        event.preventDefault();
+        event.stopPropagation();
+        return;
+      }
+      if (button.dataset.recentNavigationDisabled === "true") {
+        return;
+      }
+      void renderViewer({
+        desktop: isDesktop,
+        room: button.dataset.recentRoom,
+        signalUrl: button.dataset.recentSignal,
+        autoJoin: true,
+      });
+    });
+  });
+}
+
+/* ─── Star field ─────────────────────────────────────────────────── */
+let starCanvas: HTMLCanvasElement | null = null;
+let starAnimId = 0;
+
+function startStarField(): void {
+  if (starCanvas) return;
+  const canvas = document.createElement("canvas");
+  canvas.id = "star-canvas";
+  document.body.prepend(canvas);
+  starCanvas = canvas;
+
+  type Star = { x: number; y: number; r: number; a: number; da: number; speed: number };
+  const stars: Star[] = [];
+  const COUNT = 180;
+
+  const resize = (): void => {
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+  };
+  resize();
+  window.addEventListener("resize", resize, { passive: true });
+
+  for (let i = 0; i < COUNT; i++) {
+    stars.push({
+      x: Math.random() * canvas.width,
+      y: Math.random() * canvas.height,
+      r: Math.random() * 1.2 + 0.2,
+      a: Math.random(),
+      da: (Math.random() - 0.5) * 0.004,
+      speed: Math.random() * 0.06 + 0.01,
+    });
+  }
+
+  const draw = (): void => {
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    for (const s of stars) {
+      s.a = Math.max(0.05, Math.min(0.9, s.a + s.da));
+      if (s.a <= 0.05 || s.a >= 0.9) s.da *= -1;
+      s.y -= s.speed;
+      if (s.y < -2) { s.y = canvas.height + 2; s.x = Math.random() * canvas.width; }
+      ctx.beginPath();
+      ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2);
+      ctx.fillStyle = `rgba(255,255,255,${s.a.toFixed(2)})`;
+      ctx.fill();
+    }
+    starAnimId = requestAnimationFrame(draw);
+  };
+  draw();
+}
+
+function stopStarField(): void {
+  if (starAnimId) { cancelAnimationFrame(starAnimId); starAnimId = 0; }
+  starCanvas?.remove();
+  starCanvas = null;
+}
+
+/* ─── Cursor glow ────────────────────────────────────────────────── */
+function startCursorGlow(): void {
+  if (document.getElementById("cursor-glow")) return;
+  const glow = document.createElement("div");
+  glow.id = "cursor-glow";
+  document.body.appendChild(glow);
+  let raf = 0;
+  let cx = -500, cy = -500;
+  document.addEventListener("mousemove", (event) => {
+    cx = event.clientX;
+    cy = event.clientY;
+    if (raf) return;
+    raf = requestAnimationFrame(() => {
+      raf = 0;
+      glow.style.transform = `translate(${cx - 110}px, ${cy - 110}px)`;
+    });
+  }, { passive: true });
+}
+
+function logoMarkup(label: string): string {
+  return `
+    <div class="wordmark">
+      <img class="wordmark-icon" src="./brand-mark.svg" width="28" height="28" alt="" aria-hidden="true" />
+      <div><strong>同频</strong><small>${escapeHtml(label)}</small></div>
+    </div>
+  `;
+}
+
+function renderDesktopHome(): void {
+  hideEmbeddedGame();
+  startStarField();
+  startCursorGlow();
+  appRoot.innerHTML = `
+    <div class="app-frame">
+      ${railMarkup()}
+      <main class="home-main">
+        <header class="home-topbar">
+          ${logoMarkup("朋友放映室")}
+          <label class="profile-field">
+            <span>我的昵称</span>
+            <input id="home-nickname" maxlength="16" value="${escapeHtml(getNickname())}" />
+          </label>
+        </header>
+        <section class="home-hero">
+          <div class="hero-copy">
+            <span class="eyebrow">PRIVATE WATCH PARTY</span>
+            <h1>今晚，和朋友<br /><em>一起看点好的。</em></h1>
+            <p>选择播放器窗口，影片声音只从该窗口的进程采集；朋友用房间码进入，就能看、聊、连麦。</p>
+            <div class="hero-trust">
+              <span>● 大陆服务器在线</span>
+              <span>● 画面点对点直传</span>
+              <span>● 最多 5 人</span>
+            </div>
+          </div>
+          <div class="home-actions" aria-label="选择功能">
+            <button id="choose-host" class="mode-card host-mode" data-desktop-role="host">
+              <span class="mode-icon">▣</span>
+              <small>我是放映者</small>
+              <strong>开启我的频道</strong>
+              <p>选择窗口 · 独立影片声 · 原画直传</p>
+              <b>开始放映 →</b>
+            </button>
+            <button id="choose-viewer" class="mode-card viewer-mode" data-desktop-role="viewer">
+              <span class="mode-icon">▶</span>
+              <small>我是观看者</small>
+              <strong>加入朋友频道</strong>
+              <p>最近频道一键重进，也可输入房间码</p>
+              <b>加入频道 →</b>
+            </button>
+          </div>
+        </section>
+        <footer class="home-footer">
+          <span>服务器仅帮助设备相互找到</span>
+          <span>影片不会上传或保存</span>
+          <span>连麦约 128–160 kbps / 人</span>
+        </footer>
+      </main>
+    </div>
+  `;
+  bindRailNavigation();
+  document.querySelector<HTMLInputElement>("#home-nickname")?.addEventListener("change", (event) => {
+    const input = event.currentTarget as HTMLInputElement;
+    input.value = saveNickname(input.value);
+    toast("昵称已保存");
+  });
+  document.querySelector("#choose-host")?.addEventListener("click", () => void renderHost());
+  document.querySelector("#choose-viewer")?.addEventListener("click", () =>
+    void renderViewer({ desktop: true }),
+  );
 }
 
 async function renderHost(): Promise<void> {
-  let qualityKey: QualityKey =
-    (localStorage.getItem("yiqikan:quality") as QualityKey | null) || "ultra";
-  let signalUrl = getSavedSignalUrl();
-  const networkInfo = await window.roomDesktop!.getNetworkInfo();
-  let stream: MediaStream | undefined;
-  let signal: SignalClient | undefined;
-  let roomCode = "";
-  let iceServers: RTCIceServer[] = [];
-  let statsTimer: number | undefined;
-  const peers = new Map<
-    string,
-    {
-      pc: RTCPeerConnection;
-      candidates: RTCIceCandidateInit[];
-      snapshot?: OutboundSnapshot;
-    }
-  >();
+  hideEmbeddedGame();
+  stopStarField();
+  startCursorGlow();
+  if (!window.roomDesktop) {
+    return;
+  }
+  let signalUrl = getSignalUrl();
+  const hostOwnership = await getHostChannelOwnership();
+  const roomCode = hostOwnership.room;
+  let nickname = getNickname();
+  let channelName = getChannelName();
 
   appRoot.innerHTML = `
-    <main class="shell host-shell">
-      ${brandMarkup("Windows 放映端")}
-      <section class="hero-grid">
-        <div class="hero-copy">
-          <span class="eyebrow">WINDOW + SYSTEM AUDIO</span>
-          <h1>今晚，<em>一起看。</em></h1>
-          <p>选择一个播放窗口，系统声音与高清画面会同时发送给朋友。</p>
-          <div class="quality-picker" role="radiogroup" aria-label="画质">
-            ${Object.values(QUALITY_PRESETS)
-              .map(
-                (preset) => `
-                  <button class="quality-option ${preset.key === qualityKey ? "active" : ""}" data-quality="${preset.key}">
-                    <strong>${preset.label}</strong>
-                    <span>${preset.detail}</span>
-                  </button>
-                `,
-              )
-              .join("")}
+    <div class="app-frame">
+      ${railMarkup()}
+      <main class="setup-main">
+        <header class="setup-topbar">
+          ${logoMarkup("设置放映")}
+          <button class="ghost-button" data-back-home>返回首页</button>
+        </header>
+        <section class="setup-grid">
+          <div class="setup-copy">
+            <span class="eyebrow">YOUR CHANNEL · ${roomCode}</span>
+            <h1>先进入频道，<br /><em>再决定谁来放映。</em></h1>
+            <p>频道创建后，所有人可以先连麦和聊天；任意 Windows 成员都能点击“开始放映”并选择自己的播放器窗口。</p>
+            <div class="privacy-callout">
+              <span aria-hidden="true">◎</span>
+              <div><strong>影片声与连麦声完全分轨</strong><small>需要 Windows 10 2004 或更高版本</small></div>
+            </div>
           </div>
-          <button id="start-share" class="primary-action">
-            <span class="action-icon">▶</span>
-            <span><strong>开始分享</strong><small>选择要播放的窗口</small></span>
-          </button>
-          <button id="open-settings" class="text-button">服务器设置</button>
-        </div>
-        <div class="broadcast-art" aria-hidden="true">
-          <div class="orbit orbit-one"></div>
-          <div class="orbit orbit-two"></div>
-          <div class="orbit orbit-three"></div>
-          <div class="broadcast-core"><span>▶</span></div>
-          <span class="signal-dot dot-one"></span>
-          <span class="signal-dot dot-two"></span>
-          <span class="signal-dot dot-three"></span>
-        </div>
-      </section>
-      <footer class="trust-row">
-        <span>✓ 原生窗口采集</span>
-        <span>✓ Windows 系统声</span>
-        <span>✓ 最高 4K / 45 Mbps</span>
-      </footer>
-    </main>
-    <dialog id="source-dialog" class="glass-dialog">
-      <div class="dialog-head">
-        <div><span class="eyebrow">选择播放窗口</span><h2>你想分享哪个窗口？</h2></div>
-        <button class="icon-button" data-close-dialog aria-label="关闭">×</button>
-      </div>
-      <div id="source-grid" class="source-grid">
-        <div class="loading-card">正在读取窗口…</div>
-      </div>
-    </dialog>
-    <dialog id="settings-dialog" class="glass-dialog settings-dialog">
-      <div class="dialog-head">
-        <div><span class="eyebrow">中国大陆连接</span><h2>信令服务器</h2></div>
-        <button class="icon-button" data-close-settings aria-label="关闭">×</button>
-      </div>
-      <label class="field-label" for="signal-url">服务器地址</label>
-      <input id="signal-url" class="field-input" value="${escapeHtml(signalUrl)}" placeholder="wss://你的域名/signal" />
-      <p class="field-help">默认启用 EXE 内置服务器，适合同一 Wi‑Fi。异地观看请填写部署在腾讯云、阿里云或其他大陆可访问服务器上的地址。</p>
-      <button id="save-settings" class="secondary-action">保存设置</button>
-    </dialog>
-  `;
-
-  const sourceDialog = document.querySelector<HTMLDialogElement>("#source-dialog")!;
-  const settingsDialog = document.querySelector<HTMLDialogElement>("#settings-dialog")!;
-
-  document.querySelectorAll<HTMLButtonElement>("[data-quality]").forEach((button) => {
-    button.addEventListener("click", () => {
-      qualityKey = button.dataset.quality as QualityKey;
-      localStorage.setItem("yiqikan:quality", qualityKey);
-      document
-        .querySelectorAll("[data-quality]")
-        .forEach((item) => item.classList.toggle("active", item === button));
-    });
-  });
-
-  document.querySelector("#open-settings")?.addEventListener("click", () => {
-    settingsDialog.showModal();
-  });
-  document.querySelector("[data-close-settings]")?.addEventListener("click", () => {
-    settingsDialog.close();
-  });
-  document.querySelector("#save-settings")?.addEventListener("click", () => {
-    try {
-      const input = document.querySelector<HTMLInputElement>("#signal-url")!;
-      signalUrl = saveSignalUrl(input.value);
-      input.value = signalUrl;
-      settingsDialog.close();
-      setToast("服务器地址已保存");
-    } catch (error) {
-      setToast(error instanceof Error ? error.message : "服务器地址无效", "error");
-    }
-  });
-  document.querySelector("[data-close-dialog]")?.addEventListener("click", () => {
-    sourceDialog.close();
-  });
-
-  document.querySelector("#start-share")?.addEventListener("click", async () => {
-    const sourceGrid = document.querySelector<HTMLDivElement>("#source-grid")!;
-    sourceGrid.innerHTML = `<div class="loading-card">正在读取窗口…</div>`;
-    sourceDialog.showModal();
-    try {
-      const sources = await window.roomDesktop!.listSources();
-      if (!sources.length) {
-        sourceGrid.innerHTML = `<div class="loading-card error-copy">没有发现可分享的窗口</div>`;
-        return;
-      }
-      sourceGrid.innerHTML = sources
-        .map(
-          (source) => `
-            <button class="source-card" data-source-id="${escapeHtml(source.id)}">
-              <img src="${source.thumbnail}" alt="" />
-              <span>${escapeHtml(source.name || "未命名窗口")}</span>
+          <div class="setup-card">
+            <label class="field">
+              <span>频道名称</span>
+              <input id="channel-name" maxlength="24" value="${escapeHtml(channelName)}" />
+            </label>
+            <label class="field">
+              <span>你的昵称</span>
+              <input id="host-nickname" maxlength="16" value="${escapeHtml(nickname)}" />
+            </label>
+            <button id="start-share" class="primary-button">
+              <span aria-hidden="true">▣</span>
+              <div><strong>创建并进入频道</strong><small>进入后再选择放映或观看</small></div>
+              <b aria-hidden="true">→</b>
             </button>
-          `,
-        )
-        .join("");
-      sourceGrid.querySelectorAll<HTMLButtonElement>("[data-source-id]").forEach((button) => {
-        button.addEventListener("click", async () => {
-          const sourceId = button.dataset.sourceId!;
-          button.classList.add("selected");
-          try {
-            await window.roomDesktop!.selectSource(sourceId);
-            sourceDialog.close();
-            await startHostSession();
-          } catch (error) {
-            setToast(error instanceof Error ? error.message : "无法开始分享", "error");
-            button.classList.remove("selected");
-          }
-        });
-      });
-    } catch (error) {
-      sourceGrid.innerHTML = `<div class="loading-card error-copy">${escapeHtml(
-        error instanceof Error ? error.message : "读取窗口失败",
-      )}</div>`;
-    }
-  });
-
-  async function startHostSession(): Promise<void> {
-    const preset = QUALITY_PRESETS[qualityKey];
-    stream = await navigator.mediaDevices.getDisplayMedia({
-      video: {
-        width: { ideal: preset.width, max: preset.width },
-        height: { ideal: preset.height, max: preset.height },
-        frameRate: { ideal: preset.frameRate, max: preset.frameRate },
-      },
-      audio: true,
-    });
-    const videoTrack = stream.getVideoTracks()[0];
-    if (!videoTrack) {
-      throw new Error("没有获取到窗口画面");
-    }
-    videoTrack.contentHint = "motion";
-    if (!stream.getAudioTracks().length) {
-      stream.getTracks().forEach((track) => track.stop());
-      stream = undefined;
-      throw new Error("没有获取到系统声音，请确认 Windows 声音正在播放后重试");
-    }
-    stream.getAudioTracks().forEach((track) => {
-      track.contentHint = "music";
-    });
-    videoTrack.addEventListener("ended", () => stopHostSession());
-    await window.roomDesktop!.setCaptureActive(true);
-    roomCode = createRoomCode();
-    renderBroadcasting();
-    await connectHostSignal();
-  }
-
-  function getInviteSignalUrl(): string {
-    try {
-      const url = new URL(signalUrl);
-      const isLocal = ["127.0.0.1", "localhost", "::1"].includes(url.hostname);
-      const lanAddress = networkInfo.lanAddresses[0];
-      if (isLocal && networkInfo.localSignalReady && lanAddress) {
-        url.hostname = lanAddress;
-        return url.toString();
-      }
-    } catch {
-      // signalUrl is normalized before this point.
-    }
-    return signalUrl;
-  }
-
-  async function connectHostSignal(): Promise<void> {
-    signal = new SignalClient();
-    signal.addEventListener("message", (event) => {
-      void handleHostMessage((event as CustomEvent<SignalEnvelope>).detail);
-    });
-    signal.addEventListener("close", () => {
-      setHostStatus("服务器连接已断开", "error");
-    });
-    try {
-      await signal.connect(signalUrl);
-      signal.send({ type: "host:create", room: roomCode });
-    } catch (error) {
-      setHostStatus(error instanceof Error ? error.message : "服务器连接失败", "error");
-    }
-  }
-
-  async function handleHostMessage(message: SignalEnvelope): Promise<void> {
-    if (message.type === "room:created") {
-      iceServers = message.iceServers || [];
-      setHostStatus("等待朋友加入", "ready");
-      return;
-    }
-    if (message.type === "viewer:joined" && message.viewerId) {
-      await createOfferForViewer(message.viewerId);
-      updateViewerCount();
-      return;
-    }
-    if (message.type === "viewer:left" && message.viewerId) {
-      peers.get(message.viewerId)?.pc.close();
-      peers.delete(message.viewerId);
-      updateViewerCount();
-      return;
-    }
-    if (message.type === "signal" && message.from && message.data) {
-      await handleViewerSignal(message.from, message.data);
-      return;
-    }
-    if (message.type === "error") {
-      setHostStatus(message.message || "服务器返回错误", "error");
-    }
-  }
-
-  async function createOfferForViewer(viewerId: string): Promise<void> {
-    if (!stream || !signal) {
-      return;
-    }
-    const pendingCandidates: RTCIceCandidateInit[] = [];
-    const pc = createPeerConnection(iceServers, (candidate) => {
-      signal?.send({ type: "signal", target: viewerId, data: candidate });
-    });
-    peers.set(viewerId, { pc, candidates: pendingCandidates });
-    stream.getTracks().forEach((track) => pc.addTrack(track, stream!));
-    preferVideoCodecs(pc, QUALITY_PRESETS[qualityKey].codecOrder);
-    await tuneSenders(pc, QUALITY_PRESETS[qualityKey]);
-    pc.addEventListener("connectionstatechange", () => {
-      if (["failed", "closed"].includes(pc.connectionState)) {
-        peers.delete(viewerId);
-        updateViewerCount();
-      }
-    });
-    const offer = tuneOpus(await pc.createOffer());
-    await pc.setLocalDescription(offer);
-    signal.send({ type: "signal", target: viewerId, data: pc.localDescription! });
-  }
-
-  async function handleViewerSignal(
-    viewerId: string,
-    data: RTCSessionDescriptionInit | RTCIceCandidateInit,
-  ): Promise<void> {
-    const peer = peers.get(viewerId);
-    if (!peer) {
-      return;
-    }
-    if ("type" in data && data.type) {
-      await peer.pc.setRemoteDescription(data as RTCSessionDescriptionInit);
-      for (const candidate of peer.candidates.splice(0)) {
-        await peer.pc.addIceCandidate(candidate);
-      }
-      return;
-    }
-    const candidate = data as RTCIceCandidateInit;
-    if (peer.pc.remoteDescription) {
-      await peer.pc.addIceCandidate(candidate);
-    } else {
-      peer.candidates.push(candidate);
-    }
-  }
-
-  function renderBroadcasting(): void {
-    if (!stream) {
-      return;
-    }
-    const inviteSignalUrl = getInviteSignalUrl();
-    const joinLink = buildJoinLink(roomCode, inviteSignalUrl);
-    appRoot.innerHTML = `
-      <main class="shell session-shell">
-        ${brandMarkup("正在放映")}
-        <section class="session-grid">
-          <div class="preview-panel">
-            <video id="local-preview" autoplay muted playsinline></video>
-            <div class="live-badge"><i></i> LIVE</div>
-            <div class="preview-caption">本地预览 · 朋友看到的是同一画面</div>
+            <details class="server-settings">
+              <summary>服务器设置</summary>
+              <label class="field">
+                <span>信令服务器</span>
+                <input id="host-signal-url" value="${escapeHtml(signalUrl)}" />
+              </label>
+              <button id="save-host-server" type="button" class="ghost-button">保存服务器</button>
+            </details>
           </div>
-          <aside class="share-panel">
-            <span class="eyebrow">邀请朋友</span>
-            <h2>输入房间码即可观看</h2>
-            <button id="copy-room" class="room-code" title="复制房间码">${roomCode}</button>
-            <div class="qr-wrap"><img id="join-qr" alt="加入房间二维码" /></div>
-            <div class="share-actions">
-              <button id="copy-invite" class="secondary-action">复制邀请信息</button>
-              <button id="stop-share" class="danger-action">停止分享</button>
-            </div>
-            <div class="status-card">
-              <div><span>连接状态</span><strong id="host-status">正在连接服务器</strong></div>
-              <div><span>观看人数</span><strong id="viewer-count">0 人</strong></div>
-              <div><span>实际画质</span><strong id="actual-quality">等待连接</strong></div>
-              <div><span>实际码率</span><strong id="actual-bitrate">等待数据</strong></div>
-            </div>
-          </aside>
         </section>
       </main>
-    `;
-    const preview = document.querySelector<HTMLVideoElement>("#local-preview")!;
-    preview.srcObject = stream;
-    void QRCode.toDataURL(joinLink, {
-      width: 232,
-      margin: 1,
-      color: { dark: "#06101fff", light: "#eaf9ffff" },
-    }).then((dataUrl) => {
-      const image = document.querySelector<HTMLImageElement>("#join-qr");
-      if (image) {
-        image.src = dataUrl;
-      }
-    });
-    document.querySelector("#copy-room")?.addEventListener("click", async () => {
-      await navigator.clipboard.writeText(roomCode);
-      setToast("房间码已复制");
-    });
-    document.querySelector("#copy-invite")?.addEventListener("click", async () => {
-      const invite = `一起看房间：${roomCode}\n服务器：${inviteSignalUrl}\n安装 APP 后点击：${joinLink}`;
-      await navigator.clipboard.writeText(invite);
-      setToast("邀请信息已复制");
-    });
-    document.querySelector("#stop-share")?.addEventListener("click", () => {
-      void stopHostSession();
-    });
-    statsTimer = window.setInterval(updateStats, 1_000);
-  }
-
-  function setHostStatus(text: string, tone: "ready" | "error"): void {
-    const element = document.querySelector<HTMLElement>("#host-status");
-    if (!element) {
-      return;
+    </div>
+  `;
+  bindRailNavigation();
+  document.querySelector("[data-back-home]")?.addEventListener("click", renderDesktopHome);
+  document.querySelector("#save-host-server")?.addEventListener("click", () => {
+    try {
+      const input = document.querySelector<HTMLInputElement>("#host-signal-url");
+      if (!input) return;
+      signalUrl = saveSignalUrl(input.value);
+      input.value = signalUrl;
+      toast("服务器地址已保存");
+    } catch (error) {
+      toast(error instanceof Error ? error.message : "服务器地址无效", "danger");
     }
-    element.textContent = text;
-    element.dataset.tone = tone;
-  }
-
-  function updateViewerCount(): void {
-    const element = document.querySelector<HTMLElement>("#viewer-count");
-    if (element) {
-      element.textContent = `${peers.size} 人`;
-    }
-  }
-
-  async function updateStats(): Promise<void> {
-    let totalBitrate = 0;
-    let bestWidth = 0;
-    let bestHeight = 0;
-    let fps = 0;
-    let codec = "";
-    await Promise.all(
-      Array.from(peers.values()).map(async (peer) => {
-        const stats = await readOutboundVideoStats(peer.pc, peer.snapshot);
-        peer.snapshot = stats.snapshot;
-        totalBitrate += stats.bitrate;
-        if ((stats.width || 0) * (stats.height || 0) > bestWidth * bestHeight) {
-          bestWidth = stats.width || 0;
-          bestHeight = stats.height || 0;
-          fps = stats.framesPerSecond || 0;
-          codec = stats.codec || "";
-        }
-      }),
+  });
+  document.querySelector("#start-share")?.addEventListener("click", async () => {
+    nickname = saveNickname(
+      document.querySelector<HTMLInputElement>("#host-nickname")?.value || nickname,
     );
-    const qualityElement = document.querySelector<HTMLElement>("#actual-quality");
-    const bitrateElement = document.querySelector<HTMLElement>("#actual-bitrate");
-    if (qualityElement) {
-      qualityElement.textContent = bestWidth
-        ? `${bestWidth}×${bestHeight} · ${Math.round(fps)}fps · ${codec}`
-        : "等待朋友加入";
+    channelName = saveChannelName(
+      document.querySelector<HTMLInputElement>("#channel-name")?.value || channelName,
+    );
+    try {
+      signalUrl = saveSignalUrl(
+        document.querySelector<HTMLInputElement>("#host-signal-url")?.value || signalUrl,
+      );
+      await openChannelSession({
+        root: appRoot,
+        desktop: true,
+        room: roomCode,
+        signalUrl,
+        nickname,
+        channelName,
+        createIfMissing: true,
+        ownerToken: hostOwnership.ownerToken,
+        notify: toast,
+        onLeave: renderDesktopHome,
+      });
+    } catch (error) {
+      toast(error instanceof Error ? error.message : "无法进入频道", "danger");
     }
-    if (bitrateElement) {
-      bitrateElement.textContent = peers.size ? formatBitrate(totalBitrate) : "等待数据";
-    }
-  }
+  });
 
-  async function stopHostSession(): Promise<void> {
-    if (statsTimer) {
-      window.clearInterval(statsTimer);
-    }
-    peers.forEach(({ pc }) => pc.close());
-    peers.clear();
-    signal?.close();
-    signal = undefined;
-    stream?.getTracks().forEach((track) => track.stop());
-    stream = undefined;
-    await window.roomDesktop?.setCaptureActive(false);
-    await renderHost();
-  }
 }
 
-async function renderViewer(): Promise<void> {
-  let signalUrl = getSavedSignalUrl();
-  let roomCode = new URLSearchParams(location.search).get("room")?.toUpperCase() || "";
-  let signal: SignalClient | undefined;
-  let pc: RTCPeerConnection | undefined;
-  let pendingCandidates: RTCIceCandidateInit[] = [];
-  let pendingHostSignals: Array<RTCSessionDescriptionInit | RTCIceCandidateInit> = [];
+interface ViewerOptions {
+  desktop?: boolean;
+  room?: string;
+  signalUrl?: string;
+  autoJoin?: boolean;
+}
+
+async function renderViewer(options: ViewerOptions = {}): Promise<void> {
+  hideEmbeddedGame();
+  stopStarField();
+  startCursorGlow();
+  const desktop = options.desktop === true;
+  let signalUrl = options.signalUrl || getSignalUrl();
+  let roomCode =
+    options.room || new URLSearchParams(location.search).get("room")?.toUpperCase() || "";
+  let nickname = getNickname();
 
   const querySignal = new URLSearchParams(location.search).get("signal");
   if (querySignal) {
     try {
-      signalUrl = saveSignalUrl(querySignal);
+      signalUrl = normalizeSignalUrl(querySignal);
     } catch {
-      // Keep the previously saved server when a malformed link is opened.
+      // Ignore malformed invitation data.
     }
-  }
-
-  try {
-    const launch = await App.getLaunchUrl();
-    if (launch?.url) {
-      const parsed = parseJoinLink(launch.url);
-      roomCode = parsed.room || roomCode;
-      if (parsed.signal) {
-        signalUrl = saveSignalUrl(parsed.signal);
-      }
-    }
-    await App.addListener("appUrlOpen", ({ url }) => {
-      const parsed = parseJoinLink(url);
-      if (parsed.room) {
-        const roomInput = document.querySelector<HTMLInputElement>("#room-input");
-        if (roomInput) {
-          roomInput.value = parsed.room;
-        }
-      }
-      if (parsed.signal) {
-        try {
-          signalUrl = saveSignalUrl(parsed.signal);
-          const signalInput = document.querySelector<HTMLInputElement>("#viewer-signal-url");
-          if (signalInput) {
-            signalInput.value = signalUrl;
-          }
-        } catch {
-          setToast("邀请中的服务器地址无效", "error");
-        }
-      }
-    });
-  } catch {
-    // Capacitor App has a no-op web implementation outside Android.
   }
 
   appRoot.innerHTML = `
-    <main class="shell viewer-shell">
-      ${brandMarkup("Android 观看端")}
-      <section class="viewer-hero">
-        <div class="viewer-orb" aria-hidden="true"><span>▶</span></div>
-        <span class="eyebrow">JOIN THE ROOM</span>
-        <h1>输入房间码，<em>马上开场。</em></h1>
-        <p>画面与电影原声会自动播放。建议连接 5GHz Wi‑Fi。</p>
-        <label class="field-label" for="room-input">房间码</label>
-        <input
-          id="room-input"
-          class="room-input"
-          value="${escapeHtml(roomCode)}"
-          maxlength="8"
-          inputmode="text"
-          autocomplete="one-time-code"
-          placeholder="例如 A7K9P2WX"
-        />
-        <button id="join-room" class="primary-action viewer-action">
-          <span class="action-icon">▶</span>
-          <span><strong>进入放映室</strong><small>低延迟高清观看</small></span>
-        </button>
-        <details class="viewer-settings">
-          <summary>服务器设置</summary>
-          <label class="field-label" for="viewer-signal-url">信令服务器</label>
-          <input id="viewer-signal-url" class="field-input" value="${escapeHtml(signalUrl)}" />
-          <button id="save-viewer-settings" class="text-button">保存</button>
-        </details>
-      </section>
-    </main>
-  `;
-
-  document.querySelector("#save-viewer-settings")?.addEventListener("click", () => {
-    try {
-      const input = document.querySelector<HTMLInputElement>("#viewer-signal-url")!;
-      signalUrl = saveSignalUrl(input.value);
-      input.value = signalUrl;
-      setToast("服务器地址已保存");
-    } catch (error) {
-      setToast(error instanceof Error ? error.message : "服务器地址无效", "error");
-    }
-  });
-
-  document.querySelector("#room-input")?.addEventListener("input", (event) => {
-    const input = event.currentTarget as HTMLInputElement;
-    input.value = input.value.toUpperCase().replace(/[^23456789A-HJ-NP-Z]/g, "");
-  });
-
-  document.querySelector("#join-room")?.addEventListener("click", async () => {
-    const input = document.querySelector<HTMLInputElement>("#room-input")!;
-    roomCode = input.value.trim().toUpperCase();
-    if (roomCode.length !== 8) {
-      setToast("请输入 8 位房间码", "error");
-      return;
-    }
-    try {
-      const signalInput = document.querySelector<HTMLInputElement>("#viewer-signal-url")!;
-      signalUrl = saveSignalUrl(signalInput.value);
-      renderPlayer();
-      await connectViewer();
-    } catch (error) {
-      setViewerStatus(error instanceof Error ? error.message : "加入失败", "error");
-    }
-  });
-
-  function renderPlayer(): void {
-    appRoot.innerHTML = `
-      <main class="player-shell">
-        <video id="remote-video" autoplay playsinline></video>
-        <div class="player-top">
-          <div class="brand compact">
-            <span class="brand-mark" aria-hidden="true"><span></span></span>
-            <strong>一起看</strong>
+    <div class="app-frame">
+      ${railMarkup()}
+      <main class="join-main">
+        <header class="setup-topbar">
+          ${logoMarkup(desktop ? "Windows 观看端" : "Android 观看端")}
+          ${desktop ? `<button class="ghost-button" data-back-home>返回首页</button>` : ""}
+        </header>
+        <section class="join-card">
+          <div class="join-art" aria-hidden="true"><span>▶</span><i></i><i></i></div>
+          <span class="eyebrow">JOIN A CHANNEL</span>
+          <h1>朋友已经开场？<br /><em>马上加入。</em></h1>
+          <p>输入 8 位频道码。加入成功后可以看电影、发弹幕，也可以选择加入连麦。</p>
+          <div class="room-code-entry">
+            <label class="field">
+              <span>频道码</span>
+              <input id="room-input" class="room-input" maxlength="8" value="${escapeHtml(roomCode)}" placeholder="例如 A7K9P2WX" autocomplete="one-time-code" />
+            </label>
           </div>
-          <span id="viewer-status" class="player-status"><i></i> 正在连接</span>
-        </div>
-        <div class="player-bottom">
-          <span>房间 ${roomCode}</span>
-          <div>
-            <button id="enable-sound" class="player-button">开启声音</button>
-            <button id="fullscreen" class="player-button">全屏</button>
-            <button id="leave-room" class="player-button danger">退出</button>
-          </div>
-        </div>
+          <label class="field">
+            <span>你的昵称</span>
+            <input id="viewer-nickname" maxlength="16" value="${escapeHtml(nickname)}" />
+          </label>
+          <button id="join-room" class="primary-button">
+            <span aria-hidden="true">▶</span><div><strong>进入频道</strong><small>自动连接朋友的画面</small></div><b>→</b>
+          </button>
+          <details class="server-settings">
+            <summary>服务器设置</summary>
+            <label class="field"><span>信令服务器</span><input id="viewer-signal-url" value="${escapeHtml(signalUrl)}" /></label>
+          </details>
+        </section>
       </main>
-    `;
-    document.querySelector("#enable-sound")?.addEventListener("click", async () => {
-      const video = document.querySelector<HTMLVideoElement>("#remote-video")!;
-      video.muted = false;
-      await video.play().catch(() => undefined);
-      setToast("声音已开启");
-    });
-    document.querySelector("#fullscreen")?.addEventListener("click", async () => {
-      const video = document.querySelector<HTMLVideoElement>("#remote-video")!;
-      await video.requestFullscreen?.();
-    });
-    document.querySelector("#leave-room")?.addEventListener("click", () => {
-      leaveViewer();
-      void renderViewer();
-    });
+    </div>
+  `;
+  bindRailNavigation();
+  document.querySelector("[data-back-home]")?.addEventListener("click", renderDesktopHome);
+  const roomInput = document.querySelector<HTMLInputElement>("#room-input");
+  roomInput?.addEventListener("input", () => {
+    roomInput.value = roomInput.value.toUpperCase().replace(/[^23456789A-HJ-NP-Z]/g, "");
+  });
+  document.querySelector("#join-room")?.addEventListener("click", () => void joinRoom());
+  if (options.autoJoin && roomCode.length === 8) {
+    window.setTimeout(() => void joinRoom(), 120);
   }
 
-  async function connectViewer(): Promise<void> {
-    signal = new SignalClient();
-    signal.addEventListener("message", (event) => {
-      void handleViewerMessage((event as CustomEvent<SignalEnvelope>).detail);
-    });
-    signal.addEventListener("close", () => {
-      setViewerStatus("服务器连接已断开", "error");
-    });
-    await signal.connect(signalUrl);
-    signal.send({ type: "viewer:join", room: roomCode });
-  }
-
-  async function handleViewerMessage(message: SignalEnvelope): Promise<void> {
-    if (message.type === "room:joined") {
-      pc = createPeerConnection(message.iceServers || [], (candidate) => {
-        signal?.send({ type: "signal", target: "host", data: candidate });
+  async function joinRoom(): Promise<void> {
+    roomCode = document.querySelector<HTMLInputElement>("#room-input")?.value.trim().toUpperCase() || "";
+    if (roomCode.length !== 8) {
+      toast("请输入 8 位频道码", "danger");
+      return;
+    }
+    nickname = saveNickname(
+      document.querySelector<HTMLInputElement>("#viewer-nickname")?.value || nickname,
+    );
+    try {
+      signalUrl = saveSignalUrl(
+        document.querySelector<HTMLInputElement>("#viewer-signal-url")?.value || signalUrl,
+      );
+      const hostOwnership = desktop
+        ? await getHostChannelOwnership()
+        : undefined;
+      const ownerToken =
+        hostOwnership?.room === roomCode
+          ? hostOwnership.ownerToken
+          : undefined;
+      await openChannelSession({
+        root: appRoot,
+        desktop,
+        room: roomCode,
+        signalUrl,
+        nickname,
+        createIfMissing: Boolean(ownerToken),
+        ownerToken,
+        notify: toast,
+        onLeave: desktop
+          ? renderDesktopHome
+          : () => renderViewer({ desktop: false }),
       });
-      pc.addEventListener("track", (event) => {
-        const video = document.querySelector<HTMLVideoElement>("#remote-video");
-        if (!video) {
-          return;
-        }
-        video.srcObject = event.streams[0] || new MediaStream([event.track]);
-        video.muted = false;
-        void video.play().catch(() => {
-          setViewerStatus("请点击“开启声音”", "ready");
-        });
-      });
-      pc.addEventListener("connectionstatechange", () => {
-        if (!pc) {
-          return;
-        }
-        if (pc.connectionState === "connected") {
-          setViewerStatus("播放中", "ready");
-        } else if (["failed", "disconnected"].includes(pc.connectionState)) {
-          setViewerStatus("连接中断，正在等待恢复", "error");
-        }
-      });
-      for (const pendingSignal of pendingHostSignals.splice(0)) {
-        await handleHostSignal(pendingSignal);
-      }
-      return;
+    } catch (error) {
+      toast(error instanceof Error ? error.message : "加入失败", "danger");
     }
-    if (message.type === "signal" && message.data) {
-      if (!pc) {
-        pendingHostSignals.push(message.data);
-        return;
-      }
-      await handleHostSignal(message.data);
-      return;
-    }
-    if (message.type === "host:left") {
-      setViewerStatus("放映已结束", "error");
-      pc?.close();
-      return;
-    }
-    if (message.type === "error") {
-      setViewerStatus(message.message || "加入房间失败", "error");
-    }
-  }
-
-  async function handleHostSignal(
-    data: RTCSessionDescriptionInit | RTCIceCandidateInit,
-  ): Promise<void> {
-    if (!pc) {
-      return;
-    }
-    if ("type" in data && data.type) {
-      await pc.setRemoteDescription(data as RTCSessionDescriptionInit);
-      for (const candidate of pendingCandidates.splice(0)) {
-        await pc.addIceCandidate(candidate);
-      }
-      if (data.type === "offer") {
-        const answer = tuneOpus(await pc.createAnswer());
-        await pc.setLocalDescription(answer);
-        signal?.send({ type: "signal", target: "host", data: pc.localDescription! });
-      }
-      return;
-    }
-    const candidate = data as RTCIceCandidateInit;
-    if (pc.remoteDescription) {
-      await pc.addIceCandidate(candidate);
-    } else {
-      pendingCandidates.push(candidate);
-    }
-  }
-
-  function setViewerStatus(text: string, tone: "ready" | "error"): void {
-    const element = document.querySelector<HTMLElement>("#viewer-status");
-    if (!element) {
-      setToast(text, tone === "error" ? "error" : "normal");
-      return;
-    }
-    element.textContent = text;
-    element.dataset.tone = tone;
-  }
-
-  function leaveViewer(): void {
-    pc?.close();
-    pc = undefined;
-    signal?.close();
-    signal = undefined;
-    pendingCandidates = [];
-    pendingHostSignals = [];
   }
 }
 
-if (window.roomDesktop) {
-  void renderHost();
+if (isDesktop) {
+  renderDesktopHome();
+  window.roomDesktop?.onOpenUrl((url) => {
+    const invite = confirmExternalInvite(url);
+    if (invite) {
+      void renderViewer({
+        desktop: true,
+        room: invite.room,
+        signalUrl: invite.signalUrl,
+        autoJoin: true,
+      });
+    }
+  });
 } else {
-  void renderViewer();
+  void (async () => {
+    let recentInviteKey = "";
+    let recentInviteAt = 0;
+    let recentInviteHandled = false;
+    const openInvite = (url?: string): boolean => {
+      if (!url) return false;
+      const parsedForKey = parseJoinLink(url);
+      const inviteKey = parsedForKey.room
+        ? `${parsedForKey.room}|${parsedForKey.signal || getSignalUrl()}`
+        : url;
+      const now = Date.now();
+      // Capacitor can deliver one cold-start URI through both appUrlOpen and
+      // getLaunchUrl(). Treat the duplicate as the same completed decision:
+      // accepted links must not create two sessions, and a rejected unknown
+      // host must not prompt twice. The short window still permits a later,
+      // deliberate re-open of the same invitation.
+      if (inviteKey === recentInviteKey && now - recentInviteAt < 10_000) {
+        return recentInviteHandled;
+      }
+      const invite = confirmExternalInvite(url);
+      recentInviteKey = inviteKey;
+      recentInviteAt = now;
+      recentInviteHandled = Boolean(invite);
+      if (!invite) return false;
+      void renderViewer({
+        room: invite.room,
+        signalUrl: invite.signalUrl,
+        autoJoin: true,
+      });
+      return true;
+    };
+    const appUrlListener = await App.addListener("appUrlOpen", ({ url }) => {
+      openInvite(url);
+    });
+    window.addEventListener("beforeunload", () => {
+      void appUrlListener.remove();
+    });
+    const launch = await App.getLaunchUrl().catch(() => undefined);
+    if (!openInvite(launch?.url)) {
+      await renderViewer();
+    }
+  })();
 }

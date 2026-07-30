@@ -1,26 +1,57 @@
 {
-  "name": "yiqikan-native",
-  "version": "0.2.0",
+  "name": "synced-native",
+  "version": "2.8.1",
   "private": true,
-  "author": "一起看",
-  "description": "一起看：Windows 原生窗口与系统声分享，Android 低延迟观看",
+  "author": "同频",
+  "description": "同频：Windows 原生分享与观看，Android 低延迟观看",
   "main": "electron/main.cjs",
   "type": "module",
   "scripts": {
     "dev:web": "vite",
     "dev:signal": "node server/index.mjs",
+    "bundle:signal": "node scripts/build-signal.mjs",
+    "build:audio-helper": "node scripts/build-audio-helper.mjs",
+    "brand:generate": "node scripts/generate-brand-assets.mjs",
+    "brand:check": "node scripts/generate-brand-assets.mjs --check",
     "build:renderer": "vite build",
     "typecheck": "tsc --noEmit",
+    "lint": "tsc --noEmit --pretty false && node --check electron/main.cjs && node --check server/index.mjs",
     "test": "node --test test/*.test.mjs",
-    "start:electron": "npm run build:renderer && electron .",
-    "dist:win": "npm run check && electron-builder --win portable --x64",
+    "smoke:media": "electron scripts/smoke-channel-media.cjs",
+    "smoke:emby": "electron scripts/smoke-emby-mode.cjs",
+    "smoke:emby-ui": "npm run build:renderer && electron scripts/smoke-emby-ui.cjs",
+    "smoke:window": "electron scripts/smoke-window-capture.cjs",
+    "smoke:audio": "electron scripts/smoke-process-audio.cjs && electron scripts/smoke-process-audio-bridge.cjs",
+    "smoke:voice": "electron scripts/smoke-voice-processing.cjs",
+    "smoke:csp": "npm run build:renderer && electron scripts/smoke-csp.cjs",
+    "smoke:sidebar": "electron scripts/smoke-sidebar-layout.cjs",
+    "smoke:game": "npm run build:renderer && electron scripts/smoke-embedded-game.cjs",
+    "smoke:overlay": "electron scripts/smoke-danmaku-overlay.cjs",
+    "smoke:desktop-danmaku": "electron scripts/smoke-desktop-danmaku.cjs",
+    "smoke:history": "electron scripts/smoke-recent-history.cjs",
+    "field:emby:portable": "node scripts/portable-emby-field-test.cjs",
+    "check:public": "node scripts/check-public-signal.mjs",
+    "check:public:security": "node scripts/check-public-security.mjs",
+    "check:public:sfu": "electron scripts/smoke-public-sfu.cjs",
+    "check:version": "node scripts/check-version.mjs",
+    "check:packaged-resources": "node scripts/check-packaged-resources.mjs",
+    "ensure:ffmpeg": "node scripts/ensure-ffmpeg-runtime.mjs",
+    "check:ffmpeg": "npm run ensure:ffmpeg && node scripts/check-ffmpeg-runtime.mjs",
+    "smoke:release": "npm run build:audio-helper && npm run smoke:csp && npm run smoke:audio && npm run smoke:media && npm run smoke:emby && npm run smoke:emby-ui && npm run smoke:voice && npm run smoke:sidebar && npm run smoke:game && npm run smoke:overlay && npm run smoke:desktop-danmaku",
+    "start:electron": "npm run build:audio-helper && npm run build:renderer && electron .",
+    "dist:portable": "npm run build:audio-helper && npm run check && electron-builder --win dir --x64 && npm run check:packaged-resources && node scripts/build-portable.mjs",
+    "dist:win": "npm run dist:portable",
     "cap:sync": "npm run build:renderer && cap sync android",
     "apk:debug": "npm run cap:sync && cd android && gradlew.bat assembleDebug",
-    "check": "npm run typecheck && npm test && npm run build:renderer"
+    "apk:release": "node scripts/build-android-release.mjs",
+    "release:all": "node scripts/build-release.mjs",
+    "check": "npm run check:version && npm run brand:check && npm run lint && npm test && npm run check:ffmpeg && npm run build:renderer"
   },
   "dependencies": {
     "@capacitor/app": "^7.0.0",
     "@capacitor/core": "^7.0.0",
+    "deepfilternet3-noise-filter": "1.3.0",
+    "livekit-client": "2.21.0",
     "qrcode": "^1.5.4",
     "ws": "^8.18.3"
   },
@@ -29,14 +60,20 @@
     "@capacitor/cli": "^7.0.0",
     "@types/node": "^24.0.0",
     "@types/qrcode": "^1.5.5",
+    "brace-expansion": "file:vendor/brace-expansion-compat",
     "electron": "^43.2.0",
-    "electron-builder": "^26.0.12",
+    "electron-builder": "26.15.7",
+    "esbuild": "^0.28.1",
+    "sharp": "0.35.3",
     "typescript": "^5.8.3",
     "vite": "^7.0.0"
   },
+  "overrides": {
+    "brace-expansion": "$brace-expansion"
+  },
   "build": {
     "appId": "com.yiqikan.room.desktop",
-    "productName": "一起看",
+    "productName": "同频",
     "asar": true,
     "electronDist": "node_modules/electron/dist",
     "directories": {
@@ -44,11 +81,48 @@
     },
     "files": [
       "dist-renderer/**/*",
+      "!dist-renderer/models/deepfilternet3/**/*",
       "electron/**/*",
-      "server/**/*",
-      "package.json"
+      "package.json",
+      "!node_modules/@capacitor/app/android/**/*",
+      "!node_modules/@capacitor/core/android/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "audio-helper/publish/win-x64",
+        "to": "audio-helper",
+        "filter": [
+          "YiQiKan.AudioCapture.exe"
+        ]
+      },
+      {
+        "from": "vendor/ffmpeg",
+        "to": "ffmpeg",
+        "filter": [
+          "ffmpeg.exe",
+          "LICENSE.txt",
+          "README.md"
+        ]
+      },
+      {
+        "from": "public/models/deepfilternet3",
+        "to": "models/deepfilternet3",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "protocols": [
+      {
+        "name": "同频频道邀请",
+        "schemes": [
+          "synced",
+          "yiqikan"
+        ]
+      }
     ],
     "win": {
+      "icon": "build/icon.ico",
       "target": [
         {
           "target": "portable",
@@ -56,8 +130,23 @@
             "x64"
           ]
         }
-      ],
-      "artifactName": "YiQiKan-${version}-portable.${ext}"
+      ]
+    },
+    "nsis": {
+      "artifactName": "Synced-${version}-setup.${ext}",
+      "oneClick": false,
+      "perMachine": true,
+      "allowElevation": true,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "同频",
+      "include": "build/installer.nsh"
+    },
+    "portable": {
+      "artifactName": "Synced-${version}-portable.${ext}",
+      "requestExecutionLevel": "user",
+      "unpackDirName": "SyncedPortableApp"
     }
   }
 }

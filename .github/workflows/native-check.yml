@@ -1,0 +1,39 @@
+name: Native checks
+
+on:
+  push:
+    paths:
+      - "native/**"
+      - ".github/workflows/native-check.yml"
+  pull_request:
+    paths:
+      - "native/**"
+      - ".github/workflows/native-check.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: native
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: native/package-lock.json
+      - name: Cache pinned FFmpeg runtime
+        uses: actions/cache@v4
+        with:
+          path: native/vendor/ffmpeg/ffmpeg.exe
+          key: ffmpeg-win64-n8.1.2-31-g8c9502e9b0
+      - run: npm ci
+      - run: npm run check

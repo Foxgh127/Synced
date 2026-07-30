@@ -1,0 +1,13 @@
+DeepFilterNet3 model and runtime notice
+
+This application redistributes model/runtime assets compatible with
+DeepFilterNet3, an open-source real-time speech enhancement project:
+https://github.com/Rikorose/DeepFilterNet
+
+DeepFilterNet is licensed under MIT and/or Apache-2.0 terms. The browser
+integration package used by this application is
+deepfilternet3-noise-filter, also licensed under Apache-2.0 OR MIT:
+https://github.com/mezonai/mezon-noise-suppression
+
+The original license texts remain available in the corresponding upstream
+projects and installed package.

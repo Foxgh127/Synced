@@ -5,12 +5,11 @@
 # For more details, see
 #   http://developer.android.com/guide/developing/tools/proguard.html
 
-# If your project uses WebView with JS, uncomment the following
-# and specify the fully qualified class name to the JavaScript interface
-# class:
-#-keepclassmembers class fqcn.of.javascript.interface.for.webview {
-#   public *;
-#}
+# Keep human-readable bytecode while still allowing R8 to remove unused
+# dependencies, methods and resources. This reduces the packaged attack
+# surface without producing the short randomized names often associated with
+# packed or heavily obfuscated APKs.
+-dontobfuscate
 
 # Uncomment this to preserve the line number information for
 # debugging stack traces.

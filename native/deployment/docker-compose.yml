@@ -4,30 +4,158 @@ services:
       context: ..
       dockerfile: deployment/Dockerfile
     restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     environment:
       PORT: "8787"
       HOST: "0.0.0.0"
+      ICE_SERVERS_JSON: >-
+        [{"urls":["stun:${PUBLIC_IP}:3478"]}]
       TURN_URLS: "${TURN_URLS}"
-      TURN_SECRET: "${TURN_SECRET}"
-      ALLOWED_ORIGINS: "*"
+      TURN_SECRET_FILE: "/run/secrets/turn_secret"
+      TURN_TCP_ENABLED: "${TURN_TCP_ENABLED:-true}"
+      TURN_CREDENTIAL_TTL_SECONDS: "${TURN_CREDENTIAL_TTL_SECONDS:-14400}"
+      SFU_ENABLED: "${SFU_ENABLED:-true}"
+      SFU_PUBLIC_URL: "${SFU_PUBLIC_URL}"
+      LIVEKIT_API_KEY: "${LIVEKIT_API_KEY}"
+      LIVEKIT_API_SECRET_FILE: "/run/secrets/livekit_api_secret"
+      SIGNAL_NODE_ID: "${SIGNAL_NODE_ID:-hk-edge-primary}"
+      SIGNAL_REGION: "${SIGNAL_REGION:-ap-hongkong}"
+      MAX_CLIENTS: "${MAX_CLIENTS:-128}"
+      MAX_CLIENTS_PER_IP: "${MAX_CLIENTS_PER_IP:-16}"
+      MAX_MESSAGES_PER_MINUTE: "${MAX_MESSAGES_PER_MINUTE:-600}"
+      SIGNAL_MAX_BUFFERED_BYTES: "${SIGNAL_MAX_BUFFERED_BYTES:-786432}"
+      ALLOWED_ORIGINS: "${ALLOWED_ORIGINS:-file://,http://localhost,https://localhost,capacitor://localhost}"
+      ALLOW_NO_ORIGIN: "${ALLOW_NO_ORIGIN:-true}"
+      TRUST_PROXY: "false"
+      ALLOW_LEGACY_PROTOCOL: "false"
     ports:
       - "8787:8787"
+    secrets:
+      - turn_secret
+      - livekit_api_secret
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - >-
+          fetch('http://127.0.0.1:8787/readyz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    stop_grace_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   coturn:
-    image: coturn/coturn:4.14.0
+    image: coturn/coturn:4.15.0-r0
     restart: unless-stopped
+    user: "65534:65534"
     network_mode: host
+    entrypoint:
+      - /bin/sh
+      - /opt/yiqikan/coturn-entrypoint.sh
+    environment:
+      TURN_SECRET_FILE: "/run/secrets/turn_secret"
+    secrets:
+      - turn_secret
+    volumes:
+      - ./coturn-entrypoint.sh:/opt/yiqikan/coturn-entrypoint.sh:ro
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     command:
       - --no-cli
       - --fingerprint
-      - --use-auth-secret
-      - --static-auth-secret=${TURN_SECRET}
       - --realm=${TURN_REALM}
       - --external-ip=${PUBLIC_IP}
       - --listening-port=3478
-      - --min-port=49160
-      - --max-port=49200
+      - --min-port=32768
+      - --max-port=65535
+      - --user-quota=16
+      - --total-quota=1000
+      - --stale-nonce=600
+      - --channel-lifetime=600
+      - --permission-lifetime=300
+      - --max-allocate-lifetime=7200
+      - --denied-peer-ip=0.0.0.0-0.255.255.255
+      - --denied-peer-ip=10.0.0.0-10.255.255.255
+      - --denied-peer-ip=100.64.0.0-100.127.255.255
+      - --denied-peer-ip=127.0.0.0-127.255.255.255
+      - --denied-peer-ip=169.254.0.0-169.254.255.255
+      - --denied-peer-ip=172.16.0.0-172.31.255.255
+      - --denied-peer-ip=192.168.0.0-192.168.255.255
+      - --denied-peer-ip=198.18.0.0-198.19.255.255
+      - --denied-peer-ip=224.0.0.0-255.255.255.255
       - --no-multicast-peers
       - --no-tls
       - --no-dtls
       - --log-file=stdout
+    stop_grace_period: 15s
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+  livekit:
+    image: livekit/livekit-server:v1.13.4
+    restart: unless-stopped
+    init: true
+    network_mode: host
+    read_only: true
+    entrypoint:
+      - /bin/sh
+      - /opt/yiqikan/livekit-entrypoint.sh
+    environment:
+      LIVEKIT_API_KEY: "${LIVEKIT_API_KEY}"
+      LIVEKIT_API_SECRET_FILE: "/run/secrets/livekit_api_secret"
+      LIVEKIT_NODE_IP: "${PUBLIC_IP}"
+      LIVEKIT_TURN_HOST: "${PUBLIC_IP}"
+      TURN_SECRET_FILE: "/run/secrets/turn_secret"
+      TURN_CREDENTIAL_TTL_SECONDS: "${TURN_CREDENTIAL_TTL_SECONDS:-14400}"
+    secrets:
+      - livekit_api_secret
+      - turn_secret
+    volumes:
+      - ./livekit-entrypoint.sh:/opt/yiqikan/livekit-entrypoint.sh:ro
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    stop_grace_period: 30s
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+secrets:
+  turn_secret:
+    file: "${TURN_SECRET_FILE:-./secrets/turn_secret}"
+  livekit_api_secret:
+    file: "${LIVEKIT_API_SECRET_FILE:-./secrets/livekit_api_secret}"

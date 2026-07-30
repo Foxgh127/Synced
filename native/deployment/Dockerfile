@@ -8,5 +8,6 @@ COPY server ./server
 ENV NODE_ENV=production
 ENV PORT=8787
 EXPOSE 8787
+USER node
 
 CMD ["node", "server/index.mjs"]

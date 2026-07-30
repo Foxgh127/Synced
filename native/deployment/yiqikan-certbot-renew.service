@@ -1,0 +1,8 @@
+[Unit]
+Description=Renew the short-lived YiQiKan public-IP TLS certificate
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/yiqikan-certbot/bin/certbot renew --quiet --deploy-hook "systemctl reload nginx"

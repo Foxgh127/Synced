@@ -12,6 +12,13 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // Generated/runtime workspaces and the independently checked native app:
+    ".vinext/**",
+    ".wrangler/**",
+    "dist/**",
+    "outputs/**",
+    "work/**",
+    "native/**",
   ]),
 ]);
 

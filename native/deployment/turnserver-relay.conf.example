@@ -1,0 +1,36 @@
+# Tencent/Hong Kong 200 Mbps relay profile.
+# Replace the three __...__ placeholders on the host. Never commit the secret.
+listening-port=3478
+listening-ip=0.0.0.0
+external-ip=__PUBLIC_IP__
+realm=__TURN_REALM__
+fingerprint
+use-auth-secret
+static-auth-secret=__TURN_SECRET__
+
+min-port=32768
+max-port=65535
+user-quota=16
+total-quota=1000
+# Do not configure max-bps or bps-capacity. Relay allocations may use all
+# bandwidth available on the host; WebRTC congestion control remains active.
+stale-nonce=600
+channel-lifetime=600
+permission-lifetime=300
+max-allocate-lifetime=7200
+
+denied-peer-ip=0.0.0.0-0.255.255.255
+denied-peer-ip=10.0.0.0-10.255.255.255
+denied-peer-ip=100.64.0.0-100.127.255.255
+denied-peer-ip=127.0.0.0-127.255.255.255
+denied-peer-ip=169.254.0.0-169.254.255.255
+denied-peer-ip=172.16.0.0-172.31.255.255
+denied-peer-ip=192.168.0.0-192.168.255.255
+denied-peer-ip=198.18.0.0-198.19.255.255
+denied-peer-ip=224.0.0.0-255.255.255.255
+no-multicast-peers
+no-tls
+no-dtls
+no-cli
+simple-log
+log-file=syslog

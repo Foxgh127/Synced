@@ -1,4 +1,13 @@
-# vinext-starter
+# 一起看
+
+本仓库包含当前 Windows/Android Native 产品，以及一套独立的 VDO.Ninja
+网页实现。项目架构、媒体/信令原理、服务器连接、目录逐项说明、构建与排障请先阅读
+[`PROJECT_GUIDE.md`](./PROJECT_GUIDE.md)。
+
+> Native 产品代码位于 [`native/`](./native/)；下面内容只说明仓库根目录的
+> vinext/VDO.Ninja 网页工程。
+
+## 根目录网页工程
 
 A clean full-stack starter running on
 [vinext](https://github.com/cloudflare/vinext), with optional Cloudflare D1 and

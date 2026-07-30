@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>YiQiKan Window Capture Smoke Source</title>
+    <style>
+      html,
+      body,
+      video {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        overflow: hidden;
+        background: #111827;
+      }
+
+      video {
+        display: block;
+        object-fit: cover;
+      }
+
+      canvas {
+        display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas width="960" height="540"></canvas>
+    <video autoplay muted loop playsinline></video>
+    <script>
+      window.videoReady = false;
+
+      async function createDecodedVideoSurface() {
+        const canvas = document.querySelector("canvas");
+        const video = document.querySelector("video");
+        const context = canvas.getContext("2d");
+        const stream = canvas.captureStream(30);
+        const chunks = [];
+        const recorder = new MediaRecorder(stream, {
+          mimeType: "video/webm;codecs=vp8",
+          videoBitsPerSecond: 4_000_000,
+        });
+        let frame = 0;
+        const timer = setInterval(() => {
+          frame += 1;
+          const gradient = context.createLinearGradient(
+            0,
+            0,
+            canvas.width,
+            canvas.height,
+          );
+          gradient.addColorStop(0, frame % 2 ? "#7c3aed" : "#0891b2");
+          gradient.addColorStop(1, frame % 2 ? "#db2777" : "#14b8a6");
+          context.fillStyle = gradient;
+          context.fillRect(0, 0, canvas.width, canvas.height);
+          context.fillStyle = "#ffffff";
+          context.font = "700 64px Segoe UI";
+          context.fillText("YiQiKan GPU VIDEO", 90, 285);
+        }, 33);
+        recorder.addEventListener("dataavailable", (event) => {
+          if (event.data.size) chunks.push(event.data);
+        });
+        const stopped = new Promise((resolve) =>
+          recorder.addEventListener("stop", resolve, { once: true }),
+        );
+        recorder.start(200);
+        await new Promise((resolve) => setTimeout(resolve, 1_200));
+        recorder.stop();
+        await stopped;
+        clearInterval(timer);
+        stream.getTracks().forEach((track) => track.stop());
+        video.src = URL.createObjectURL(
+          new Blob(chunks, { type: "video/webm" }),
+        );
+        await video.play();
+        await new Promise((resolve) => video.requestVideoFrameCallback(resolve));
+        window.videoReady = true;
+      }
+
+      void createDecodedVideoSurface();
+    </script>
+  </body>
+</html>

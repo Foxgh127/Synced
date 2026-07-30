@@ -1,9 +1,30 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import Link from "next/link";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 
 const VDO_ORIGIN = "https://vdo.ninja";
 const STREAM_ID_PATTERN = /^[a-zA-Z0-9_-]{8,64}$/;
+
+function subscribeToLocationChange(listener: () => void) {
+  window.addEventListener("popstate", listener);
+  return () => window.removeEventListener("popstate", listener);
+}
+
+function getLocationSearch(): string | null {
+  return window.location.search;
+}
+
+function getServerLocationSearch(): string | null {
+  return null;
+}
 
 type HostStatus = "idle" | "preparing" | "sharing" | "error";
 type ViewerStatus = "waiting" | "connected" | "offline";
@@ -129,9 +150,21 @@ export default function Home() {
   const hasStartedRef = useRef(false);
   const statusRef = useRef<HostStatus>("idle");
 
-  const [routeReady, setRouteReady] = useState(false);
-  const [viewerId, setViewerId] = useState<string | null>(null);
-  const [invalidViewerLink, setInvalidViewerLink] = useState(false);
+  const locationSearch = useSyncExternalStore(
+    subscribeToLocationChange,
+    getLocationSearch,
+    getServerLocationSearch,
+  );
+  const requestedViewerId =
+    locationSearch === null
+      ? null
+      : new URLSearchParams(locationSearch).get("watch");
+  const routeReady = locationSearch !== null;
+  const viewerId =
+    requestedViewerId && STREAM_ID_PATTERN.test(requestedViewerId)
+      ? requestedViewerId
+      : null;
+  const invalidViewerLink = Boolean(requestedViewerId && !viewerId);
   const [viewerStatus, setViewerStatus] =
     useState<ViewerStatus>("waiting");
   const [soundEnabled, setSoundEnabled] = useState(false);
@@ -148,18 +181,6 @@ export default function Home() {
     "idle",
   );
   const [notice, setNotice] = useState("");
-
-  useEffect(() => {
-    const value = new URLSearchParams(window.location.search).get("watch");
-    if (value) {
-      if (STREAM_ID_PATTERN.test(value)) {
-        setViewerId(value);
-      } else {
-        setInvalidViewerLink(true);
-      }
-    }
-    setRouteReady(true);
-  }, []);
 
   useEffect(() => {
     statusRef.current = hostStatus;
@@ -191,10 +212,7 @@ export default function Home() {
   }, [publisherSrc, viewerSrc, requestDetailedState]);
 
   useEffect(() => {
-    if (hostStatus !== "preparing") {
-      setPickerSlow(false);
-      return;
-    }
+    if (hostStatus !== "preparing") return;
     const timer = window.setTimeout(() => setPickerSlow(true), 12000);
     return () => window.clearTimeout(timer);
   }, [hostStatus, frameNonce]);
@@ -369,9 +387,9 @@ export default function Home() {
             </span>
             <h1>这个观看链接不完整</h1>
             <p>请让分享者重新复制完整链接，再发给你一次。</p>
-            <a className="primary-action anchor-action" href="/">
+            <Link className="primary-action anchor-action" href="/">
               返回首页
-            </a>
+            </Link>
           </div>
           <p className="footer-note">底层连接由 VDO.Ninja 提供</p>
         </section>

@@ -1,0 +1,10 @@
+// Tencent Cloud images may ship with the security pocket commented out.
+// Keep production signaling/TURN dependencies patched without unattended
+// reboots; reboots remain an explicit maintenance action.
+Unattended-Upgrade::Allowed-Origins {
+        "${distro_id}:${distro_codename}-security";
+        "${distro_id}ESMApps:${distro_codename}-apps-security";
+        "${distro_id}ESM:${distro_codename}-infra-security";
+};
+
+Unattended-Upgrade::Automatic-Reboot "false";

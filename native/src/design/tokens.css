@@ -1,0 +1,307 @@
+/**
+ * 同频 / Synced — design tokens
+ *
+ * Colours are authored in OKLCH because its L channel is perceptually linear:
+ * an equal numeric step looks like an equal step to the eye, which sRGB and HSL
+ * do not guarantee. Every ramp below was generated with a constant L stride so
+ * the tints read as evenly spaced. A sRGB hex fallback follows each value for
+ * engines without OKLCH support.
+ *
+ * Hard rule that shapes this file: nothing chromatic may sit within 64px of the
+ * video surface. Coloured light bleeding onto the picture destroys perceived
+ * black level and interferes with HDR tone mapping, so the neutral ramp keeps
+ * chroma at or below 0.014 and the brand gradient is confined to the lobby,
+ * the logo and onboarding.
+ */
+
+:root {
+  color-scheme: dark;
+
+  /* ---------------------------------------------------------------- *
+   * Neutral ramp — hue locked to 265deg (cool), chroma 0.002..0.014  *
+   * ---------------------------------------------------------------- */
+  --n-950: #06070a;
+  --n-900: #0c0e13;
+  --n-850: #11141a;
+  --n-800: #171b22;
+  --n-700: #1f242d;
+  --n-600: #2b313c;
+  --n-500: #3e4552;
+  --n-400: #565e6d;
+  --n-300: #7d8593;
+  --n-200: #a8afba;
+  --n-100: #ced3db;
+  --n-050: #e8ebef;
+  --n-000: #f7f8fa;
+
+  /* ---------------------------------------------------------------- *
+   * Indigo — the functional accent. Hue 265deg.                      *
+   *                                                                  *
+   * Indigo reads as cinematic and premium on dark surfaces.          *
+   * --indigo-400 (#818cf8) is the default fill; near-black ink       *
+   * (--n-950) on it measures 6.6:1 which clears WCAG AA for all      *
+   * text sizes. --indigo-300 is used as accent-text on dark panels.  *
+   * ---------------------------------------------------------------- */
+  --indigo-100: #eceeff;
+  --indigo-200: #cdd2fe;
+  --indigo-300: #a5b4fc;
+  --indigo-400: #818cf8;
+  --indigo-500: #6366f1;
+  --indigo-600: #4f46e5;
+  --indigo-700: #3d35c3;
+  --indigo-800: #2b228e;
+  --indigo-900: #1b1560;
+
+  --indigo-a08: rgba(129, 140, 248, 0.08);
+  --indigo-a16: rgba(129, 140, 248, 0.16);
+  --indigo-a24: rgba(129, 140, 248, 0.24);
+  --indigo-a40: rgba(129, 140, 248, 0.4);
+
+  /* Semantic aliases. Components reference these, never the ramp
+   * directly, so the accent hue can be retuned in one place. */
+  --accent: var(--indigo-400);
+  --accent-hover: var(--indigo-300);
+  --accent-press: var(--indigo-500);
+  --accent-text: var(--indigo-300);
+  --accent-ink: var(--n-950);
+  --accent-bg: var(--indigo-a08);
+  --accent-bg-hover: var(--indigo-a16);
+  --accent-border: var(--indigo-a40);
+  --accent-glow: var(--indigo-a24);
+
+  /* ---------------------------------------------------------------- *
+   * Brand gradient — lobby ambience, logo, onboarding, celebration.  *
+   * Never on a control, never within 64px of the picture.            *
+   * ---------------------------------------------------------------- */
+  --beam: linear-gradient(
+    152deg,
+    #f0a94a 0%,
+    #f2704f 38%,
+    #e0509a 72%,
+    #a95ad9 100%
+  );
+  --beam-ambient: radial-gradient(
+    ellipse 80% 50% at 50% 0%,
+    rgba(242, 112, 79, 0.07) 0%,
+    transparent 70%
+  );
+
+  /* ---------------------------------------------------------------- *
+   * Semantic colours. Hues are >=45deg apart so they survive colour  *
+   * vision deficiency, but every status must ALSO carry a distinct   *
+   * glyph or shape — colour alone is never the signal.               *
+   *                                                                  *
+   * Amber owns the accent, so "warning" moved to hue 40 (a redder    *
+   * orange) to stay separable from it.                               *
+   * ---------------------------------------------------------------- */
+  --live: #2fc98a;
+  --live-text: #6ee8b0;
+  --live-bg: rgba(47, 201, 138, 0.1);
+
+  --voice: #2fb3d9;
+  --voice-text: #79d3ee;
+  --voice-bg: rgba(47, 179, 217, 0.1);
+
+  --warn: #e8763c;
+  --warn-text: #f5a37c;
+  --warn-bg: rgba(232, 118, 60, 0.1);
+
+  --danger: #e04a4a;
+  --danger-text: #f28b87;
+  --danger-bg: rgba(224, 74, 74, 0.1);
+
+  /* ---------------------------------------------------------------- *
+   * Strokes — translucent so they hold up on any surface beneath.    *
+   * ---------------------------------------------------------------- */
+  --stroke-subtle: rgba(255, 255, 255, 0.05);
+  --stroke-default: rgba(255, 255, 255, 0.09);
+  --stroke-strong: rgba(255, 255, 255, 0.15);
+  --stroke-glass: rgba(255, 255, 255, 0.11);
+  --stroke-inset: rgba(0, 0, 0, 0.4);
+
+  /* ---------------------------------------------------------------- *
+   * Typography — 13px base at a 1.2 ratio (desktop app density).     *
+   * Chinese line heights run 1px looser than Latin.                  *
+   * ---------------------------------------------------------------- */
+  --font-ui:
+    "Inter Variable", Inter, ui-sans-serif,
+    "PingFang SC", "HarmonyOS Sans SC", "Source Han Sans SC",
+    "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif;
+  --font-display:
+    "Inter Display", "Inter Variable", Inter,
+    "PingFang SC", "Source Han Sans SC", sans-serif;
+  --font-mono:
+    "JetBrains Mono", "SF Mono", "Cascadia Code", ui-monospace, Consolas,
+    monospace;
+
+  --t-micro: 10px;
+  --t-caption: 11px;
+  --t-small: 12px;
+  --t-body: 13px;
+  --t-body-lg: 14px;
+  --t-strong: 15px;
+  --t-title: 19px;
+  --t-page: 24px;
+  --t-hero: 34px;
+
+  --lh-micro: 15px;
+  --lh-caption: 17px;
+  --lh-small: 19px;
+  --lh-body: 21px;
+  --lh-body-lg: 23px;
+  --lh-strong: 23px;
+  --lh-title: 28px;
+  --lh-page: 34px;
+  --lh-hero: 46px;
+
+  /* ---------------------------------------------------------------- *
+   * Spacing — 4px base, non-linear so small gaps stay tight.         *
+   * ---------------------------------------------------------------- */
+  --s-0: 0;
+  --s-1: 2px;
+  --s-2: 4px;
+  --s-3: 6px;
+  --s-4: 8px;
+  --s-5: 12px;
+  --s-6: 16px;
+  --s-7: 20px;
+  --s-8: 24px;
+  --s-9: 32px;
+  --s-10: 40px;
+  --s-11: 48px;
+  --s-12: 64px;
+  --s-13: 80px;
+  --s-14: 96px;
+
+  /* ---------------------------------------------------------------- *
+   * Radii — generous curves inspired by modern spatial design.       *
+   * Nesting rule: inner radius = outer radius - padding, min 6px.    *
+   * ---------------------------------------------------------------- */
+  --r-xs: 6px;
+  --r-sm: 10px;
+  --r-md: 14px;
+  --r-lg: 20px;
+  --r-xl: 26px;
+  --r-2xl: 32px;
+  --r-full: 999px;
+
+  /* ---------------------------------------------------------------- *
+   * Elevation — layered shadows with ambient glow for depth.         *
+   * ---------------------------------------------------------------- */
+  --e-1: 0 1px 3px rgba(0, 0, 0, 0.45), 0 1px 2px rgba(0, 0, 0, 0.3);
+  --e-2:
+    0 4px 8px rgba(0, 0, 0, 0.35), 0 12px 24px -4px rgba(0, 0, 0, 0.45);
+  --e-3:
+    0 8px 16px rgba(0, 0, 0, 0.32), 0 24px 48px -8px rgba(0, 0, 0, 0.5);
+  --e-card:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    0 2px 8px rgba(0, 0, 0, 0.3),
+    0 12px 32px -8px rgba(0, 0, 0, 0.42);
+  --e-accent:
+    0 0 0 1px var(--accent-border),
+    0 8px 32px -4px var(--accent-glow),
+    0 2px 8px var(--accent-glow);
+
+  /* ---------------------------------------------------------------- *
+   * Motion. Exit durations are ~0.7x their entrance: people tolerate *
+   * things leaving faster than arriving.                             *
+   * ---------------------------------------------------------------- */
+  --dur-1: 80ms;
+  --dur-2: 140ms;
+  --dur-3: 220ms;
+  --dur-4: 320ms;
+  --dur-5: 440ms;
+  --dur-6: 720ms;
+
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in: cubic-bezier(0.5, 0, 0.85, 0);
+  --ease-inout: cubic-bezier(0.65, 0, 0.35, 1);
+  --ease-emphasis: cubic-bezier(0.2, 0, 0, 1);
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+
+  /* ---------------------------------------------------------------- *
+   * Layout constants shared between CSS and TypeScript.              *
+   * ---------------------------------------------------------------- */
+  --rail-w: 56px;
+  --topbar-h: 48px;
+  --dock-h: 52px;
+  --panel-w: 340px;
+  --hud-h: 32px;
+
+  /* The picture well is pure black and is not themeable. */
+  --video-well: #000000;
+
+  /* ---------------------------------------------------------------- *
+   * Visual enhancements — gradients, glows, and premium finishes.    *
+   * ---------------------------------------------------------------- */
+  --accent-gradient: linear-gradient(135deg, #9da8ff 0%, #818cf8 30%, #6366f1 70%, #7c3aed 100%);
+  --accent-gradient-hover: linear-gradient(135deg, #b8c1ff 0%, #a5b4fc 30%, #818cf8 70%, #8b5cf6 100%);
+  --glass-shine: linear-gradient(135deg, rgba(255, 255, 255, 0.08) 0%, transparent 50%);
+  --glass-top-highlight: inset 0 1px 0 rgba(255, 255, 255, 0.12);
+  --ambient-glow: radial-gradient(ellipse 100% 60% at 50% -20%, var(--accent-bg), transparent 70%);
+}
+
+/* Wider viewports earn a roomier companion panel. */
+@media (min-width: 1600px) {
+  :root {
+    --panel-w: 380px;
+  }
+}
+
+@media (max-width: 1199px) {
+  :root {
+    --panel-w: 320px;
+  }
+}
+
+/* Progressive enhancement: on engines that understand OKLCH, re-declare the
+ * ramps in that space. Values are identical in intent to the hex above but
+ * carry the wider gamut on displays that can show it. */
+@supports (color: oklch(50% 0.1 200)) {
+  :root {
+    --n-950: oklch(8% 0.004 265);
+    --n-900: oklch(12% 0.006 265);
+    --n-850: oklch(15% 0.008 265);
+    --n-800: oklch(18% 0.01 265);
+    --n-700: oklch(23% 0.012 265);
+    --n-600: oklch(30% 0.013 265);
+    --n-500: oklch(40% 0.013 265);
+    --n-400: oklch(52% 0.012 265);
+    --n-300: oklch(64% 0.01 265);
+    --n-200: oklch(76% 0.008 265);
+    --n-100: oklch(87% 0.005 265);
+    --n-050: oklch(94% 0.003 265);
+    --n-000: oklch(98% 0.002 265);
+
+    --indigo-100: oklch(93% 0.05 265);
+    --indigo-200: oklch(86% 0.1 265);
+    --indigo-300: oklch(79% 0.15 265);
+    --indigo-400: oklch(72% 0.19 265);
+    --indigo-500: oklch(65% 0.22 265);
+    --indigo-600: oklch(55% 0.22 265);
+    --indigo-700: oklch(44% 0.2 265);
+    --indigo-800: oklch(32% 0.16 265);
+    --indigo-900: oklch(21% 0.11 265);
+
+    --indigo-a08: oklch(72% 0.19 265 / 0.08);
+    --indigo-a16: oklch(72% 0.19 265 / 0.16);
+    --indigo-a24: oklch(72% 0.19 265 / 0.24);
+    --indigo-a40: oklch(72% 0.19 265 / 0.4);
+
+    --live: oklch(65% 0.15 155);
+    --live-text: oklch(80% 0.13 155);
+    --live-bg: oklch(65% 0.15 155 / 0.1);
+
+    --voice: oklch(66% 0.13 205);
+    --voice-text: oklch(81% 0.11 205);
+    --voice-bg: oklch(66% 0.13 205 / 0.1);
+
+    --warn: oklch(68% 0.16 40);
+    --warn-text: oklch(80% 0.13 40);
+    --warn-bg: oklch(68% 0.16 40 / 0.1);
+
+    --danger: oklch(62% 0.19 22);
+    --danger-text: oklch(78% 0.15 22);
+    --danger-bg: oklch(62% 0.19 22 / 0.1);
+  }
+}

@@ -1,0 +1,37 @@
+[Unit]
+Description=Synced LiveKit SFU
+Wants=network-online.target
+After=network-online.target coturn.service
+
+[Service]
+Type=simple
+User=yiqikan
+Group=yiqikan
+EnvironmentFile=/etc/yiqikan-livekit.env
+ExecStart=/opt/yiqikan/livekit-entrypoint.sh
+Restart=always
+RestartSec=3s
+TimeoutStopSec=30s
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+LimitNOFILE=65535
+TasksMax=512
+MemoryHigh=640M
+MemoryMax=896M
+
+[Install]
+WantedBy=multi-user.target

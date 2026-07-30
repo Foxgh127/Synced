@@ -1,0 +1,1095 @@
+/**
+ * Visual enhancements — Apple aesthetic polish
+ *
+ * Gradients, animations, glass refinements, and premium finishes.
+ * All rules here override base styles.css for visual enhancement only.
+ */
+
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   Rail & Navigation
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
+.channel-rail {
+  background:
+    linear-gradient(180deg, rgba(129, 140, 248, 0.03) 0%, transparent 30%),
+    rgba(8, 11, 17, 0.95);
+  backdrop-filter: blur(32px) saturate(1.3);
+}
+
+.rail-logo {
+  background: var(--accent-gradient);
+  box-shadow:
+    0 12px 40px var(--accent-glow),
+    0 4px 12px rgba(99, 102, 241, 0.4),
+    inset 0 1px 0 rgba(255, 255, 255, 0.2);
+  transition: all var(--dur-3) var(--ease-spring);
+}
+
+.rail-logo:hover {
+  transform: scale(1.05) translateY(-2px);
+  box-shadow:
+    0 16px 48px var(--accent-glow),
+    0 6px 16px rgba(99, 102, 241, 0.5),
+    inset 0 1px 0 rgba(255, 255, 255, 0.25);
+}
+
+.rail-logo:active {
+  transform: scale(0.98);
+}
+
+.recent-channel {
+  background:
+    linear-gradient(135deg, rgba(255, 255, 255, 0.04) 0%, rgba(255, 255, 255, 0.01) 100%),
+    var(--panel-2);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+  transition:
+    transform var(--dur-3) var(--ease-spring),
+    box-shadow var(--dur-3) var(--ease-spring),
+    background var(--dur-2) var(--ease-out),
+    border-radius var(--dur-2) var(--ease-out);
+}
+
+.recent-channel:hover {
+  transform: translateY(-3px) scale(1.02);
+  background:
+    linear-gradient(135deg, rgba(255, 255, 255, 0.08) 0%, rgba(255, 255, 255, 0.02) 100%),
+    var(--panel-3);
+  box-shadow:
+    0 8px 24px rgba(0, 0, 0, 0.25),
+    0 0 0 1px rgba(255, 255, 255, 0.06) inset;
+}
+
+.profile-orb {
+  background: var(--accent-gradient);
+  box-shadow: 0 4px 16px var(--accent-glow);
+  font-weight: 700;
+  transition: all var(--dur-3) var(--ease-spring);
+}
+
+.profile-orb:hover {
+  transform: scale(1.08);
+  box-shadow: 0 8px 24px var(--accent-glow);
+}
+
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   Home Page & Hero
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
+.home-main {
+  background: var(--ambient-glow);
+}
+
+.wordmark-icon {
+  filter: drop-shadow(0 4px 12px var(--accent-glow));
+}
+
+.eyebrow {
+  background: var(--accent-gradient);
+  background-clip: text;
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+
+.mode-card {
+  background:
+    linear-gradient(135deg, rgba(255, 255, 255, 0.08) 0%, rgba(255, 255, 255, 0.02) 60%, transparent 100%),
+    rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  backdrop-filter: blur(32px) saturate(1.6);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.14),
+    0 8px 32px -8px rgba(0, 0, 0, 0.5),
+    0 2px 8px rgba(0, 0, 0, 0.2);
+  transition:
+    transform var(--dur-4) var(--ease-spring),
+    box-shadow var(--dur-4) var(--ease-spring),
+    border-color var(--dur-3) var(--ease-out),
+    background var(--dur-3) var(--ease-out);
+}
+
+.mode-card:hover {
+  transform: translateY(-10px) scale(1.02);
+  border-color: rgba(165, 180, 252, 0.4);
+  background:
+    linear-gradient(135deg, rgba(129, 140, 248, 0.18) 0%, rgba(255, 255, 255, 0.06) 60%, transparent 100%),
+    rgba(255, 255, 255, 0.07);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.2),
+    0 24px 64px -12px rgba(0, 0, 0, 0.6),
+    0 12px 32px rgba(129, 140, 248, 0.25),
+    0 0 0 1px rgba(165, 180, 252, 0.2);
+}
+
+.mode-card:active {
+  transform: translateY(-4px) scale(0.99);
+}
+
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   Setup & Forms
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
+.setup-card,
+.join-card {
+  background:
+    linear-gradient(160deg, rgba(255, 255, 255, 0.05) 0%, transparent 60%),
+    var(--n-850);
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  box-shadow: var(--e-card);
+}
+
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible {
+  border-color: var(--accent);
+  box-shadow:
+    0 0 0 4px var(--accent-glow),
+    0 2px 8px rgba(0, 0, 0, 0.2);
+}
+
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   Primary Buttons & Actions
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
+.primary-button {
+  background: var(--accent-gradient);
+  color: var(--n-000);
+  border-radius: 16px;
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.2) inset,
+    0 12px 32px var(--accent-glow),
+    0 4px 12px rgba(0, 0, 0, 0.25);
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.15);
+  transition: all var(--dur-3) var(--ease-spring);
+}
+
+.primary-button:hover:not(:disabled) {
+  background: var(--accent-gradient-hover);
+  transform: translateY(-2px);
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.25) inset,
+    0 16px 48px var(--accent-glow),
+    0 8px 20px rgba(0, 0, 0, 0.3);
+}
+
+.primary-button:active:not(:disabled) {
+  transform: translateY(0) scale(0.98);
+}
+
+.primary-button > span {
+  background: rgba(255, 255, 255, 0.2);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15) inset;
+}
+
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   Quality & Settings
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
+.quality-option {
+  background: var(--n-800);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  transition:
+    all var(--dur-3) var(--ease-spring);
+}
+
+.quality-option:hover:not(:disabled) {
+  transform: translateY(-2px);
+  border-color: rgba(129, 140, 248, 0.3);
+  background:
+    linear-gradient(135deg, rgba(129, 140, 248, 0.08) 0%, transparent 50%),
+    var(--n-700);
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.2);
+}
+
+.quality-option.active {
+  background: var(--accent-gradient);
+  border-color: transparent;
+  color: var(--n-000);
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.2) inset,
+    0 8px 24px var(--accent-glow),
+    0 2px 8px rgba(0, 0, 0, 0.3);
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.15);
+}
+
+.quality-option.active strong,
+.quality-option.active span {
+  color: var(--n-000);
+}
+
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   Source Cards & Broadcast
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
+.source-card {
+  background:
+    linear-gradient(135deg, rgba(255, 255, 255, 0.04) 0%, transparent 50%),
+    #0b1017;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  transition:
+    all var(--dur-3) var(--ease-spring);
+}
+
+.source-card:hover,
+.source-card.selected {
+  transform: translateY(-4px);
+  border-color: var(--accent);
+  background:
+    linear-gradient(135deg, rgba(129, 140, 248, 0.12) 0%, rgba(255, 255, 255, 0.04) 50%),
+    #0e1420;
+  box-shadow:
+    0 12px 32px rgba(0, 0, 0, 0.3),
+    0 8px 24px var(--accent-glow),
+    inset 0 1px 0 rgba(255, 255, 255, 0.08);
+}
+
+.broadcast-mode-tabs button.active {
+  background:
+    var(--accent-gradient);
+  border-color: transparent;
+  color: var(--n-000);
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.2) inset,
+    0 4px 16px var(--accent-glow);
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.15);
+}
+
+.broadcast-mode-tabs button.active strong,
+.broadcast-mode-tabs button.active span {
+  color: var(--n-000);
+}
+
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   Session & Video Stage
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
+.session-header {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.06) 0%, transparent 100%),
+    rgba(12, 14, 19, 0.88);
+  backdrop-filter: blur(48px) saturate(1.5);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.12),
+    0 4px 16px rgba(0, 0, 0, 0.2);
+}
+
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   Dialogs & Modals
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
+dialog {
+  border-radius: var(--r-xl);
+}
+
+dialog > header {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.04) 0%, transparent 100%);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   Toast & Notifications
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
+.toast {
+  background:
+    linear-gradient(90deg, rgba(255, 255, 255, 0.04) 0%, transparent 100%),
+    var(--n-800);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  backdrop-filter: blur(32px) saturate(1.4);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.1),
+    0 12px 32px rgba(0, 0, 0, 0.4);
+}
+
+.toast-info .toast-bar {
+  background: var(--accent-gradient);
+  box-shadow: 0 0 12px var(--accent-glow);
+}
+
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   Dock & Controls
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
+.dock {
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.14),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.25),
+    0 12px 40px -8px rgba(0, 0, 0, 0.7);
+}
+
+.progress-fill {
+  background: var(--accent-gradient);
+  box-shadow: 0 0 12px var(--accent-glow);
+}
+
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   Members & User List
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
+.member-item:hover,
+.member-row:hover {
+  background:
+    linear-gradient(90deg, rgba(129, 140, 248, 0.08) 0%, transparent 100%),
+    rgba(255, 255, 255, 0.03);
+}
+
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   Animations
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
+@keyframes glow-pulse {
+  0%, 100% {
+    box-shadow:
+      0 12px 40px var(--accent-glow),
+      0 4px 12px rgba(99, 102, 241, 0.4);
+  }
+  50% {
+    box-shadow:
+      0 16px 56px var(--accent-glow),
+      0 6px 16px rgba(99, 102, 241, 0.6);
+  }
+}
+
+.rail-logo {
+  animation: glow-pulse 3s var(--ease-inout) infinite;
+}
+
+/* Smooth enter animations for dynamic content */
+@keyframes slide-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.mode-card,
+.source-card,
+.quality-option,
+.member-item {
+  animation: slide-fade-in var(--dur-4) var(--ease-out) backwards;
+}
+
+.mode-card:nth-child(1) { animation-delay: 0ms; }
+.mode-card:nth-child(2) { animation-delay: 80ms; }
+
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   Reduced Motion Overrides
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
+@media (prefers-reduced-motion: reduce) {
+  .rail-logo {
+    animation: none;
+  }
+
+  .mode-card,
+  .source-card,
+  .quality-option,
+  .member-item {
+    animation: none;
+  }
+}
+
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   FINAL DESIGN PASS — token consistency & style unification
+   All remaining raw hex / rgba values replaced by semantic tokens.
+   All border-radius px values mapped to the canonical ramp.
+   PiP button teal → accent. Amber → accent. Neutral hardcodes → n-*.
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
+/* ── Typography & Labels ── */
+.eyebrow,
+.panel-kicker {
+  color: var(--accent-text);
+}
+
+.hero-trust {
+  color: var(--n-200);
+}
+
+/* "大陆服务器在线" is a live-status signal → live colour */
+.hero-trust span:first-child {
+  color: var(--live-text);
+}
+
+.home-footer {
+  color: var(--n-400);
+}
+
+/* mode-card CTA arrows */
+.mode-card b,
+.viewer-mode b {
+  color: var(--accent-text);
+}
+
+/* quality / bandwidth hints */
+.quality-recommended-badge {
+  background: var(--accent-bg-hover);
+  color: var(--accent-text);
+  border-radius: var(--r-xs);
+}
+
+.bw-recommend-hint,
+.quality-summary {
+  color: var(--accent-text);
+}
+
+/* ── Setup / Privacy ── */
+.privacy-callout {
+  border-color: var(--accent-border);
+  background: var(--accent-bg);
+  border-radius: var(--r-md);
+}
+
+.privacy-callout > span {
+  color: var(--accent-text);
+}
+
+/* ── Primary button shadow ── */
+.primary-button {
+  border-radius: var(--r-lg);
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.2) inset,
+    0 12px 32px var(--accent-glow),
+    0 4px 12px rgba(0, 0, 0, 0.25);
+}
+
+/* ── Quality options ── */
+.quality-option {
+  border-radius: var(--r-sm);
+  background: var(--n-800);
+}
+
+/* ── Channel empty / loading ── */
+.channel-empty > span {
+  border-color: var(--accent-border);
+  border-radius: var(--r-lg);
+  background: var(--accent-bg);
+}
+
+.buffer-spinner {
+  border-color: var(--n-600);
+  border-top-color: var(--accent);
+}
+
+.channel-buffering progress {
+  accent-color: var(--accent);
+}
+
+/* ── Connection pills ── */
+.connection-pill,
+.count-pill {
+  border-radius: var(--r-full);
+}
+
+/* "ready" = live connection established → voice semantic */
+.connection-pill[data-tone="ready"] {
+  border-color: var(--voice-bg);
+  color: var(--voice-text);
+}
+
+.connection-pill[data-tone="error"] {
+  border-color: var(--danger-bg);
+  color: var(--danger-text);
+}
+
+/* ── Live dot ── */
+.live-dot.idle {
+  background: var(--n-400);
+  box-shadow: 0 0 0 5px rgba(86, 94, 109, 0.15);
+}
+
+/* ── Video stage ── */
+.video-stage {
+  border-radius: var(--r-lg);
+  background: var(--n-950);
+}
+
+/* ── Buffering copy / spinner ── */
+.buffering-copy span {
+  border-color: var(--n-600);
+  border-top-color: var(--accent);
+}
+
+/* ── Broadcast action buttons ── */
+.broadcast-action {
+  border-color: var(--accent-border);
+  border-radius: var(--r-sm);
+  background: var(--accent-bg);
+  color: var(--accent-text);
+  cursor: pointer;
+  transition: all var(--dur-2) var(--ease-out);
+}
+
+.broadcast-action:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: var(--accent-bg-hover);
+}
+
+.broadcast-action:active:not(:disabled) {
+  transform: scale(0.97);
+}
+
+.broadcast-action.active {
+  border-color: var(--danger-bg);
+  background: var(--danger-bg);
+  color: var(--danger-text);
+}
+
+/* ── PiP button → accent (it's a feature toggle, not voice) ── */
+#dock-pip.active,
+#dock-pip[aria-checked="true"] {
+  border-color: var(--accent-border);
+  background: var(--accent-bg-hover);
+  color: var(--accent-text);
+  box-shadow: none;
+}
+
+.mini-window-track {
+  background: var(--n-600);
+  transition:
+    border-color var(--dur-2) var(--ease-out),
+    background var(--dur-3) var(--ease-spring);
+}
+
+.mini-window-knob {
+  background: var(--n-100);
+  transition:
+    background var(--dur-2) var(--ease-out),
+    transform var(--dur-3) var(--ease-spring);
+}
+
+.mini-window-state {
+  color: var(--n-300);
+}
+
+#dock-pip[aria-checked="true"] .mini-window-track {
+  border-color: var(--accent-border);
+  background: var(--accent);
+}
+
+#dock-pip[aria-checked="true"] .mini-window-knob {
+  background: var(--n-000);
+}
+
+#dock-pip[aria-checked="true"] .mini-window-state {
+  color: var(--accent-text);
+}
+
+/* ── Source cards / dialogs ── */
+.source-card img,
+.source-card .source-placeholder,
+.source-card .source-placeholder > div {
+  background-color: var(--n-950);
+}
+
+.source-toolbar label {
+  border-radius: var(--r-sm);
+  background: var(--n-900);
+}
+
+/* ── Picture / settings dialog ── */
+.picture-dialog {
+  border-color: var(--stroke-strong);
+  border-radius: var(--r-xl);
+  background: var(--n-850);
+  box-shadow: var(--e-3);
+}
+
+.picture-dialog > header > button {
+  border-radius: var(--r-sm);
+}
+
+/* Current source summary (voice colour = stream/media semantic) */
+.picture-source-summary {
+  border-color: var(--accent-border);
+  border-radius: var(--r-md);
+  background: var(--accent-bg);
+  color: var(--accent-text);
+  font-weight: 700;
+}
+
+/* ── Segmented control ── */
+.segmented-control {
+  border-radius: var(--r-md);
+  background: var(--n-950);
+}
+
+/* ── Receiver quality select ── */
+.receiver-quality select {
+  border-radius: var(--r-sm);
+  background: var(--n-900);
+  color: var(--n-100);
+}
+
+.receiver-quality select option:disabled {
+  background: var(--n-950);
+  color: var(--n-400);
+}
+
+/* ── Receiver capability text ── */
+.receiver-capability {
+  color: var(--n-300);
+}
+
+/* ── Control dock ── */
+.control-dock {
+  border-radius: var(--r-md);
+  background: var(--n-850);
+  border-color: var(--line);
+}
+
+/* ── Danmaku bubbles ── */
+.danmaku {
+  border-radius: var(--r-full);
+}
+
+/* ── Invite dialog ── */
+.invite-code[data-copied="true"] small {
+  color: var(--live-text);
+}
+
+/* ── Non-token transitions fix ── */
+.channel-layout input,
+.quality-option input {
+  transition:
+    border-color var(--dur-2) var(--ease-out),
+    transform var(--dur-3) var(--ease-spring);
+}
+
+/* ── Channel header ── */
+.channel-header {
+  border-radius: var(--r-sm);
+}
+
+/* ── Session rail profile ── */
+.channel-rail .profile-orb,
+.session-rail .profile-orb {
+  background: var(--accent-gradient);
+  box-shadow: 0 4px 16px var(--accent-glow);
+}
+
+/* ── Mobile playback stats ── */
+.mobile-playback-stats {
+  border-radius: var(--r-sm);
+  background: rgba(12, 14, 19, 0.78);
+  backdrop-filter: blur(20px) saturate(1.3);
+}
+
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   Apple-style Liquid Glass — cards, sidebar, companion panel
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
+/* Companion sidebar: frosted glass with depth */
+.room-sidebar.companion-panel {
+  background:
+    linear-gradient(160deg, rgba(255, 255, 255, 0.055) 0%, rgba(255, 255, 255, 0.01) 100%),
+    rgba(11, 14, 20, 0.82);
+  backdrop-filter: blur(56px) saturate(1.8) brightness(1.04);
+  border-left: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.12),
+    -4px 0 32px rgba(0, 0, 0, 0.3);
+}
+
+/* Voice & chat cards: liquid glass elevation */
+.voice-card,
+.chat-card {
+  background:
+    linear-gradient(145deg, rgba(255, 255, 255, 0.06) 0%, rgba(255, 255, 255, 0.01) 60%, transparent 100%),
+    rgba(15, 18, 26, 0.72);
+  backdrop-filter: blur(40px) saturate(1.6);
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: var(--r-lg);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.1),
+    0 4px 20px rgba(0, 0, 0, 0.3),
+    0 1px 4px rgba(0, 0, 0, 0.2);
+  transition:
+    box-shadow var(--dur-3) var(--ease-out),
+    border-color var(--dur-3) var(--ease-out);
+}
+
+.voice-card:hover,
+.chat-card:hover {
+  border-color: rgba(255, 255, 255, 0.14);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.14),
+    0 8px 28px rgba(0, 0, 0, 0.36),
+    0 2px 6px rgba(0, 0, 0, 0.24);
+}
+
+/* Participant rows: spring hover + speaking glow */
+.participant-row {
+  transition:
+    background var(--dur-2) var(--ease-out),
+    border-color var(--dur-2) var(--ease-out),
+    transform var(--dur-3) var(--ease-spring);
+}
+
+.participant-row:hover {
+  transform: translateX(2px);
+}
+
+/* Voice button: pill CTA with gradient */
+.voice-button {
+  background:
+    linear-gradient(135deg, rgba(47, 179, 217, 0.18) 0%, rgba(47, 179, 217, 0.08) 100%);
+  border: 1px solid rgba(47, 179, 217, 0.3);
+  border-radius: var(--r-full);
+  transition:
+    all var(--dur-3) var(--ease-spring);
+  box-shadow: 0 0 0 0 rgba(47, 179, 217, 0);
+}
+
+.voice-button:hover:not(:disabled) {
+  background:
+    linear-gradient(135deg, rgba(47, 179, 217, 0.28) 0%, rgba(47, 179, 217, 0.14) 100%);
+  border-color: rgba(47, 179, 217, 0.5);
+  transform: scale(1.02);
+  box-shadow: 0 4px 16px rgba(47, 179, 217, 0.25);
+}
+
+.voice-button:active:not(:disabled) {
+  transform: scale(0.97);
+}
+
+.voice-button.connected {
+  background:
+    linear-gradient(135deg, rgba(47, 179, 217, 0.32) 0%, rgba(47, 179, 217, 0.16) 100%);
+  border-color: rgba(47, 179, 217, 0.55);
+  color: var(--voice-text);
+  animation: voice-connected-breathe 2.5s var(--ease-inout) infinite;
+}
+
+@keyframes voice-connected-breathe {
+  0%, 100% { box-shadow: 0 4px 16px rgba(47, 179, 217, 0.2); }
+  50%       { box-shadow: 0 6px 24px rgba(47, 179, 217, 0.38); }
+}
+
+/* HUD bar: compact glass chip */
+.hud-bar {
+  background:
+    linear-gradient(135deg, rgba(255, 255, 255, 0.07) 0%, rgba(255, 255, 255, 0.02) 100%),
+    rgba(8, 11, 17, 0.8);
+  backdrop-filter: blur(32px) saturate(1.5);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.1),
+    0 2px 12px rgba(0, 0, 0, 0.35);
+}
+
+/* Session / channel header: layered glass */
+.channel-header.session-header {
+  backdrop-filter: blur(60px) saturate(2);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.065) 0%, transparent 100%),
+    rgba(8, 11, 17, 0.85);
+  border-bottom: none;
+}
+
+/* Video stage ring on active broadcast */
+.video-stage {
+  transition:
+    box-shadow var(--dur-4) var(--ease-out),
+    border-radius var(--dur-3) var(--ease-out);
+}
+
+/* Dock: premium float with blur */
+.dock {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.08) 0%, rgba(255, 255, 255, 0.03) 100%),
+    rgba(8, 11, 17, 0.88);
+  backdrop-filter: blur(48px) saturate(1.8) brightness(1.02);
+  border: 1px solid rgba(255, 255, 255, 0.11);
+  border-radius: var(--r-xl);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.14),
+    0 -2px 8px rgba(0, 0, 0, 0.2),
+    0 16px 48px -8px rgba(0, 0, 0, 0.7),
+    0 4px 16px rgba(0, 0, 0, 0.4);
+}
+
+/* Dock buttons: refined hover + active states */
+.dock .btn-ghost {
+  border-radius: var(--r-sm);
+  transition:
+    background var(--dur-2) var(--ease-out),
+    transform var(--dur-2) var(--ease-spring),
+    color var(--dur-2) var(--ease-out);
+}
+
+.dock .btn-ghost:hover {
+  transform: scale(1.1);
+}
+
+.dock .btn-ghost:active {
+  transform: scale(0.92);
+}
+
+/* Control dock (session controls bar) */
+.control-dock,
+.session-control-dock {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.05) 0%, rgba(255, 255, 255, 0.01) 100%),
+    rgba(11, 14, 20, 0.75);
+  backdrop-filter: blur(36px) saturate(1.5);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: var(--r-md);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.1),
+    0 4px 16px rgba(0, 0, 0, 0.3);
+}
+
+/* Broadcast dialog: wide glass modal */
+.broadcast-dialog,
+.source-dialog {
+  background:
+    linear-gradient(160deg, rgba(255, 255, 255, 0.05) 0%, transparent 40%),
+    rgba(12, 15, 22, 0.95);
+  backdrop-filter: blur(64px) saturate(1.8);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.12),
+    0 32px 80px -16px rgba(0, 0, 0, 0.7),
+    0 8px 32px rgba(0, 0, 0, 0.4);
+}
+
+/* Invite dialog */
+.invite-dialog {
+  background:
+    linear-gradient(145deg, rgba(255, 255, 255, 0.055) 0%, transparent 60%),
+    rgba(14, 17, 25, 0.96);
+  backdrop-filter: blur(48px) saturate(1.7);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.1),
+    0 24px 64px -12px rgba(0, 0, 0, 0.65);
+}
+
+/* Invite code chip: frosted accent */
+.invite-code {
+  background:
+    linear-gradient(135deg, rgba(129, 140, 248, 0.12) 0%, rgba(129, 140, 248, 0.05) 100%),
+    rgba(12, 14, 19, 0.7);
+  backdrop-filter: blur(24px);
+  border: 1px solid rgba(129, 140, 248, 0.3);
+  border-radius: var(--r-lg);
+  transition:
+    all var(--dur-3) var(--ease-spring);
+}
+
+.invite-code:hover {
+  background:
+    linear-gradient(135deg, rgba(129, 140, 248, 0.2) 0%, rgba(129, 140, 248, 0.08) 100%),
+    rgba(12, 14, 19, 0.7);
+  border-color: rgba(129, 140, 248, 0.5);
+  transform: scale(1.02);
+}
+
+/* Toast: elevated glass notification */
+.toast {
+  backdrop-filter: blur(40px) saturate(1.7) brightness(1.05);
+  background:
+    linear-gradient(135deg, rgba(255, 255, 255, 0.08) 0%, rgba(255, 255, 255, 0.03) 100%),
+    rgba(14, 18, 26, 0.88);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: var(--r-lg);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.12),
+    0 16px 40px rgba(0, 0, 0, 0.5),
+    0 4px 12px rgba(0, 0, 0, 0.3);
+}
+
+/* Participant avatar: ring glow on speaking */
+.participant-avatar.is-speaking {
+  box-shadow:
+    0 0 0 2px rgba(47, 179, 217, 0.6),
+    0 0 16px rgba(47, 179, 217, 0.35),
+    inset 0 1px 0 rgba(255, 255, 255, 0.15);
+}
+
+/* Mobile gesture HUD */
+.mobile-gesture-hud {
+  background:
+    linear-gradient(145deg, rgba(255, 255, 255, 0.1) 0%, rgba(255, 255, 255, 0.04) 100%),
+    rgba(6, 8, 12, 0.75);
+  backdrop-filter: blur(32px) saturate(1.5);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: var(--r-xl);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.12),
+    0 8px 24px rgba(0, 0, 0, 0.4);
+}
+
+/* Mobile cards enter independently. Do not animate the sidebar transform:
+ * the responsive layout owns that property and must never flash as a drawer. */
+@keyframes slide-up-fade-in {
+  from { opacity: 0; transform: translateY(24px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@media (max-width: 800px) {
+  .room-sidebar {
+    animation: none;
+  }
+
+  .chat-card,
+  .voice-card {
+    animation: slide-up-fade-in var(--dur-4) var(--ease-out) backwards;
+  }
+
+  .chat-card  { animation-delay: 40ms; }
+  .voice-card { animation-delay: 80ms; }
+}
+
+/* Springy entrance for participant rows */
+@keyframes row-enter {
+  from { opacity: 0; transform: translateX(-12px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+
+.participant-row.is-entering {
+  animation: row-enter var(--dur-4) var(--ease-spring) backwards;
+}
+
+/* Progress bar: glow pulse when buffering */
+.progress-buffer {
+  background: rgba(129, 140, 248, 0.18);
+}
+
+/* Channel empty / loading state: richer illustration */
+.channel-empty > span {
+  background:
+    linear-gradient(135deg, rgba(129, 140, 248, 0.12) 0%, rgba(129, 140, 248, 0.04) 100%);
+  backdrop-filter: blur(16px);
+  border: 1px solid rgba(129, 140, 248, 0.2);
+}
+
+/* Device panel: compact glass select */
+.voice-device-panel label {
+  background:
+    linear-gradient(135deg, rgba(255, 255, 255, 0.04) 0%, transparent 100%),
+    rgba(12, 14, 19, 0.5);
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  border-radius: var(--r-sm);
+  transition: border-color var(--dur-2) var(--ease-out);
+}
+
+.voice-device-panel label:focus-within {
+  border-color: rgba(129, 140, 248, 0.4);
+  background:
+    linear-gradient(135deg, rgba(129, 140, 248, 0.06) 0%, transparent 100%),
+    rgba(12, 14, 19, 0.5);
+}
+
+/* Chat log: subtle glass */
+.chat-log-shell {
+  background:
+    linear-gradient(180deg, rgba(0, 0, 0, 0.15) 0%, rgba(0, 0, 0, 0.08) 100%),
+    rgba(6, 8, 12, 0.4);
+  border-radius: var(--r-sm);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+/* Chat form input: glass style */
+.chat-form input {
+  background:
+    linear-gradient(135deg, rgba(255, 255, 255, 0.04) 0%, transparent 100%),
+    rgba(8, 10, 16, 0.7);
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: var(--r-full);
+  backdrop-filter: blur(16px);
+  transition:
+    border-color var(--dur-2) var(--ease-out),
+    background var(--dur-2) var(--ease-out),
+    box-shadow var(--dur-2) var(--ease-out);
+}
+
+.chat-form input:focus {
+  border-color: rgba(129, 140, 248, 0.5);
+  background:
+    linear-gradient(135deg, rgba(129, 140, 248, 0.07) 0%, transparent 100%),
+    rgba(8, 10, 16, 0.8);
+  box-shadow: 0 0 0 3px rgba(129, 140, 248, 0.12);
+}
+
+/* Chat send button */
+.chat-form button[type="submit"] {
+  background: var(--accent-gradient);
+  border-radius: var(--r-full);
+  box-shadow: 0 2px 8px var(--accent-glow);
+  transition: all var(--dur-2) var(--ease-spring);
+}
+
+.chat-form button[type="submit"]:hover {
+  transform: scale(1.06);
+  box-shadow: 0 4px 16px var(--accent-glow);
+}
+
+.chat-form button[type="submit"]:active {
+  transform: scale(0.94);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .voice-button.connected { animation: none; }
+  .participant-row { animation: none; }
+  .room-sidebar,
+  .voice-card,
+  .chat-card { animation: none; }
+}
+
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   Cursor proximity glow — driven by --cursor-x / --cursor-y on :root
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
+:root {
+  --cursor-x: -500px;
+  --cursor-y: -500px;
+}
+
+/* Glow orb follows cursor beneath all interactive elements.
+   Position is driven by JS via insertRule(transform:translate) */
+#cursor-glow {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 220px;
+  height: 220px;
+  border-radius: 50%;
+  pointer-events: none;
+  z-index: 9999;
+  transform: translate(-500px, -500px);
+  background: radial-gradient(
+    circle at center,
+    rgba(129, 140, 248, 0.06) 0%,
+    rgba(129, 140, 248, 0.025) 42%,
+    transparent 72%
+  );
+  will-change: transform;
+}
+
+/* Stronger glow on interactive elements */
+button:hover ~ #cursor-glow,
+a:hover ~ #cursor-glow {
+  background: radial-gradient(
+    circle at center,
+    rgba(129, 140, 248, 0.09) 0%,
+    rgba(129, 140, 248, 0.035) 42%,
+    transparent 72%
+  );
+}
+
+/* Card-specific glow — tighter radius */
+.voice-card:hover,
+.chat-card:hover,
+.mode-card:hover,
+.source-card:hover {
+  --card-glow-x: var(--cursor-x);
+  --card-glow-y: var(--cursor-y);
+}

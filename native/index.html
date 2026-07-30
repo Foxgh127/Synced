@@ -6,8 +6,12 @@
       name="viewport"
       content="width=device-width, initial-scale=1.0, viewport-fit=cover"
     />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; base-uri 'none'; object-src 'none'; frame-src 'none'; form-action 'none'; script-src 'self' blob: 'wasm-unsafe-eval'; worker-src 'self' blob:; style-src 'self'; img-src 'self' data: blob:; media-src 'self' data: blob:; font-src 'self'; connect-src 'self' ws: wss: yiqikan-resource: http://localhost https://localhost"
+    />
     <meta name="theme-color" content="#07101f" />
-    <title>一起看</title>
+    <title>同频</title>
   </head>
   <body>
     <div id="app"></div>

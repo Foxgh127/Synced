@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body,
+      #overlay {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        overflow: hidden;
+        background: transparent;
+        pointer-events: none;
+        user-select: none;
+      }
+
+      .message {
+        --lane: 0;
+        position: absolute;
+        top: calc(5% + var(--lane) * 9%);
+        right: 0;
+        left: auto;
+        display: inline-flex;
+        max-width: 72%;
+        min-height: 34px;
+        align-items: center;
+        gap: 9px;
+        padding: 8px 15px;
+        border: 1px solid rgba(255, 255, 255, 0.34);
+        border-radius: 999px;
+        background: rgba(4, 7, 12, 0.76);
+        color: #fff;
+        font-family: "Microsoft YaHei", "Segoe UI", sans-serif;
+        font-size: clamp(17px, 1.75vw, 30px);
+        font-weight: 700;
+        line-height: 1.25;
+        white-space: nowrap;
+        text-shadow:
+          0 1px 4px rgba(0, 0, 0, 0.95);
+        will-change: transform;
+        animation: fly 10s linear forwards;
+      }
+
+      .message strong {
+        color: #f5c979;
+        font-size: 0.84em;
+      }
+
+      .message.mine {
+        border-color: rgba(57, 231, 211, 0.66);
+        background: rgba(8, 52, 54, 0.78);
+      }
+
+      .message.mine strong {
+        color: #79d3ee;
+      }
+
+      @keyframes fly {
+        from {
+          transform: translateX(100%);
+        }
+        to {
+          transform: translateX(calc(-100vw - 100%));
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .message {
+          right: auto;
+          left: 50%;
+          transform: translateX(-50%);
+          animation: static-fade 4200ms linear forwards;
+        }
+
+        @keyframes static-fade {
+          0%,
+          70% {
+            opacity: 1;
+          }
+          100% {
+            opacity: 0;
+          }
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="overlay"></div>
+    <script>
+      const root = document.querySelector("#overlay");
+      const speedPxPerSecond = 168;
+      const laneGapPx = 48;
+      const minLanePitchPx = 48;
+      const laneFreeAt = [];
+      const cleanupTimers = new Set();
+
+      function getLaneCount(containerHeight, lanePitch) {
+        return Math.max(
+          4,
+          Math.min(12, Math.floor(containerHeight * 0.58 / lanePitch)),
+        );
+      }
+
+      function pickLane(elementWidth, containerHeight, lanePitch) {
+        const laneCount = getLaneCount(containerHeight, lanePitch);
+        if (laneFreeAt.length > laneCount) laneFreeAt.length = laneCount;
+        while (laneFreeAt.length < laneCount) laneFreeAt.push(0);
+        const now = Date.now();
+        const travelMs =
+          ((elementWidth + laneGapPx) / speedPxPerSecond) * 1_000;
+        let bestLane = 0;
+        let bestFreeAt = Number.POSITIVE_INFINITY;
+        for (let lane = 0; lane < laneCount; lane += 1) {
+          const freeAt = laneFreeAt[lane] || 0;
+          if (freeAt < bestFreeAt) {
+            bestFreeAt = freeAt;
+            bestLane = lane;
+          }
+        }
+        if (bestFreeAt > now + 500) return -1;
+        laneFreeAt[bestLane] = now + travelMs;
+        return bestLane;
+      }
+
+      window.danmakuOverlay.onMessage((message) => {
+        const item = document.createElement("span");
+        item.className = `message ${message.mine ? "mine" : ""}`;
+
+        const author = document.createElement("strong");
+        author.textContent = message.nickname;
+        const content = document.createElement("span");
+        content.textContent = message.text;
+        item.append(author, content);
+        root.append(item);
+        requestAnimationFrame(() => {
+          if (!item.isConnected) return;
+          const width = Math.max(30, item.offsetWidth);
+          const lanePitch = Math.max(
+            minLanePitchPx,
+            Math.ceil(item.offsetHeight) + 12,
+          );
+          const lane = pickLane(
+            width,
+            Math.max(136, root.clientHeight),
+            lanePitch,
+          );
+          if (lane === -1) {
+            item.remove();
+            return;
+          }
+          const reducedMotion = matchMedia(
+            "(prefers-reduced-motion: reduce)",
+          ).matches;
+          const durationSeconds =
+            (Math.max(1, root.clientWidth) + width) / speedPxPerSecond;
+          item.style.setProperty("--lane", String(lane));
+          item.style.top = `calc(8% + ${lane * lanePitch}px)`;
+          item.style.animation = reducedMotion
+            ? "static-fade 4200ms linear forwards"
+            : `fly ${durationSeconds.toFixed(2)}s linear forwards`;
+          const remove = () => item.remove();
+          item.addEventListener("animationend", remove, { once: true });
+          const timer = setTimeout(() => {
+            cleanupTimers.delete(timer);
+            remove();
+          }, reducedMotion ? 4_700 : durationSeconds * 1_000 + 500);
+          cleanupTimers.add(timer);
+        });
+      });
+
+      window.danmakuOverlay.onClear(() => {
+        for (const timer of cleanupTimers) clearTimeout(timer);
+        cleanupTimers.clear();
+        laneFreeAt.length = 0;
+        root.replaceChildren();
+      });
+    </script>
+  </body>
+</html>
