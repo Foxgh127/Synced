@@ -7,7 +7,7 @@ const http = require("node:http");
 const path = require("node:path");
 const WebSocket = require("ws");
 
-const EXPECTED_VERSION = "2.9.0";
+const EXPECTED_VERSION = "2.9.1";
 const projectRoot = path.join(__dirname, "..");
 const packageJson = JSON.parse(
   fs.readFileSync(path.join(projectRoot, "package.json"), "utf8"),
@@ -35,7 +35,7 @@ const reportPath = path.join(
   artifactDirectory,
   `emby-${EXPECTED_VERSION}-${artifactStamp}.json`,
 );
-const searchProbe = "__synced_2_8_1_field_probe_no_match__";
+const searchProbe = "__synced_2_9_1_field_probe_no_match__";
 const CDP_CONNECT_TIMEOUT_MS = 8_000;
 const CDP_COMMAND_TIMEOUT_MS = 6_000;
 const CDP_SHUTDOWN_TIMEOUT_MS = 1_500;
@@ -680,7 +680,7 @@ async function main() {
       await evaluate(`(() => {
         const nickname = document.querySelector("#host-nickname");
         const channel = document.querySelector("#channel-name");
-        if (nickname && !nickname.value.trim()) nickname.value = "2.9.0 实地验收";
+        if (nickname && !nickname.value.trim()) nickname.value = "2.9.1 实地验收";
         if (channel && !channel.value.trim()) channel.value = "Emby 实地验收";
         nickname?.dispatchEvent(new Event("input", { bubbles: true }));
         channel?.dispatchEvent(new Event("input", { bubbles: true }));

@@ -1296,6 +1296,156 @@ test("viewer handshake separates control traffic and synchronizes initial play",
   await controller.destroy();
 });
 
+test("CMAF viewers keep media idle until a viewer-scoped partial-reliability fallback request", async (t) => {
+  const {
+    EMBY_CONTROL_CHANNEL_LABEL,
+    EMBY_DATA_CHANNEL_LABEL,
+    EmbyBroadcastController,
+  } = await loadModule();
+  const harness = createHarness([]);
+  const controller = new EmbyBroadcastController({
+    roomId: "ROOM",
+    video: harness.video,
+    notify: () => {},
+    onStatus: () => {},
+    onStreamReady: () => {},
+  });
+  t.after(() => controller.destroy());
+  controller.pipelineId = "pipeline-segment-fallback";
+  controller.plan = plan("segment-fallback");
+  controller.mimeType = 'video/mp4; codecs="avc1.640028,mp4a.40.2"';
+  controller.mediaVersion = 1;
+  controller.segmentDescriptor = {
+    protocol: "synced-cmaf-v1",
+    sessionId: controller.sessionId,
+    assetId: "0123456789abcdef0123456789abcdef01234567",
+    mediaVersion: 1,
+    manifestPath:
+      `/media/v1/rooms/ROOM/sessions/${controller.sessionId}/assets/` +
+      "0123456789abcdef0123456789abcdef01234567/versions/1/manifest.json",
+  };
+  const baseFragment = {
+    roomId: "ROOM",
+    sessionId: controller.sessionId,
+    mediaVersion: 1,
+    timestampMs: Date.now(),
+    mediaTimeMs: 0,
+    timelineTimeMs: 0,
+    trackType: "muxed",
+    keyframe: true,
+  };
+  controller.cache.setInit({
+    ...baseFragment,
+    sequence: 0,
+    data: Uint8Array.of(1, 2, 3),
+  });
+  controller.cache.add({
+    ...baseFragment,
+    sequence: 1,
+    data: Uint8Array.of(4, 5, 6),
+  });
+
+  class FakeChannel extends EventTarget {
+    binaryType = "arraybuffer";
+    bufferedAmountLowThreshold = 0;
+    bufferedAmount = 0;
+    readyState = "connecting";
+    sent = [];
+    constructor(label) {
+      super();
+      this.label = label;
+    }
+    open() {
+      this.readyState = "open";
+      this.dispatchEvent(new Event("open"));
+    }
+    send(value) {
+      this.sent.push(value);
+    }
+    close() {
+      if (this.readyState === "closed") return;
+      this.readyState = "closed";
+      this.dispatchEvent(new Event("close"));
+    }
+  }
+  const channels = [];
+  controller.attachViewer("viewer-segment-fallback", {
+    createDataChannel(label, options) {
+      const channel = new FakeChannel(label);
+      channel.options = options;
+      channels.push(channel);
+      return channel;
+    },
+  });
+  const media = channels.find(
+    (channel) => channel.label === EMBY_DATA_CHANNEL_LABEL,
+  );
+  const control = channels.find(
+    (channel) => channel.label === EMBY_CONTROL_CHANNEL_LABEL,
+  );
+  assert.deepEqual(media.options, { ordered: false, maxRetransmits: 1 });
+  assert.deepEqual(control.options, { ordered: true });
+  media.open();
+  control.open();
+  control.dispatchEvent(
+    new MessageEvent("message", {
+      data: JSON.stringify({
+        type: "session-ready",
+        sessionId: controller.sessionId,
+        mediaVersion: 1,
+        transportEpoch: 0,
+      }),
+    }),
+  );
+  await nextTurn();
+  assert.equal(
+    media.sent.length,
+    0,
+    "normal HTTPS CMAF playback carries only control over RTC",
+  );
+
+  control.dispatchEvent(
+    new MessageEvent("message", {
+      data: JSON.stringify({
+        type: "segment-fallback-request",
+        sessionId: controller.sessionId,
+        mediaVersion: 1,
+        targetTime: 0,
+      }),
+    }),
+  );
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.ok(
+    control.sent.some(
+      (value) =>
+        typeof value === "string" &&
+        JSON.parse(value).type === "resync",
+    ),
+  );
+  assert.ok(
+    media.sent.some((value) => value instanceof ArrayBuffer),
+    "the host primes its recent fragment cache only for the requesting viewer",
+  );
+  assert.equal(
+    controller.peers.get("viewer-segment-fallback").mediaFallbackActive,
+    true,
+  );
+
+  control.dispatchEvent(
+    new MessageEvent("message", {
+      data: JSON.stringify({
+        type: "segment-fallback-release",
+        sessionId: controller.sessionId,
+        mediaVersion: 1,
+      }),
+    }),
+  );
+  assert.equal(
+    controller.peers.get("viewer-segment-fallback").mediaFallbackActive,
+    false,
+  );
+});
+
 test("only the initial viewer barrier may wait; a late viewer never pauses active playback", async (t) => {
   const { EmbyBroadcastController } = await loadModule();
   const harness = createHarness([]);

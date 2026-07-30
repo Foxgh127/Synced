@@ -139,6 +139,16 @@ declare global {
         token: string;
         expiresAt: number;
       }) => Promise<{ updated: boolean; pipelineId: string }>;
+      embyUpdateRenditionDemand?: (input: {
+        original?: boolean;
+        low?: boolean;
+        availableUploadBps?: number;
+      }) => Promise<{
+        updated: boolean;
+        active: string[];
+        uploadBudgetBps: number;
+        pipelineId: string;
+      }>;
       embyReportPlayback: (input: {
         action: "start" | "progress" | "stop";
         positionTicks: number;

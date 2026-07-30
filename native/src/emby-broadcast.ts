@@ -61,6 +61,8 @@ interface PeerState {
   lastInitRequestAt: number;
   lastSyncPingAt: number;
   lastBufferStateAt: number;
+  mediaFallbackActive: boolean;
+  lastMediaFallbackAt: number;
 }
 
 interface PendingStart {
@@ -210,6 +212,7 @@ export class EmbyBroadcastController {
     access: SegmentRelayAccess;
   };
   private segmentDescriptor?: EmbySegmentSessionDescriptor;
+  private segmentRenditionDemandSignature = "";
 
   constructor(private readonly options: EmbyBroadcastControllerOptions) {
     const bridge = window.roomDesktop;
@@ -306,6 +309,34 @@ export class EmbyBroadcastController {
         })
         .catch(() => undefined);
     }
+  }
+
+  setSegmentRenditionDemand(input: {
+    original?: boolean;
+    low?: boolean;
+    availableUploadBps?: number;
+  }): void {
+    if (!this.segmentRelayActive || !this.bridge.embyUpdateRenditionDemand) {
+      return;
+    }
+    const normalized = {
+      original: input.original === true,
+      low: input.low === true,
+      ...(Number.isFinite(Number(input.availableUploadBps)) &&
+      Number(input.availableUploadBps) >= 0
+        ? { availableUploadBps: Number(input.availableUploadBps) }
+        : {}),
+    };
+    const signature = JSON.stringify(normalized);
+    if (signature === this.segmentRenditionDemandSignature) return;
+    this.segmentRenditionDemandSignature = signature;
+    void this.bridge
+      .embyUpdateRenditionDemand(normalized)
+      .catch(() => {
+        if (this.segmentRenditionDemandSignature === signature) {
+          this.segmentRenditionDemandSignature = "";
+        }
+      });
   }
 
   get localPlaybackDiagnostics() {
@@ -458,10 +489,12 @@ export class EmbyBroadcastController {
         assetId,
       };
       const manifestPath =
-        `${new URL(baseUrl).pathname}rooms/${this.options.roomId}/assets/` +
+        `${new URL(baseUrl).pathname}rooms/${this.options.roomId}/sessions/` +
+        `${this.sessionId}/assets/` +
         `${assetId}/versions/${this.mediaVersion}/manifest.json`;
       this.segmentDescriptor = {
         protocol: "synced-cmaf-v1",
+        sessionId: this.sessionId,
         assetId,
         mediaVersion: this.mediaVersion,
         manifestPath,
@@ -570,12 +603,16 @@ export class EmbyBroadcastController {
 
   attachViewer(viewerId: string, pc: RTCPeerConnection): RTCDataChannel {
     if (this.segmentDescriptor) {
+      const mediaChannel = pc.createDataChannel(EMBY_DATA_CHANNEL_LABEL, {
+        ordered: false,
+        maxRetransmits: 1,
+      });
       const controlChannel = pc.createDataChannel(
         EMBY_CONTROL_CHANNEL_LABEL,
         { ordered: true },
       );
-      this.attachTransport(viewerId, controlChannel, controlChannel);
-      return controlChannel;
+      this.attachTransport(viewerId, mediaChannel, controlChannel);
+      return mediaChannel;
     }
     const channel = pc.createDataChannel(EMBY_DATA_CHANNEL_LABEL, {
       // Avoid reliable SCTP retransmission stalls. The receiver's fragment
@@ -626,6 +663,8 @@ export class EmbyBroadcastController {
       lastInitRequestAt: 0,
       lastSyncPingAt: 0,
       lastBufferStateAt: 0,
+      mediaFallbackActive: false,
+      lastMediaFallbackAt: 0,
     };
     state.sender = new EmbyPeerSender(
       channel,
@@ -1260,12 +1299,25 @@ export class EmbyBroadcastController {
         memoryBudgetBytes: 320 * 1024 * 1024,
       };
       this.cache.configureLimits(
+        this.segmentDescriptor
+          ? Math.min(
+              60_000,
+              Math.max(
+                30_000,
+                Math.ceil(bufferProfile.maxSeconds * 1_000),
+              ),
+            )
+          : Math.min(
+              180_000,
+              Math.max(
+                60_000,
+                Math.ceil(bufferProfile.maxSeconds * 1_250),
+              ),
+            ),
         Math.min(
-          180_000,
-          Math.max(60_000, Math.ceil(bufferProfile.maxSeconds * 1_250)),
-        ),
-        Math.min(
-          320 * 1024 * 1024,
+          this.segmentDescriptor
+            ? 160 * 1024 * 1024
+            : 320 * 1024 * 1024,
           Math.max(
             96 * 1024 * 1024,
             Math.floor(bufferProfile.memoryBudgetBytes * 0.75),
@@ -1334,13 +1386,14 @@ export class EmbyBroadcastController {
       };
       this.cache.add(fragment);
       this.localPlayer.appendFragment(fragment);
-      if (!this.segmentDescriptor) {
-        for (const state of this.peers.values()) {
-          if (state.sessionReady) {
-            state.sender.sendFragment(fragment, {
-              transportEpoch: state.transportEpoch,
-            });
-          }
+      for (const state of this.peers.values()) {
+        if (
+          state.sessionReady &&
+          (!this.segmentDescriptor || state.mediaFallbackActive)
+        ) {
+          state.sender.sendFragment(fragment, {
+            transportEpoch: state.transportEpoch,
+          });
         }
       }
       // IPC can have fragments already in flight after stdout is paused. Use
@@ -1369,14 +1422,15 @@ export class EmbyBroadcastController {
       };
       this.cache.add(fragment);
       this.localPlayer.applySubtitle(event.subtitle.text);
-      if (!this.segmentDescriptor) {
-        for (const state of this.peers.values()) {
-          if (state.sessionReady) {
-            state.sender.sendFragment(fragment, {
-              priority: true,
-              transportEpoch: state.transportEpoch,
-            });
-          }
+      for (const state of this.peers.values()) {
+        if (
+          state.sessionReady &&
+          (!this.segmentDescriptor || state.mediaFallbackActive)
+        ) {
+          state.sender.sendFragment(fragment, {
+            priority: true,
+            transportEpoch: state.transportEpoch,
+          });
         }
       }
       return;
@@ -1590,7 +1644,7 @@ export class EmbyBroadcastController {
     clearQueuedMedia = false,
   ): void {
     if (!state.sessionReady) return;
-    if (this.segmentDescriptor) {
+    if (this.segmentDescriptor && !state.mediaFallbackActive) {
       this.broadcastPlaybackState(true);
       if (this.streamHasEnded) this.sendEndedToPeer(state);
       return;
@@ -1741,6 +1795,43 @@ export class EmbyBroadcastController {
       return;
     }
     if (!state.sessionReady) return;
+    if (message.type === "segment-fallback-request") {
+      if (
+        viewerId === "__sfu__" ||
+        !this.segmentDescriptor ||
+        !Number.isFinite(message.targetTime) ||
+        message.targetTime < 0 ||
+        message.targetTime > 30 * 24 * 60 * 60
+      ) {
+        return;
+      }
+      const now = Date.now();
+      if (
+        state.mediaFallbackActive &&
+        now - state.lastMediaFallbackAt < 1_000
+      ) {
+        return;
+      }
+      state.mediaFallbackActive = true;
+      state.lastMediaFallbackAt = now;
+      this.primeMediaForPeer(state, message.targetTime, true);
+      this.bridge.reportDiagnostic("emby-segment-media-fallback-started", {
+        viewerId,
+        mediaVersion: this.mediaVersion,
+        targetTime: message.targetTime,
+      });
+      return;
+    }
+    if (message.type === "segment-fallback-release") {
+      if (!state.mediaFallbackActive) return;
+      state.mediaFallbackActive = false;
+      state.sender.clearMediaQueue();
+      this.bridge.reportDiagnostic("emby-segment-media-fallback-released", {
+        viewerId,
+        mediaVersion: this.mediaVersion,
+      });
+      return;
+    }
     if (message.type === "catch-up") {
       if (viewerId === "__sfu__") {
         // The published SFU data track is shared by every subscriber. A

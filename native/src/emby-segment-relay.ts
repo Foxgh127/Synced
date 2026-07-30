@@ -11,7 +11,11 @@ import type { SegmentRelayAccess } from "./rtc";
 const MEBIBYTE = 1024 * 1024;
 const GIBIBYTE = 1024 * 1024 * 1024;
 const MAX_SEGMENT_BYTES = 96 * MEBIBYTE;
-const MANIFEST_POLL_MS = 650;
+const MANIFEST_URGENT_POLL_MS = 400;
+const MANIFEST_CHANGED_POLL_MS = 650;
+const MANIFEST_NORMAL_POLL_MS = 2_500;
+const MANIFEST_DEEP_BUFFER_POLL_MS = 5_000;
+const MANIFEST_FAILURE_MAX_BACKOFF_MS = 30_000;
 const FETCH_HEADER_TIMEOUT_MS = 10_000;
 const FETCH_BODY_IDLE_TIMEOUT_MS = 15_000;
 const FETCH_RANGE_RETRIES = 2;
@@ -21,6 +25,38 @@ const WARM_WINDOW_SECONDS = 120;
 const PREFETCH_BANDWIDTH_SHARE = 0.65;
 const MAX_BACKGROUND_CACHE_MARKERS = 20_000;
 const BACKGROUND_CACHE_MARKER_TRIM = 4_000;
+const MAX_PERSISTED_CACHE_ENTRIES = 10_000;
+const SEGMENT_GAP_EPSILON_MS = 250;
+
+class EmbyRelayHttpError extends Error {
+  constructor(
+    readonly status: number,
+    readonly resource: "manifest" | "segment",
+  ) {
+    super(`${resource} request failed with HTTP ${status}`);
+    this.name = "EmbyRelayHttpError";
+  }
+}
+
+export function embyManifestPollDelayMs(
+  bufferAheadSeconds: number,
+  consecutiveFailures: number,
+  manifestChanged: boolean,
+): number {
+  if (consecutiveFailures > 0) {
+    return Math.min(
+      MANIFEST_FAILURE_MAX_BACKOFF_MS,
+      MANIFEST_CHANGED_POLL_MS *
+        2 ** Math.min(6, consecutiveFailures - 1),
+    );
+  }
+  if (bufferAheadSeconds < 5) return MANIFEST_URGENT_POLL_MS;
+  if (manifestChanged && bufferAheadSeconds < 15) {
+    return MANIFEST_CHANGED_POLL_MS;
+  }
+  if (bufferAheadSeconds >= 45) return MANIFEST_DEEP_BUFFER_POLL_MS;
+  return MANIFEST_NORMAL_POLL_MS;
+}
 
 export interface EmbySegmentManifestEntry {
   sequence: number;
@@ -44,6 +80,9 @@ export interface EmbyRenditionManifest {
   switchGroup: string;
   initPath: string;
   segments: EmbySegmentManifestEntry[];
+  ended?: boolean;
+  finalSequence?: number;
+  finalTimelineEndMs?: number;
 }
 
 export interface EmbySegmentManifest {
@@ -56,6 +95,7 @@ export interface EmbySegmentManifest {
   startTimeTicks: number;
   runtimeTicks?: number;
   updatedAt: number;
+  playbackTimeMs?: number;
   ended?: boolean;
   subtitle?: {
     path: string;
@@ -82,6 +122,9 @@ export interface EmbyAbrDiagnostics {
   appendedSegments: number;
   warmedSegments: number;
   prefetchedSegments: number;
+  upgradeFailures: number;
+  relayFallbackActive: boolean;
+  consecutiveRelayFailures: number;
   lastError?: string;
 }
 
@@ -142,7 +185,8 @@ function manifestUrl(
   descriptor: EmbySegmentSessionDescriptor,
 ): URL {
   const expected =
-    `${baseUrl.pathname}rooms/${encodeURIComponent(roomId)}/assets/` +
+    `${baseUrl.pathname}rooms/${encodeURIComponent(roomId)}/sessions/` +
+    `${encodeURIComponent(descriptor.sessionId)}/assets/` +
     `${descriptor.assetId}/versions/${descriptor.mediaVersion}/manifest.json`;
   const url = new URL(expected, baseUrl);
   if (
@@ -245,7 +289,8 @@ export function parseEmbySegmentManifest(
   }
   const renditions: EmbyRenditionManifest[] = [];
   const versionRoot =
-    `/media/v1/rooms/${expected.roomId}/assets/${expected.assetId}/` +
+    `/media/v1/rooms/${expected.roomId}/sessions/${input.sessionId}/` +
+    `assets/${expected.assetId}/` +
     `versions/${expected.mediaVersion}/`;
   const renditionIds = new Set<string>();
   for (const candidate of input.renditions) {
@@ -300,6 +345,15 @@ export function parseEmbySegmentManifest(
     if (uniqueSequences.size !== segments.length) {
       throw new Error("分片清单包含重复序号");
     }
+    if (
+      segments.some(
+        (segment, index) =>
+          index > 0 &&
+          segment.sequence !== segments[index - 1].sequence + 1,
+      )
+    ) {
+      throw new Error("分片清单包含不连续序号");
+    }
     renditionIds.add(renditionId);
     renditions.push({
       id: renditionId,
@@ -315,6 +369,17 @@ export function parseEmbySegmentManifest(
       ),
       initPath,
       segments,
+      ended: rendition.ended === true,
+      finalSequence:
+        Number.isSafeInteger(Number(rendition.finalSequence)) &&
+        Number(rendition.finalSequence) >= 1
+          ? Number(rendition.finalSequence)
+          : undefined,
+      finalTimelineEndMs:
+        Number.isFinite(Number(rendition.finalTimelineEndMs)) &&
+        Number(rendition.finalTimelineEndMs) >= 0
+          ? Number(rendition.finalTimelineEndMs)
+          : undefined,
     });
   }
   return {
@@ -330,6 +395,10 @@ export function parseEmbySegmentManifest(
         ? undefined
         : Math.max(0, finite(input.runtimeTicks)),
     updatedAt: Math.max(0, finite(input.updatedAt)),
+    playbackTimeMs:
+      input.playbackTimeMs === undefined
+        ? undefined
+        : Math.max(0, finite(input.playbackTimeMs)),
     ended: input.ended === true,
     subtitle:
       input.subtitle &&
@@ -406,6 +475,7 @@ export function selectEmbyAbrRendition(
     bufferAheadSeconds: number;
     stableForMs: number;
     upgradeHoldRemainingMs: number;
+    upgradeFailureCount?: number;
   },
 ): EmbyRenditionManifest {
   const ordered = [...renditions].sort(
@@ -426,7 +496,11 @@ export function selectEmbyAbrRendition(
   const safeBitrate = Math.max(0, input.throughputBps / headroom);
   const eligible = ordered.filter(
     (item) =>
-      item.bitrate <= safeBitrate && item.height <= preferredHeight,
+      item.bitrate <= safeBitrate &&
+      item.height <= preferredHeight &&
+      (item.id !== "original" ||
+        (input.bufferAheadSeconds >= 20 &&
+          input.throughputBps >= item.bitrate * 1.5)),
   );
   let selected =
     eligible.at(-1) ||
@@ -436,7 +510,12 @@ export function selectEmbyAbrRendition(
   if (selected.bitrate < current.bitrate) return selected;
   if (selected.bitrate === current.bitrate) return current;
   if (
-    input.stableForMs < ABR_UPGRADE_STABLE_MS ||
+    input.stableForMs <
+      Math.min(
+        60_000,
+        ABR_UPGRADE_STABLE_MS +
+          Math.max(0, finite(input.upgradeFailureCount)) * 10_000,
+      ) ||
     input.upgradeHoldRemainingMs > 0 ||
     input.throughputBps < selected.bitrate * 1.5
   ) {
@@ -459,20 +538,37 @@ export function updateEmbyThroughputEstimate(
 
 class BrowserSegmentCache implements SegmentCacheLike {
   private readonly entries = new Map<string, CachedEntry>();
-  private cache?: Cache;
-  private memory = new Map<string, Uint8Array>();
+  private readonly memory = new Map<string, Uint8Array>();
   private bytes = 0;
   private budgetBytes = 256 * MEBIBYTE;
-  private initialized?: Promise<void>;
+  private cachePromise?: Promise<Cache | undefined>;
+  private metadataPromise?: Promise<IDBDatabase | undefined>;
+  private backgroundIndexStarted = false;
+  private closed = false;
 
   constructor(
     private readonly cacheStorage: CacheStorage | undefined =
       globalThis.caches,
   ) {}
 
-  private ensureInitialized(): Promise<void> {
-    if (this.initialized) return this.initialized;
-    this.initialized = (async () => {
+  private openCache(): Promise<Cache | undefined> {
+    if (this.cachePromise) return this.cachePromise;
+    this.cachePromise = this.cacheStorage
+      ? this.cacheStorage
+          .open("synced-emby-segments-v1")
+          .then((cache) => {
+            this.startBackgroundIndex(cache);
+            return cache;
+          })
+          .catch(() => undefined)
+      : Promise.resolve(undefined);
+    return this.cachePromise;
+  }
+
+  private startBackgroundIndex(cache: Cache): void {
+    if (this.backgroundIndexStarted || this.closed) return;
+    this.backgroundIndexStarted = true;
+    void (async () => {
       try {
         const estimate = await navigator.storage?.estimate?.();
         const quota = finite(estimate?.quota);
@@ -486,38 +582,194 @@ class BrowserSegmentCache implements SegmentCacheLike {
       } catch {
         // The conservative fallback remains bounded.
       }
-      if (!this.cacheStorage) return;
-      this.cache = await this.cacheStorage.open(
-        "synced-emby-segments-v1",
-      );
-      const keys = await this.cache.keys();
-      const discarded = keys.slice(0, Math.max(0, keys.length - 10_000));
-      await Promise.all(
-        discarded.map((request) => this.cache!.delete(request)),
-      );
-      for (const request of keys.slice(-10_000)) {
-        const response = await this.cache.match(request);
-        const bytes = finite(response?.headers.get("content-length"));
-        this.entries.set(request.url, {
-          key: request.url,
-          bytes,
-          lastAccess: Date.now(),
-        });
-        this.bytes += bytes;
+      const persisted = await this.readMetadata();
+      if (persisted.length) {
+        for (const entry of persisted) {
+          const current = this.entries.get(entry.key);
+          if (!current || current.lastAccess < entry.lastAccess) {
+            this.entries.set(entry.key, entry);
+          }
+        }
+        this.recalculateBytes();
+        const retained = new Set(this.entries.keys());
+        const keys = await cache.keys();
+        await Promise.all(
+          keys
+            .filter((request) => !retained.has(request.url))
+            .map((request) => cache.delete(request)),
+        );
+      } else {
+        // Migration from the original CacheStorage-only index happens in the
+        // background. A foreground exact match never waits for this scan.
+        const keys = await cache.keys();
+        const discarded = keys.slice(
+          0,
+          Math.max(0, keys.length - MAX_PERSISTED_CACHE_ENTRIES),
+        );
+        await Promise.all(discarded.map((request) => cache.delete(request)));
+        const kept = keys.slice(-MAX_PERSISTED_CACHE_ENTRIES);
+        for (let offset = 0; offset < kept.length; offset += 32) {
+          await Promise.all(
+            kept.slice(offset, offset + 32).map(async (request) => {
+              const response = await cache.match(request);
+              if (!response) return;
+              const entry = {
+                key: request.url,
+                bytes: Math.max(
+                  0,
+                  finite(response.headers.get("content-length")),
+                ),
+                lastAccess: Math.max(
+                  0,
+                  finite(response.headers.get("x-synced-cached-at")),
+                ) || Date.now(),
+              };
+              const current = this.entries.get(entry.key);
+              if (!current || current.lastAccess <= entry.lastAccess) {
+                this.entries.set(entry.key, entry);
+                void this.persistMetadata(entry);
+              }
+            }),
+          );
+        }
+        this.recalculateBytes();
       }
-      await this.evict();
-    })();
-    return this.initialized;
+      await this.pruneMetadataCount();
+      await this.evict(cache);
+    })().catch(() => undefined);
+  }
+
+  private openMetadata(): Promise<IDBDatabase | undefined> {
+    if (this.metadataPromise) return this.metadataPromise;
+    if (typeof globalThis.indexedDB === "undefined") {
+      this.metadataPromise = Promise.resolve(undefined);
+      return this.metadataPromise;
+    }
+    this.metadataPromise = new Promise((resolve) => {
+      const request = globalThis.indexedDB.open(
+        "synced-emby-cache-index-v1",
+        1,
+      );
+      request.onupgradeneeded = () => {
+        const database = request.result;
+        if (!database.objectStoreNames.contains("entries")) {
+          const store = database.createObjectStore("entries", {
+            keyPath: "key",
+          });
+          store.createIndex("lastAccess", "lastAccess");
+        }
+      };
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => resolve(undefined);
+      request.onblocked = () => resolve(undefined);
+    });
+    return this.metadataPromise;
+  }
+
+  private async readMetadata(): Promise<CachedEntry[]> {
+    const database = await this.openMetadata();
+    if (!database) return [];
+    return new Promise((resolve) => {
+      const transaction = database.transaction("entries", "readonly");
+      const entries: CachedEntry[] = [];
+      let settled = false;
+      const finish = (): void => {
+        if (settled) return;
+        settled = true;
+        resolve(entries.sort((left, right) => left.lastAccess - right.lastAccess));
+      };
+      const request = transaction
+        .objectStore("entries")
+        .index("lastAccess")
+        .openCursor(null, "prev");
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (!cursor || entries.length >= MAX_PERSISTED_CACHE_ENTRIES) {
+          finish();
+          return;
+        }
+        const entry = cursor.value as Partial<CachedEntry>;
+        if (
+          typeof entry?.key === "string" &&
+          Number.isFinite(entry.bytes) &&
+          Number.isFinite(entry.lastAccess)
+        ) {
+          entries.push({
+            key: entry.key,
+            bytes: Number(entry.bytes),
+            lastAccess: Number(entry.lastAccess),
+          });
+        }
+        cursor.continue();
+      };
+      request.onerror = finish;
+      transaction.onabort = finish;
+      transaction.oncomplete = finish;
+    });
+  }
+
+  private async pruneMetadataCount(): Promise<void> {
+    const database = await this.openMetadata();
+    if (!database) return;
+    await new Promise<void>((resolve) => {
+      const transaction = database.transaction("entries", "readwrite");
+      const request = transaction
+        .objectStore("entries")
+        .index("lastAccess")
+        .openCursor(null, "prev");
+      let count = 0;
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (!cursor) return;
+        count += 1;
+        if (count > MAX_PERSISTED_CACHE_ENTRIES) cursor.delete();
+        cursor.continue();
+      };
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => resolve();
+      transaction.onabort = () => resolve();
+    });
+  }
+
+  private async persistMetadata(entry: CachedEntry): Promise<void> {
+    const database = await this.openMetadata();
+    if (!database || this.closed) return;
+    await new Promise<void>((resolve) => {
+      const transaction = database.transaction("entries", "readwrite");
+      transaction.objectStore("entries").put(entry);
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => resolve();
+      transaction.onabort = () => resolve();
+    });
+  }
+
+  private async deleteMetadata(key: string): Promise<void> {
+    const database = await this.openMetadata();
+    if (!database) return;
+    await new Promise<void>((resolve) => {
+      const transaction = database.transaction("entries", "readwrite");
+      transaction.objectStore("entries").delete(key);
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => resolve();
+      transaction.onabort = () => resolve();
+    });
+  }
+
+  private recalculateBytes(): void {
+    this.bytes = [...this.entries.values()].reduce(
+      (total, entry) => total + Math.max(0, entry.bytes),
+      0,
+    );
   }
 
   async get(url: string): Promise<Uint8Array | undefined> {
-    await this.ensureInitialized();
     const memory = this.memory.get(url);
     if (memory) {
       this.touch(url, memory.byteLength);
       return memory.slice();
     }
-    const response = await this.cache?.match(url);
+    const cache = await this.openCache();
+    const response = await cache?.match(url);
     if (!response) return undefined;
     const data = new Uint8Array(await response.arrayBuffer());
     this.touch(url, data.byteLength);
@@ -525,31 +777,34 @@ class BrowserSegmentCache implements SegmentCacheLike {
   }
 
   async put(url: string, data: Uint8Array, headers?: Headers): Promise<void> {
-    await this.ensureInitialized();
     this.touch(url, data.byteLength);
-    if (this.cache) {
+    const cache = await this.openCache();
+    if (cache) {
       const responseHeaders = new Headers(headers);
       responseHeaders.set("content-length", String(data.byteLength));
       responseHeaders.set("x-synced-cached-at", String(Date.now()));
-      await this.cache.put(
+      await cache.put(
         url,
         new Response(data.slice(), { headers: responseHeaders }),
       );
     } else {
       this.memory.set(url, data.slice());
     }
-    await this.evict();
+    await this.evict(cache);
   }
 
   async delete(url: string): Promise<void> {
-    await this.ensureInitialized();
     const previous = this.entries.get(url);
     if (previous) {
       this.entries.delete(url);
       this.bytes = Math.max(0, this.bytes - previous.bytes);
     }
     this.memory.delete(url);
-    await this.cache?.delete(url);
+    const cache = await this.openCache();
+    await Promise.all([
+      cache?.delete(url),
+      this.deleteMetadata(url),
+    ]);
   }
 
   private touch(key: string, bytes: number): void {
@@ -557,23 +812,36 @@ class BrowserSegmentCache implements SegmentCacheLike {
     if (previous) this.bytes = Math.max(0, this.bytes - previous.bytes);
     this.bytes += bytes;
     this.entries.delete(key);
-    this.entries.set(key, { key, bytes, lastAccess: Date.now() });
+    const entry = { key, bytes, lastAccess: Date.now() };
+    this.entries.set(key, entry);
+    void this.persistMetadata(entry);
   }
 
-  private async evict(): Promise<void> {
+  private async evict(cache?: Cache): Promise<void> {
     for (const [key, entry] of this.entries) {
-      if (this.bytes <= this.budgetBytes) break;
+      if (
+        this.bytes <= this.budgetBytes &&
+        this.entries.size <= MAX_PERSISTED_CACHE_ENTRIES
+      ) {
+        break;
+      }
       this.entries.delete(key);
       this.bytes = Math.max(0, this.bytes - entry.bytes);
       this.memory.delete(key);
-      await this.cache?.delete(key);
+      await Promise.all([
+        cache?.delete(key),
+        this.deleteMetadata(key),
+      ]);
     }
   }
 
   async close(): Promise<void> {
+    this.closed = true;
     this.memory.clear();
     this.entries.clear();
     this.bytes = 0;
+    const database = await this.openMetadata();
+    database?.close();
   }
 }
 
@@ -630,6 +898,8 @@ export class EmbyAbrSegmentClient {
     ) || 8_000_000;
   private stableSince = performance.now();
   private upgradeHoldUntil = 0;
+  private lastUpgradeAt = 0;
+  private upgradeFailures = 0;
   private deliverySequence = 0;
   private appended = new Set<string>();
   private appendedTimelineEndMs = 0;
@@ -642,6 +912,15 @@ export class EmbyAbrSegmentClient {
   private requiresKeyframe = true;
   private baselineNetworkRttMs?: number;
   private appliedSubtitlePath = "";
+  private endedSignaled = false;
+  private manifestEtag = "";
+  private lastManifest?: EmbySegmentManifest;
+  private consecutiveManifestFailures = 0;
+  private relayFallbackActive = false;
+  private relayFallbackRequested = false;
+  private relayRecoverySuccesses = 0;
+  private relayRecoveryNotified = false;
+  private forceRenditionResync = false;
   private diagnosticsState: EmbyAbrDiagnostics = {
     active: false,
     estimatedThroughputBps: 0,
@@ -652,6 +931,9 @@ export class EmbyAbrSegmentClient {
     appendedSegments: 0,
     warmedSegments: 0,
     prefetchedSegments: 0,
+    upgradeFailures: 0,
+    relayFallbackActive: false,
+    consecutiveRelayFailures: 0,
   };
   private readonly handleSegmentRecovery = (event: Event): void => {
     const detail = (
@@ -688,6 +970,13 @@ export class EmbyAbrSegmentClient {
       cache?: SegmentCacheLike;
       onTokenExpiring?: () => void;
       onDiagnostic?: (diagnostics: EmbyAbrDiagnostics) => void;
+      onMediaFallbackNeeded?: (detail: {
+        targetTime: number;
+        sessionId: string;
+        mediaVersion: number;
+        reason: string;
+      }) => void;
+      onRelayRecovered?: () => void;
     },
   ) {
     this.access = options.access;
@@ -736,6 +1025,53 @@ export class EmbyAbrSegmentClient {
         : undefined;
   }
 
+  matchesSession(
+    session: EmbyPlayerSession,
+    descriptor: EmbySegmentSessionDescriptor,
+  ): boolean {
+    return (
+      this.diagnosticsState.active &&
+      this.session?.sessionId === session.sessionId &&
+      this.session.mediaVersion === session.mediaVersion &&
+      this.descriptor?.sessionId === descriptor.sessionId &&
+      this.descriptor.assetId === descriptor.assetId &&
+      this.descriptor.mediaVersion === descriptor.mediaVersion
+    );
+  }
+
+  activateMediaFallback(): void {
+    if (!this.session || !this.controller) return;
+    this.relayFallbackActive = true;
+    this.relayFallbackRequested = true;
+    this.relayRecoverySuccesses = 0;
+    this.relayRecoveryNotified = false;
+    this.forceRenditionResync = false;
+    this.diagnosticsState.relayFallbackActive = true;
+    this.mediaFetchController?.abort("relay-media-fallback");
+  }
+
+  resumeHttps(): void {
+    if (!this.session || !this.controller) return;
+    this.relayFallbackActive = false;
+    this.relayFallbackRequested = false;
+    this.relayRecoverySuccesses = 0;
+    this.relayRecoveryNotified = false;
+    this.forceRenditionResync = true;
+    this.consecutiveManifestFailures = 0;
+    this.diagnosticsState.relayFallbackActive = false;
+    this.diagnosticsState.consecutiveRelayFailures = 0;
+    this.fetchGeneration += 1;
+    this.recoveryTargetTime = Math.max(
+      0,
+      this.options.player.currentTime,
+    );
+    this.appended.clear();
+    this.appendedTimelineEndMs = this.recoveryTargetTime * 1_000;
+    this.requiresKeyframe = true;
+    this.manifestEtag = "";
+    this.renewMediaFetchController(this.controller.signal);
+  }
+
   start(
     session: EmbyPlayerSession,
     descriptor: EmbySegmentSessionDescriptor,
@@ -761,9 +1097,20 @@ export class EmbyAbrSegmentClient {
         : undefined;
     this.appendedTimelineEndMs = requestedStartTime * 1_000;
     this.appliedSubtitlePath = "";
+    this.endedSignaled = false;
+    this.manifestEtag = "";
+    this.lastManifest = undefined;
+    this.consecutiveManifestFailures = 0;
+    this.relayFallbackActive = false;
+    this.relayFallbackRequested = false;
+    this.relayRecoverySuccesses = 0;
+    this.relayRecoveryNotified = false;
+    this.forceRenditionResync = false;
     this.currentRendition = undefined;
     this.stableSince = performance.now();
     this.upgradeHoldUntil = 0;
+    this.lastUpgradeAt = 0;
+    this.upgradeFailures = 0;
     this.lastObservedPlaybackTime = this.options.player.currentTime;
     this.diagnosticsState = {
       active: true,
@@ -775,6 +1122,9 @@ export class EmbyAbrSegmentClient {
       appendedSegments: 0,
       warmedSegments: 0,
       prefetchedSegments: 0,
+      upgradeFailures: 0,
+      relayFallbackActive: false,
+      consecutiveRelayFailures: 0,
     };
     void this.run(this.controller.signal);
   }
@@ -792,6 +1142,11 @@ export class EmbyAbrSegmentClient {
     this.recoveryTargetTime = undefined;
     this.requiresKeyframe = true;
     this.backgroundCaching = false;
+    this.relayFallbackActive = false;
+    this.relayFallbackRequested = false;
+    this.relayRecoverySuccesses = 0;
+    this.relayRecoveryNotified = false;
+    this.forceRenditionResync = false;
     this.diagnosticsState.active = false;
     if (closeCache) void this.cache.close();
   }
@@ -815,34 +1170,127 @@ export class EmbyAbrSegmentClient {
 
   private async run(signal: AbortSignal): Promise<void> {
     while (!signal.aborted && this.session && this.descriptor) {
+      let manifestChanged = false;
       try {
         if (this.access.expiresAt - Date.now() < 2 * 60_000) {
           this.options.onTokenExpiring?.();
         }
-        const manifest = await this.fetchManifest(signal);
+        const result = await this.fetchManifest(signal);
+        const manifest = result.manifest;
+        manifestChanged = result.changed;
         if (signal.aborted) return;
-        await this.applyManifestSubtitle(manifest, signal);
-        await this.fillPlaybackBuffer(manifest, signal);
-        this.maybeCacheAhead(
-          this.mediaFetchController?.signal || signal,
-          this.fetchGeneration,
-        );
+        if (this.relayFallbackActive) {
+          const recovered = await this.probeRelayRecovery(manifest, signal);
+          this.relayRecoverySuccesses = recovered
+            ? this.relayRecoverySuccesses + 1
+            : 0;
+          if (
+            this.relayRecoverySuccesses >= 3 &&
+            !this.relayRecoveryNotified
+          ) {
+            this.relayRecoveryNotified = true;
+            this.options.onRelayRecovered?.();
+          }
+        } else {
+          await this.applyManifestSubtitle(manifest, signal);
+          await this.fillPlaybackBuffer(manifest, signal);
+          this.maybeCacheAhead(
+            this.mediaFetchController?.signal || signal,
+            this.fetchGeneration,
+          );
+        }
         this.diagnosticsState.lastError = undefined;
+        this.consecutiveManifestFailures = 0;
+        this.diagnosticsState.consecutiveRelayFailures = 0;
       } catch (error) {
         if (signal.aborted) return;
         this.diagnosticsState.lastError =
           error instanceof Error ? error.message : String(error);
         this.lastRebufferAt = performance.now();
         this.stableSince = performance.now();
+        this.consecutiveManifestFailures = Math.min(
+          20,
+          this.consecutiveManifestFailures + 1,
+        );
+        this.diagnosticsState.consecutiveRelayFailures =
+          this.consecutiveManifestFailures;
+        if (
+          this.consecutiveManifestFailures >= 3 &&
+          !this.relayFallbackRequested &&
+          this.session
+        ) {
+          this.relayFallbackRequested = true;
+          this.options.onMediaFallbackNeeded?.({
+            targetTime: Math.max(
+              0,
+              this.options.player.currentTime,
+              this.recoveryTargetTime || 0,
+            ),
+            sessionId: this.session.sessionId,
+            mediaVersion: this.session.mediaVersion,
+            reason:
+              error instanceof Error ? error.message : String(error),
+          });
+        }
       }
       this.options.onDiagnostic?.(this.diagnostics);
-      await abortableDelay(signal, MANIFEST_POLL_MS);
+      await abortableDelay(
+        signal,
+        embyManifestPollDelayMs(
+          this.options.player.bufferedAhead,
+          this.consecutiveManifestFailures,
+          manifestChanged,
+        ),
+      );
     }
+  }
+
+  private async probeRelayRecovery(
+    manifest: EmbySegmentManifest,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    const rendition =
+      manifest.renditions.find(
+        (candidate) => candidate.id === this.currentRendition?.id,
+      ) ||
+      [...manifest.renditions].sort(
+        (left, right) => left.bitrate - right.bitrate,
+      )[0];
+    if (!rendition) return false;
+    const currentMs = Math.max(0, this.options.player.currentTime * 1_000);
+    const segment =
+      embySegmentTimelineWindow(
+        rendition.segments,
+        Math.max(0, currentMs - 2_000),
+        currentMs + 30_000,
+      ).find((candidate) => candidate.keyframe) ||
+      rendition.segments.at(-1);
+    if (!segment) return manifest.ended === true;
+    const url = mediaUrl(this.baseUrl, segment.path);
+    return this.withResponseDeadlines(
+      url,
+      {
+        method: "HEAD",
+        headers: {
+          authorization: `Bearer ${this.access.token}`,
+          accept: "video/iso.segment",
+        },
+        cache: "no-store",
+      },
+      signal,
+      async (response) => {
+        if (response.status === 401 || response.status === 403) {
+          this.options.onTokenExpiring?.();
+          return false;
+        }
+        return response.ok;
+      },
+    );
   }
 
   private async fetchManifest(
     signal: AbortSignal,
-  ): Promise<EmbySegmentManifest> {
+  ): Promise<{ manifest: EmbySegmentManifest; changed: boolean }> {
     if (!this.descriptor) throw new Error("分片会话尚未建立");
     const url = manifestUrl(
       this.baseUrl,
@@ -855,13 +1303,19 @@ export class EmbyAbrSegmentClient {
         headers: {
           authorization: `Bearer ${this.access.token}`,
           accept: "application/json",
+          ...(this.manifestEtag
+            ? { "if-none-match": this.manifestEtag }
+            : {}),
         },
-        cache: "no-store",
+        cache: "no-cache",
       },
       signal,
       async (response, controller) => {
+        if (response.status === 304 && this.lastManifest) {
+          return { manifest: this.lastManifest, changed: false };
+        }
         if (response.status === 404) {
-          throw new Error("分片清单尚未就绪");
+          throw new EmbyRelayHttpError(404, "manifest");
         }
         if (response.status === 401 || response.status === 403) {
           this.options.onTokenExpiring?.();
@@ -907,7 +1361,7 @@ export class EmbyAbrSegmentClient {
           bytes.set(chunk, offset);
           offset += chunk.byteLength;
         }
-        return parseEmbySegmentManifest(
+        const manifest = parseEmbySegmentManifest(
           JSON.parse(new TextDecoder().decode(bytes)),
           {
             roomId: this.session!.roomId,
@@ -916,6 +1370,9 @@ export class EmbyAbrSegmentClient {
             sessionId: this.session!.sessionId,
           },
         );
+        this.manifestEtag = response.headers.get("etag") || "";
+        this.lastManifest = manifest;
+        return { manifest, changed: true };
       },
     );
   }
@@ -964,22 +1421,51 @@ export class EmbyAbrSegmentClient {
       bufferAheadSeconds: this.options.player.bufferedAhead,
       stableForMs: now - this.stableSince,
       upgradeHoldRemainingMs: Math.max(0, this.upgradeHoldUntil - now),
+      upgradeFailureCount: this.upgradeFailures,
     });
-    if (selected.id !== this.currentRendition?.id) {
+    if (
+      selected.id !== this.currentRendition?.id ||
+      this.forceRenditionResync
+    ) {
       const upgrading =
+        !this.forceRenditionResync &&
         Boolean(this.currentRendition) &&
         selected.bitrate > this.currentRendition!.bitrate;
+      const downgrading =
+        !this.forceRenditionResync &&
+        Boolean(this.currentRendition) &&
+        selected.bitrate < this.currentRendition!.bitrate;
       await this.switchRendition(
         selected,
         fetchSignal,
         fetchGeneration,
       );
-      if (upgrading) this.upgradeHoldUntil = now + ABR_UPGRADE_HOLD_MS;
+      this.forceRenditionResync = false;
+      if (upgrading) {
+        this.upgradeHoldUntil = now + ABR_UPGRADE_HOLD_MS;
+        this.lastUpgradeAt = now;
+      } else if (
+        downgrading &&
+        this.lastUpgradeAt > 0 &&
+        now - this.lastUpgradeAt <= ABR_UPGRADE_HOLD_MS
+      ) {
+        this.upgradeFailures = Math.min(4, this.upgradeFailures + 1);
+        this.diagnosticsState.upgradeFailures = this.upgradeFailures;
+      }
       this.stableSince = now;
     } else {
       // Every manifest is a fresh immutable snapshot. Keep the selected
       // rendition object current so newly uploaded segments become visible.
       this.currentRendition = selected;
+      if (
+        this.upgradeFailures > 0 &&
+        now - this.lastUpgradeAt >= 60_000 &&
+        now - this.lastRebufferAt >= 60_000
+      ) {
+        this.upgradeFailures -= 1;
+        this.diagnosticsState.upgradeFailures = this.upgradeFailures;
+        this.lastUpgradeAt = now;
+      }
     }
     const rendition = this.currentRendition;
     if (
@@ -1020,17 +1506,83 @@ export class EmbyAbrSegmentClient {
       ) {
         break;
       }
-      await this.appendSegment(
-        rendition,
-        segment,
-        fetchSignal,
-        fetchGeneration,
-      );
+      if (
+        !this.requiresKeyframe &&
+        this.appendedTimelineEndMs > 0 &&
+        segment.timelineTimeMs >
+          this.appendedTimelineEndMs + SEGMENT_GAP_EPSILON_MS
+      ) {
+        this.armManifestGapRecovery(
+          `清单时间线存在 ${Math.round(
+            segment.timelineTimeMs - this.appendedTimelineEndMs,
+          )} ms 空洞`,
+          currentTime,
+        );
+        throw new Error("分片清单存在时间空洞，已停止追加并刷新清单");
+      }
+      try {
+        await this.appendSegment(
+          rendition,
+          segment,
+          fetchSignal,
+          fetchGeneration,
+        );
+      } catch (error) {
+        if (
+          error instanceof EmbyRelayHttpError &&
+          error.status === 404
+        ) {
+          this.armManifestGapRecovery(
+            "清单引用的分片已不存在",
+            currentTime,
+          );
+        }
+        throw error;
+      }
     }
+    this.maybeMarkEnded(manifest, rendition);
     if (this.options.player.bufferedAhead < 1.5) {
       this.lastRebufferAt = now;
       this.stableSince = now;
     }
+  }
+
+  private armManifestGapRecovery(reason: string, targetTime: number): void {
+    this.manifestEtag = "";
+    this.lastManifest = undefined;
+    this.requiresKeyframe = true;
+    this.recoveryTargetTime = Math.max(0, targetTime);
+    this.appendedTimelineEndMs = Math.max(0, targetTime * 1_000);
+    this.stableSince = performance.now();
+    this.diagnosticsState.lastError = reason;
+  }
+
+  private maybeMarkEnded(
+    manifest: EmbySegmentManifest,
+    rendition: EmbyRenditionManifest,
+  ): void {
+    if (
+      this.endedSignaled ||
+      !manifest.ended ||
+      !rendition.ended ||
+      this.requiresKeyframe
+    ) {
+      return;
+    }
+    const finalSequence = rendition.finalSequence;
+    const finalTimelineEndMs = rendition.finalTimelineEndMs;
+    const finalAppended =
+      finalSequence === undefined ||
+      this.appended.has(`${rendition.id}:${finalSequence}`);
+    const timelineComplete =
+      finalTimelineEndMs === undefined ||
+      this.appendedTimelineEndMs + 50 >= finalTimelineEndMs;
+    if (!finalAppended || !timelineComplete) return;
+    this.endedSignaled = true;
+    // HTTPS delivery has its own rendition-local sequence space. RTC fragment
+    // boundaries are intentionally ignored; the authoritative CMAF manifest
+    // closes MSE only after this rendition's final segment is appended.
+    this.options.player.markEnded();
   }
 
   private async applyManifestSubtitle(
@@ -1077,21 +1629,25 @@ export class EmbyAbrSegmentClient {
     const needsMediaSourceRebuild =
       !previous ||
       previous.mimeType !== rendition.mimeType ||
-      previous.switchGroup !== rendition.switchGroup;
+      previous.switchGroup !== rendition.switchGroup ||
+      this.options.player.activeSession?.mimeType !== rendition.mimeType;
+    const plan = {
+      ...this.session.plan,
+      width: rendition.width,
+      height: rendition.height,
+      frameRate: rendition.frameRate,
+      bitrate: rendition.bitrate,
+    };
+    this.session = {
+      ...this.session,
+      mimeType: rendition.mimeType,
+      plan,
+    };
+    // configure() updates the ABR plan and buffer budget in place when the
+    // codec is compatible, and rebuilds MediaSource only when the P2P
+    // emergency stream used a different MIME type.
+    this.options.player.configure(this.session);
     if (needsMediaSourceRebuild) {
-      const plan = {
-        ...this.session.plan,
-        width: rendition.width,
-        height: rendition.height,
-        frameRate: rendition.frameRate,
-        bitrate: rendition.bitrate,
-      };
-      this.session = {
-        ...this.session,
-        mimeType: rendition.mimeType,
-        plan,
-      };
-      this.options.player.configure(this.session);
       this.deliverySequence = 0;
       this.appended.clear();
       this.appendedTimelineEndMs = Math.max(
@@ -1359,6 +1915,9 @@ export class EmbyAbrSegmentClient {
               this.options.onTokenExpiring?.();
               throw new Error("分片访问凭证已过期");
             }
+            if (response.status === 404) {
+              throw new EmbyRelayHttpError(404, "segment");
+            }
             if (received > 0 && response.status === 200) {
               // Some otherwise valid HTTP caches ignore Range. Restart from
               // byte zero instead of concatenating a duplicate prefix.
@@ -1368,7 +1927,7 @@ export class EmbyAbrSegmentClient {
               throw new Error(`分片续传被拒绝（${response.status}）`);
             }
             if (!response.ok) {
-              throw new Error(`分片请求失败（${response.status}）`);
+              throw new EmbyRelayHttpError(response.status, "segment");
             }
             responseHeaders = response.headers;
             const receivedBeforeBody = received;
@@ -1436,7 +1995,13 @@ export class EmbyAbrSegmentClient {
         );
         break;
       } catch (error) {
-        if (signal.aborted || attempt >= FETCH_RANGE_RETRIES) throw error;
+        if (
+          signal.aborted ||
+          attempt >= FETCH_RANGE_RETRIES ||
+          (error instanceof EmbyRelayHttpError && error.status === 404)
+        ) {
+          throw error;
+        }
         this.diagnosticsState.rangeRetries += 1;
       }
     }

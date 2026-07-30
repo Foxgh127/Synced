@@ -457,7 +457,13 @@ export async function openChannelSession(
   const failedVideoCodecsByViewer = new Map<string, Set<string>>();
   const receiverPreferences = new Map<
     string,
-    { height?: number; frameRate?: number }
+    {
+      height?: number;
+      frameRate?: number;
+      originalDemand?: boolean;
+      lowDemand?: boolean;
+      availableDownloadBps?: number;
+    }
   >();
   let watcherPc: RTCPeerConnection | undefined;
   let retainedWatcherPc: RTCPeerConnection | undefined;
@@ -614,6 +620,9 @@ export async function openChannelSession(
   let lastEmbyHostDiagnosticAt = 0;
   let embyViewer: EmbyMsePlayer | undefined;
   let embyAbrViewer: EmbyAbrSegmentClient | undefined;
+  let embyFallbackMediaChannel: RTCDataChannel | undefined;
+  let embySegmentFallbackActive = false;
+  let embySegmentFallbackTargetTime = 0;
   let embyLogin: EmbyAccount | undefined;
   let embyAccounts: EmbyAccount[] = [];
   let embyActiveAccountId = "";
@@ -4606,22 +4615,25 @@ export async function openChannelSession(
       Math.max(0, fresh.downloadKbps) *
       1_000 *
       (fresh.networkType === "cellular" || fresh.metered ? 0.5 : 0.62);
-    const relayConstrained =
-      fresh.directReachable === false ||
-      networkAdvice.routeMode === "relay-preferred";
     if (
       safeDownloadBps >= 15_000_000 &&
-      !relayConstrained &&
+      !fresh.metered &&
       fresh.networkType !== "cellular"
     ) {
-      return 1_080;
+      // HTTPS CMAF ABR is independent from P2P reachability. Leaving the
+      // height unbounded lets the rendition actor select original only after
+      // it measures 1.5x bitrate headroom and has a healthy forward buffer.
+      return 0;
     }
     if (fresh.networkType === "cellular" || fresh.metered) {
       return safeDownloadBps >= 3_200_000 ? 480 : 360;
     }
-    if (safeDownloadBps >= 7_500_000) return 720;
-    if (safeDownloadBps >= 3_200_000) return 480;
-    return 360;
+    // A fixed 720p ceiling duplicates the ABR bitrate decision and prevents a
+    // healthy-but-not-exceptional fixed connection from reaching 1080p. Keep
+    // 1080p available here; the rendition actor still requires measured 1.5x
+    // bitrate headroom before it upgrades.
+    if (safeDownloadBps >= 3_200_000) return 1_080;
+    return 480;
   }
 
   function effectiveEmbyViewerHeight(): number | undefined {
@@ -4704,6 +4716,32 @@ export async function openChannelSession(
       signalFeatures.has("emby-segment-relay-v1")
     ) {
       embyAbrViewer?.setPreferredHeight(requestedHeight);
+      // The height remains a local ABR ceiling. The publisher only consumes
+      // this advisory request to wake or idle independent CMAF producers; it
+      // never rebuilds the shared preview pipeline in segment-relay mode.
+      safeSignalSend({
+        type: "quality:request",
+        height: requestedHeight,
+        frameRate: preferredFrameRate || undefined,
+        originalDemand:
+          requestedHeight === undefined &&
+          detectEmbyMediaCapabilities().desktop &&
+          Boolean(
+            networkReport &&
+              Date.now() - networkReport.measuredAt <= 5 * 60_000 &&
+              !networkReport.metered &&
+              networkReport.networkType !== "cellular" &&
+              networkReport.downloadKbps * 1_000 * 0.62 >=
+                15_000_000,
+          ),
+        lowDemand:
+          requestedHeight !== undefined && requestedHeight <= 480,
+        availableDownloadBps:
+          networkReport &&
+          Date.now() - networkReport.measuredAt <= 5 * 60_000
+            ? Math.max(0, networkReport.downloadKbps) * 1_000
+            : undefined,
+      });
       if (showFeedback) {
         notify(
           `已仅为当前设备设置 Emby ABR 上限：${
@@ -4986,14 +5024,19 @@ export async function openChannelSession(
       retainedRemoteStream = undefined;
     }
     remoteStream = nextStream || new MediaStream();
-    embyAbrViewer?.destroy();
-    embyAbrViewer = undefined;
-    embyViewer?.destroy();
-    embyViewer = undefined;
-    embyBufferedAhead = 0;
-    embyStartupBufferProgressAt = 0;
-    embyStartupLastBufferAhead = 0;
-    remoteFirstFrame = false;
+    const preserveEmbyDataPlane =
+      broadcastCapabilities?.mode === "emby" &&
+      Boolean(embyViewer && embyAbrViewer?.diagnostics.active);
+    if (!preserveEmbyDataPlane) {
+      embyAbrViewer?.destroy();
+      embyAbrViewer = undefined;
+      embyViewer?.destroy();
+      embyViewer = undefined;
+      embyBufferedAhead = 0;
+      embyStartupBufferProgressAt = 0;
+      embyStartupLastBufferAhead = 0;
+      remoteFirstFrame = false;
+    }
     sfuScreenFrameSnapshot = undefined;
     sfuScreenReceiverSnapshot = undefined;
     resetViewerMediaLiveness();
@@ -5040,6 +5083,33 @@ export async function openChannelSession(
     }
   }
 
+  function activatePendingEmbySegmentFallback(
+    player: EmbyMsePlayer,
+  ): boolean {
+    const channel = embyFallbackMediaChannel;
+    if (
+      !channel ||
+      channel.readyState !== "open" ||
+      embyViewer !== player ||
+      !embyAbrViewer?.diagnostics.relayFallbackActive
+    ) {
+      return false;
+    }
+    embySegmentFallbackActive =
+      player.enableDataChannelSegmentFallback(
+        channel,
+        embySegmentFallbackTargetTime ||
+          Math.max(0, player.currentTime),
+      );
+    if (embySegmentFallbackActive) {
+      setStatus(
+        "HTTPS 分片服务波动 · P2P 媒体应急链路已接管",
+        "neutral",
+      );
+    }
+    return embySegmentFallbackActive;
+  }
+
   function attachSegmentRelayViewer(
     player: EmbyMsePlayer,
     isActive: () => boolean,
@@ -5058,12 +5128,18 @@ export async function openChannelSession(
           session: NonNullable<EmbyMsePlayer["activeSession"]>;
           descriptor: {
             protocol: "synced-cmaf-v1";
+            sessionId: string;
             assetId: string;
             mediaVersion: number;
             manifestPath: string;
           };
         }>
       ).detail;
+      if (embyAbrViewer?.matchesSession(detail.session, detail.descriptor)) {
+        embyAbrViewer.updateAccess(segmentRelayAccess);
+        embyAbrViewer.setPreferredHeight(effectiveEmbyViewerHeight());
+        return;
+      }
       player.enableExternalSegmentTransport();
       embyAbrViewer?.destroy();
       const abr = new EmbyAbrSegmentClient({
@@ -5071,6 +5147,43 @@ export async function openChannelSession(
         signalUrl,
         access: segmentRelayAccess,
         onTokenExpiring: requestSegmentRelayTokenRefresh,
+        onMediaFallbackNeeded: (fallback) => {
+          if (!isActive() || embyAbrViewer !== abr || leaving) return;
+          embySegmentFallbackTargetTime = fallback.targetTime;
+          abr.activateMediaFallback();
+          reportPlaybackDiagnostic("emby-segment-fallback-requested", {
+            reason: fallback.reason,
+            mediaVersion: fallback.mediaVersion,
+            targetTime: Number(fallback.targetTime.toFixed(3)),
+          });
+          if (activatePendingEmbySegmentFallback(player)) return;
+          if (sfuViewerActive) {
+            void fallbackFromSfu(
+              "HTTPS 分片服务暂不可用，正在建立 P2P 媒体应急链路",
+            );
+          } else {
+            void beginP2PWatching(true);
+          }
+        },
+        onRelayRecovered: () => {
+          if (
+            !isActive() ||
+            embyAbrViewer !== abr
+          ) {
+            return;
+          }
+          if (embySegmentFallbackActive) {
+            player.releaseDataChannelSegmentFallback();
+          }
+          player.enableExternalSegmentTransport();
+          embySegmentFallbackActive = false;
+          abr.resumeHttps();
+          resetViewerMediaLiveness();
+          setStatus("HTTPS 独立 ABR 已稳定恢复", "ready");
+          reportPlaybackDiagnostic("emby-segment-fallback-released", {
+            mediaVersion: player.activeSession?.mediaVersion,
+          });
+        },
         onDiagnostic: (diagnostics) => {
           if (!isActive() || embyAbrViewer !== abr) return;
           const mediaProgress =
@@ -5102,6 +5215,7 @@ export async function openChannelSession(
       abr.setPreferredHeight(effectiveEmbyViewerHeight());
       abr.start(detail.session, detail.descriptor);
       reportPlaybackDiagnostic("emby-segment-abr-started", {
+        sessionId: detail.descriptor.sessionId,
         assetId: detail.descriptor.assetId,
         mediaVersion: detail.descriptor.mediaVersion,
       });
@@ -5113,6 +5227,14 @@ export async function openChannelSession(
     controlChannel: RTCDataChannel,
   ): void {
     if (!video) throw new Error("Emby viewer video element is unavailable");
+    if (embyViewer) {
+      embyViewer.attachControlChannel(controlChannel);
+      if (!embyAbrViewer?.diagnostics.active) {
+        embyViewer.attachChannel(mediaChannel);
+      }
+      resetViewerMediaLiveness();
+      return;
+    }
     const player = new EmbyMsePlayer({
       video,
       host: false,
@@ -5127,7 +5249,10 @@ export async function openChannelSession(
     video.volume = movieVolume;
     video.autoplay = true;
     video.playsInline = true;
-    const active = () => sfuViewerActive && embyViewer === player;
+    const active = () =>
+      embyViewer === player &&
+      broadcastCapabilities?.mode === "emby" &&
+      !leaving;
     attachSegmentRelayViewer(player, active);
     player.addEventListener("session", (event) => {
       if (!active()) return;
@@ -5237,7 +5362,10 @@ export async function openChannelSession(
     if (
       !expectedBroadcasterId ||
       expectedBroadcasterId === selfId ||
-      !sfuAccess
+      !sfuAccess ||
+      (broadcastCapabilities?.mode === "emby" &&
+        (embySegmentFallbackActive ||
+          embyAbrViewer?.diagnostics.relayFallbackActive))
     ) {
       return false;
     }
@@ -5386,10 +5514,12 @@ export async function openChannelSession(
       return;
     }
     clearSfuStabilityTimer(true);
-    embyAbrViewer?.destroy();
-    embyAbrViewer = undefined;
-    embyViewer?.destroy();
-    embyViewer = undefined;
+    if (broadcastCapabilities?.mode !== "emby") {
+      embyAbrViewer?.destroy();
+      embyAbrViewer = undefined;
+      embyViewer?.destroy();
+      embyViewer = undefined;
+    }
     watchAttempts = 0;
     setStatus(reason, "neutral");
     reportPlaybackDiagnostic("sfu-runtime-fallback", {
@@ -5655,13 +5785,17 @@ export async function openChannelSession(
         remoteStream.getTracks().forEach((track) => track.stop());
       }
       remoteStream = new MediaStream();
-      embyAbrViewer?.destroy();
-      embyAbrViewer = undefined;
-      embyViewer?.destroy();
-      embyViewer = undefined;
-      embyBufferedAhead = 0;
-      embyStartupBufferProgressAt = 0;
-      embyStartupLastBufferAhead = 0;
+      embyFallbackMediaChannel = undefined;
+      embySegmentFallbackActive = false;
+      if (broadcastCapabilities?.mode !== "emby") {
+        embyAbrViewer?.destroy();
+        embyAbrViewer = undefined;
+        embyViewer?.destroy();
+        embyViewer = undefined;
+        embyBufferedAhead = 0;
+        embyStartupBufferProgressAt = 0;
+        embyStartupLastBufferAhead = 0;
+      }
       if (broadcastCapabilities?.mode === "emby") {
         peer.addEventListener("datachannel", (event) => {
           if (
@@ -5673,6 +5807,31 @@ export async function openChannelSession(
           ) {
             event.channel.close();
             return;
+          }
+          if (event.channel.label === EMBY_DATA_CHANNEL_LABEL) {
+            embyFallbackMediaChannel = event.channel;
+            const activateFallback = () => {
+              if (
+                watcherPc === peer &&
+                embyFallbackMediaChannel === event.channel &&
+                embyViewer
+              ) {
+                activatePendingEmbySegmentFallback(embyViewer);
+              }
+            };
+            event.channel.addEventListener("open", activateFallback, {
+              once: true,
+            });
+            event.channel.addEventListener(
+              "close",
+              () => {
+                if (embyFallbackMediaChannel === event.channel) {
+                  embyFallbackMediaChannel = undefined;
+                  embySegmentFallbackActive = false;
+                }
+              },
+              { once: true },
+            );
           }
           let player = embyViewer;
           if (!player) {
@@ -5686,7 +5845,10 @@ export async function openChannelSession(
             embyViewer = player;
             attachSegmentRelayViewer(
               player,
-              () => watcherPc === peer && embyViewer === player,
+              () =>
+                embyViewer === player &&
+                broadcastCapabilities?.mode === "emby" &&
+                !leaving,
             );
             if (video) {
               video.muted = !soundEnabled;
@@ -5701,7 +5863,11 @@ export async function openChannelSession(
                 plan: EmbyStreamPlan;
               }>
             ).detail;
-            if (watcherPc !== peer || embyViewer !== player) return;
+            if (
+              embyViewer !== player ||
+              broadcastCapabilities?.mode !== "emby" ||
+              leaving
+            ) return;
             embyStartupBufferProgressAt = Date.now();
             embyStartupLastBufferAhead = 0;
             const bufferingDetail =
@@ -5719,12 +5885,20 @@ export async function openChannelSession(
             updateEmbyViewerTimeline();
           });
             player.addEventListener("ready", () => {
-            if (watcherPc === peer && embyViewer === player) {
+            if (
+              embyViewer === player &&
+              broadcastCapabilities?.mode === "emby" &&
+              !leaving
+            ) {
               confirmEmbyPlaybackReady();
             }
           });
             player.addEventListener("buffer", (bufferEvent) => {
-            if (watcherPc !== peer || embyViewer !== player) return;
+            if (
+              embyViewer !== player ||
+              broadcastCapabilities?.mode !== "emby" ||
+              leaving
+            ) return;
             const detail = (
               bufferEvent as CustomEvent<{
                 aheadSeconds: number;
@@ -5776,7 +5950,11 @@ export async function openChannelSession(
             }
           });
           player.addEventListener("playbackstate", (playbackEvent) => {
-            if (watcherPc !== peer || embyViewer !== player) return;
+            if (
+              embyViewer !== player ||
+              broadcastCapabilities?.mode !== "emby" ||
+              leaving
+            ) return;
             const detail = (
               playbackEvent as CustomEvent<{
                 paused: boolean;
@@ -5809,7 +5987,11 @@ export async function openChannelSession(
             }
           });
             player.addEventListener("error", (errorEvent) => {
-            if (watcherPc !== peer || embyViewer !== player) return;
+            if (
+              embyViewer !== player ||
+              broadcastCapabilities?.mode !== "emby" ||
+              leaving
+            ) return;
             const message =
               (errorEvent as CustomEvent<string>).detail ||
               "Emby 编码片段无法播放";
@@ -5825,6 +6007,14 @@ export async function openChannelSession(
           }
           if (event.channel.label === EMBY_CONTROL_CHANNEL_LABEL) {
             player.attachControlChannel(event.channel);
+            event.channel.addEventListener(
+              "open",
+              () => activatePendingEmbySegmentFallback(player!),
+              { once: true },
+            );
+            activatePendingEmbySegmentFallback(player);
+          } else if (embyAbrViewer?.diagnostics.active) {
+            activatePendingEmbySegmentFallback(player);
           } else {
             player.attachChannel(event.channel);
           }
@@ -6102,6 +6292,9 @@ export async function openChannelSession(
     embyAbrViewer = undefined;
     embyViewer?.destroy();
     embyViewer = undefined;
+    embyFallbackMediaChannel = undefined;
+    embySegmentFallbackActive = false;
+    embySegmentFallbackTargetTime = 0;
     watcherPc?.close();
     watcherPc = undefined;
     clearSfuStabilityTimer(true);
@@ -6171,6 +6364,7 @@ export async function openChannelSession(
     }
     failedVideoCodecsByViewer.delete(viewerId);
     receiverPreferences.delete(viewerId);
+    updateEmbySegmentRenditionDemand();
     const pressureRemoved =
       embyPressureQualityByViewer.delete(viewerId);
     if (pressureRemoved) scheduleEmbyPressureRecovery();
@@ -8272,6 +8466,7 @@ export async function openChannelSession(
       };
       networkReport = report;
       measuredAvailableOutgoingBitrate = report.uploadKbps * 1_000;
+      updateEmbySegmentRenditionDemand();
       sendNetworkReportWhenAllowed();
       if (
         broadcastCapabilities?.mode === "emby" &&
@@ -9838,7 +10033,15 @@ export async function openChannelSession(
     );
   }
 
+  function independentEmbyCmafRelayAvailable(): boolean {
+    return (
+      signalFeatures.has("emby-segment-relay-v1") &&
+      segmentRelayAccess?.scope === "publish"
+    );
+  }
+
   function embyUplinkCount(viewers = embyViewerCount()): number {
+    if (independentEmbyCmafRelayAvailable()) return 1;
     if (!sfuSession.publishing) return Math.max(1, viewers);
     const p2pFallbacks = [...outboundPeers.values()].filter(
       (peer) =>
@@ -9947,6 +10150,23 @@ export async function openChannelSession(
     if (!source) return "1080p-8";
     const video = source.streams.find((stream) => stream.type === "Video");
     const height = video?.height || 1080;
+    const sourceBitrate = Math.max(0, Number(source.bitrate) || 0);
+    if (independentEmbyCmafRelayAvailable()) {
+      // The host preview and emergency cache are no longer multiplied by the
+      // number of viewers. Keep Auto on a broadly decodable preview profile;
+      // independent rendition actors and each viewer's measured HTTPS ABR
+      // decide whether original is warranted.
+      if (
+        sourceBitrate > 0 &&
+        sourceBitrate <= 8_000_000 &&
+        embySourceCanUseOriginal(source, allowHevc)
+      ) {
+        return "original";
+      }
+      if (height > 720) return "1080p-8";
+      if (height > 480) return "720p-4";
+      return "480p-2.5";
+    }
     const available = embyBudget().mediaPerViewer;
     if (
       source.bitrate &&
@@ -10015,6 +10235,31 @@ export async function openChannelSession(
     const requested = quality.value as EmbyPlaybackRequest["quality"] | "auto";
     const resolved = budgetSafeQuality(requested);
     const perViewer = embyQualityBitrate(resolved, source);
+    if (independentEmbyCmafRelayAvailable()) {
+      const freshNetworkReport =
+        networkReport &&
+        Date.now() - networkReport.measuredAt <= 5 * 60_000
+          ? networkReport
+          : undefined;
+      const uploadBudget = freshNetworkReport
+        ? Math.max(
+            1,
+            freshNetworkReport.uploadKbps * 1_000 -
+              (2_000_000 +
+                Math.max(0, participants.size - 1) * 350_000),
+          ) * 0.65
+        : undefined;
+      budget.textContent =
+        `HTTPS CMAF 独立 ABR · 主播预览 ${embyQualityLabels[resolved]}；` +
+        "默认生产 1080p8 / 720p4，原画与弱网档按观看需求启停；" +
+        `辅助分片共享上行${
+          uploadBudget
+            ? `最多 ${formatBitrate(uploadBudget)}（测速上行 65%）`
+            : "按测速结果限制到上行 65%"
+        }`;
+      budget.classList.remove("warning");
+      return;
+    }
     const viewerCount = embyViewerCount();
     const {
       overhead,
@@ -10095,6 +10340,10 @@ export async function openChannelSession(
     reason: string,
     forcedQuality?: EmbyPlaybackRequest["quality"],
   ): void {
+    // Viewer count and per-viewer preferences only affect independent CMAF
+    // rendition demand. Rebuilding the shared host preview here would change
+    // mediaVersion and discard every viewer's otherwise healthy cache.
+    if (embyBroadcast?.segmentRelayActive) return;
     if (
       localBroadcastMode !== "emby" ||
       broadcasterId !== selfId ||
@@ -10138,12 +10387,76 @@ export async function openChannelSession(
     }, forcedQuality ? 120 : 650);
   }
 
+  function updateEmbySegmentRenditionDemand(): void {
+    const controller = embyBroadcast;
+    if (
+      !controller?.segmentRelayActive ||
+      localBroadcastMode !== "emby" ||
+      broadcasterId !== selfId
+    ) {
+      return;
+    }
+    let original = false;
+    let low = false;
+    const originalBitrate =
+      Math.max(0, Number(selectedEmbyMediaSource()?.bitrate) || 0);
+    for (const [viewerId, preference] of receiverPreferences) {
+      const participant = participants.get(viewerId);
+      if (!participant || viewerId === selfId) continue;
+      const height = Number(preference.height);
+      if (
+        preference.lowDemand === true ||
+        (Number.isFinite(height) && height > 0 && height <= 480)
+      ) {
+        low = true;
+      }
+      if (
+        preference.originalDemand === true &&
+        participant.embyCapabilities?.desktop === true &&
+        (originalBitrate <= 0 ||
+          Number(preference.availableDownloadBps) >=
+            originalBitrate * 1.5)
+      ) {
+        original = true;
+      }
+    }
+    const freshNetworkReport =
+      networkReport &&
+      Date.now() - networkReport.measuredAt <= 5 * 60_000
+        ? networkReport
+        : undefined;
+    controller.setSegmentRenditionDemand({
+      original,
+      low,
+      ...(freshNetworkReport
+        ? {
+            availableUploadBps:
+              Math.max(
+                0,
+                Math.max(0, freshNetworkReport.uploadKbps) * 1_000 -
+                  (2_000_000 +
+                    Math.max(0, participants.size - 1) * 350_000),
+              ),
+          }
+        : {}),
+    });
+  }
+
   function scheduleEmbyViewerPreference(
     viewerId: string,
-    preference: { height?: number; frameRate?: number },
+    preference: {
+      height?: number;
+      frameRate?: number;
+      originalDemand?: boolean;
+      lowDemand?: boolean;
+      availableDownloadBps?: number;
+    },
   ): void {
     receiverPreferences.set(viewerId, preference);
-    if (embyBroadcast?.segmentRelayActive) return;
+    if (embyBroadcast?.segmentRelayActive) {
+      updateEmbySegmentRenditionDemand();
+      return;
+    }
     if (embyViewerPreferenceTimer !== undefined) {
       window.clearTimeout(embyViewerPreferenceTimer);
     }
@@ -10685,6 +10998,7 @@ export async function openChannelSession(
             durationTicks: detail.plan.runtimeTicks,
           };
           setBroadcastCapabilities(capabilities);
+          updateEmbySegmentRenditionDemand();
           if (broadcasterId === selfId) {
             try {
               safeSignalSend({
@@ -10726,6 +11040,7 @@ export async function openChannelSession(
         durationTicks: stream.plan.runtimeTicks,
       };
       setBroadcastCapabilities(capabilities);
+      updateEmbySegmentRenditionDemand();
       await boundedUiOperation(
         window.roomDesktop.setCaptureActive(true),
         3_000,
@@ -10741,6 +11056,7 @@ export async function openChannelSession(
         !safeSignalSend({
           type: "broadcast:start",
           broadcastCapabilities: capabilities,
+          sessionId: controller.sessionId,
         })
       ) {
         throw new Error("信令连接已断开，无法取得放映权");
@@ -11482,6 +11798,8 @@ export async function openChannelSession(
         segmentRelayAccess = undefined;
         embyAbrViewer?.destroy();
         embyAbrViewer = undefined;
+        embySegmentFallbackActive = false;
+        embySegmentFallbackTargetTime = 0;
       }
       reportedSfuPublisherActive = undefined;
       reportedSfuViewerActive = undefined;
@@ -11551,6 +11869,7 @@ export async function openChannelSession(
             receiverPreferences.delete(viewerId);
           }
         }
+        updateEmbySegmentRenditionDemand();
       }
       networkAdvice = fallbackNetworkAdvice(
         Math.max(1, participants.size),
@@ -11688,6 +12007,9 @@ export async function openChannelSession(
             type: "broadcast:start",
             broadcastCapabilities:
               broadcastCapabilities || retainedCapabilities,
+            ...(localBroadcastMode === "emby" && embyBroadcast
+              ? { sessionId: embyBroadcast.sessionId }
+              : {}),
           })) {
             scheduleSignalReconnect(true);
           }
@@ -11800,6 +12122,7 @@ export async function openChannelSession(
         scheduleMembershipNetworkProbe();
       }
       updateEmbyBudget();
+      updateEmbySegmentRenditionDemand();
       if (embyViewerCount() !== previousEmbyViewerCount) {
         scheduleEmbyQualityRebalance(
           "频道人数变化，正在重新分配每路码率",
@@ -11825,6 +12148,7 @@ export async function openChannelSession(
       if (message.broadcastCapabilities) {
         setBroadcastCapabilities(message.broadcastCapabilities);
       }
+      updateEmbySegmentRenditionDemand();
       companion?.setBroadcaster(selfId);
       syncDesktopDanmaku();
       if (broadcastCapabilities?.mode === "emby") {
@@ -12059,6 +12383,9 @@ export async function openChannelSession(
       const preference = {
         height: message.height,
         frameRate: message.frameRate,
+        originalDemand: message.originalDemand === true,
+        lowDemand: message.lowDemand === true,
+        availableDownloadBps: message.availableDownloadBps,
       };
       if (broadcastCapabilities?.mode === "emby") {
         scheduleEmbyViewerPreference(message.viewerId, preference);

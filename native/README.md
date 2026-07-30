@@ -30,14 +30,16 @@ WebRTC P2P，严格 NAT 下再使用腾讯云 TURN。Emby 则生成多档 GOP �
   其次 Direct Stream；客户端同时声明 fMP4 HLS、MPEG-TS HLS 和渐进式 MP4。
   首次协商或启动失败时会自动改用 MPEG-TS 兼容档并关闭视频流拷贝重试；需要兼容
   或限码时只让 Emby 服务器统一转码一次。
-- Emby 媒体由本机 FFmpeg 生成共享时间轴、约 2 秒 GOP 对齐的 CMAF 分片，并行提供
-  original/1080p/720p/480p（受源能力与硬件编码器探测约束）。放映端磁盘 spool
-  有界预生成并上传到 `/media/v1/`；观看端以 Urgent/Warm/Prefetch 三队列独立 ABR
-  拉取，Range/正文空闲超时会真正中止并重试。一级内存只保存即将追加的片段，
+- Emby 媒体由本机 FFmpeg 生成共享时间轴、约 2 秒 GOP 对齐的 CMAF 分片。默认启动
+  1080p8/720p4，original 与 480p18 根据观看端实际需求启停；所有辅助 producer 限速，
+  共享上传最多使用测速后剩余上行的 65%。放映端磁盘 spool 按随机 `sessionId` 隔离，
+  同档严格串行上传且清单只公开连续分片前缀；独立退避 actor 会在中继恢复后自动补传。
+  观看端以 Urgent/Warm/Prefetch 三队列独立 ABR 拉取，清单使用 ETag/304，Range/正文
+  空闲超时会真正中止并重试，时间洞和 404 会刷新清单并从关键帧恢复。一级内存只保存即将追加的片段，
   二级磁盘缓存默认按可用空间 4%、最高 5 GiB，三级 SourceBuffer 只保留播放点附近；
-  seek 和画质切换使用 generation/AbortController，且只从真实关键帧开始。LiveKit
-  DataTrack/P2P DataChannel 仅保留播放、暂停、seek、时钟、清单刷新等控制面；
-  不再承载 Emby 连续媒体字节，因此单个弱网观看端不会拖慢生产者或其他观看端。
+  seek 和画质切换使用 generation/AbortController，且只从真实关键帧开始。正常情况下
+  LiveKit/P2P 只承载控制面；HTTPS 连续失败三次时，仅故障观看端临时接收主播最近
+  30–60 秒的部分可靠 P2P 媒体缓存，三次恢复探测成功后热切回原 HTTPS ABR/MSE。
 - Windows 观看端可启用实际的 WebGL2 GPU 空间增强（视频纹理缩放与保守锐化，
   无 GPU→CPU→GPU 回读）。它只用于远端 Emby 360p–1080p 放大到接近 2K/4K，
   字幕和弹幕在增强后合成；SR p95 超过 14 ms、解码丢帧、资源压力、上下文丢失或

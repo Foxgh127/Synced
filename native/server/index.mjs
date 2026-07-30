@@ -2109,8 +2109,15 @@ export function createSignalServer(options = {}) {
       const member = clients.get(memberId)?.state;
       if (member) member.sfuViewerActive = false;
     }
+    if (room.segmentSessionId) {
+      segmentRelay.deactivateSession(
+        room.code || broadcaster?.room || "",
+        room.segmentSessionId,
+      );
+    }
     room.broadcasterId = undefined;
     room.broadcastCapabilities = undefined;
+    room.segmentSessionId = undefined;
     broadcastRoom(room, {
       type: "broadcast:stopped",
       broadcasterId,
@@ -2551,11 +2558,13 @@ export function createSignalServer(options = {}) {
             return;
           }
           room = {
+            code: roomCode,
             ownerId: undefined,
             ownerKey,
             members: new Set(),
             broadcasterId: undefined,
             broadcastCapabilities: undefined,
+            segmentSessionId: undefined,
             networkAdviceRevision: 0,
             networkAdviceByRecipient: new Map(),
             lastNetworkAdviceAt: 0,
@@ -2813,11 +2822,13 @@ export function createSignalServer(options = {}) {
         state.protocol = "legacy-host";
         clearTimeout(joinTimer);
         const room = {
+          code: roomCode,
           ownerId: clientId,
           ownerKey: undefined,
           members: new Set([clientId]),
           broadcasterId: clientId,
           broadcastCapabilities: undefined,
+          segmentSessionId: undefined,
           networkAdviceRevision: 0,
           networkAdviceByRecipient: new Map(),
           lastNetworkAdviceAt: 0,
@@ -3163,6 +3174,28 @@ export function createSignalServer(options = {}) {
         }
         room.broadcasterId = clientId;
         room.broadcastCapabilities = broadcastCapabilities;
+        const requestedSegmentSessionId = cleanText(
+          message.sessionId,
+          128,
+        ).toLowerCase();
+        const nextSegmentSessionId =
+          broadcastMode(broadcastCapabilities) === "emby" &&
+          /^[a-z0-9-]{8,128}$/i.test(requestedSegmentSessionId)
+            ? requestedSegmentSessionId
+            : undefined;
+        if (
+          room.segmentSessionId &&
+          room.segmentSessionId !== nextSegmentSessionId
+        ) {
+          segmentRelay.deactivateSession(
+            state.room,
+            room.segmentSessionId,
+          );
+        }
+        room.segmentSessionId = nextSegmentSessionId;
+        if (nextSegmentSessionId) {
+          segmentRelay.activateSession(state.room, nextSegmentSessionId);
+        }
         state.broadcasting = true;
         state.sfuPublisherActive = false;
         for (const memberId of room.members) {
@@ -3192,6 +3225,7 @@ export function createSignalServer(options = {}) {
             broadcasterId: clientId,
             nickname: state.nickname,
             broadcastCapabilities,
+            sessionId: nextSegmentSessionId,
           },
           clientId,
         );
@@ -3474,13 +3508,21 @@ export function createSignalServer(options = {}) {
           message.height === undefined ? undefined : Number(message.height);
         const requestedFrameRate =
           message.frameRate === undefined ? undefined : Number(message.frameRate);
+        const availableDownloadBps =
+          message.availableDownloadBps === undefined
+            ? undefined
+            : Number(message.availableDownloadBps);
         if (
           (requestedHeight !== undefined &&
             ![480, 720, 1080, 1200, 1440, 2160].includes(
               requestedHeight,
             )) ||
           (requestedFrameRate !== undefined &&
-            ![24, 30, 60, 90, 120].includes(requestedFrameRate))
+            ![24, 30, 60, 90, 120].includes(requestedFrameRate)) ||
+          (availableDownloadBps !== undefined &&
+            (!Number.isFinite(availableDownloadBps) ||
+              availableDownloadBps < 0 ||
+              availableDownloadBps > 1_000_000_000))
         ) {
           send(socket, { type: "error", message: "观看画质参数无效" });
           return;
@@ -3490,6 +3532,9 @@ export function createSignalServer(options = {}) {
           viewerId: clientId,
           height: requestedHeight,
           frameRate: requestedFrameRate,
+          originalDemand: message.originalDemand === true,
+          lowDemand: message.lowDemand === true,
+          availableDownloadBps,
         });
         return;
       }

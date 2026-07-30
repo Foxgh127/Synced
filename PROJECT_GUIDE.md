@@ -1,6 +1,6 @@
 # “同频”项目完整说明
 
-> - 适用版本：Native `2.9.0`
+> - 适用版本：Native `2.9.1`
 > - 面向读者：第一次接触本项目的产品、设计、测试、运维和开发人员
 > - 最重要的入口：当前 Windows / Android 产品在 [`native/`](./native/)；仓库根目录还保留了一套独立的 VDO.Ninja 网页实现。
 
@@ -15,7 +15,8 @@ Android 成员本地解码观看，所有成员还能连麦和发弹幕。
 - 普通屏幕画面与声音：优先由放映端上传一份多层流到腾讯云 LiveKit SFU，再按
   每位观看者的独立订阅档位分发；SFU 故障时回退到有总上行预算的 P2P/TURN。
 - Emby：放映端生成共享时间轴的多档 CMAF，通过短期签名 HTTPS 上传；观看端各自
-  ABR 下载和缓存。LiveKit/P2P 仅传播放控制、房间时钟和清单刷新。
+  ABR 下载和缓存。LiveKit/P2P 平时只传播放控制、房间时钟和清单刷新；HTTPS
+  数据面连续失败时，指定观看端会临时启用部分可靠 P2P 媒体通道。
 - 连麦语音：优先成员之间直连；复杂 NAT、公司网或代理环境下可以回退到 TURN。
 - 频道状态、SDP/ICE、聊天文字：通过 WSS 信令服务器传递。
 - 服务器不保存电影、声音或聊天历史，频道内存状态在最后一人离开后删除。
@@ -104,14 +105,16 @@ flowchart LR
     EF -->|"多档 CMAF 上传"| SR
     SR -->|"独立 ABR / Range 下载"| WR
     SR -->|"独立 ABR / Range 下载"| AR
+    EF -.->|"HTTPS 故障：30–60 秒应急 fragment cache"| WR
+    EF -.->|"HTTPS 故障：30–60 秒应急 fragment cache"| AR
 ```
 
 这里不使用数据库；媒体只进入受身份签名保护、按容量和 LRU 淘汰的临时分片缓存：
 
 - LiveKit 是普通屏幕主链路；一位放映者发布显式 1440p/1080p/720p simulcast
   与独立 480p 应急轨，SFU 按观看者选择层并用 dynacast 停掉无人订阅的层。
-- Emby 主数据面是 HTTPS CMAF；默认并行提供 original/1080p/720p/480p，每位
-  观看者自行 ABR、Range 重试与磁盘缓存，单个弱端不会改变全房间质量。
+- Emby 主数据面是 HTTPS CMAF；默认生产 1080p8/720p4，原画和 480p18 按真实观看
+  需求启停。每位观看者自行 ABR、Range 重试与磁盘缓存，单个弱端不会改变全房间质量。
 - 8 人全部连麦时，语音仍采用点对点 Mesh，每个成员最多连接另外 7 人。
 - Node 服务器处理频道状态并签发临时 TURN、LiveKit 与 CMAF 凭据，同时保存有界、
   可淘汰的不可变 CMAF 对象；它不持有 Emby 令牌，不解析影片语义。
@@ -248,26 +251,36 @@ Windows 成员打开“开始放映”后可以在普通屏幕共享与 Emby 高
 4. 固定哈希的 FFmpeg 8.1 LGPL 独立程序从随机密钥的 `127.0.0.1` 回环代理读取
    媒体。代理的 AbortController 保持到正文结束，正文 15 秒无字节会真正中止，
    Range 请求按预算重试；停止时有界关闭现有连接和空闲连接。
-5. `CmafRelayCoordinator` 并行生成共享时间轴、约 2 秒 GOP 对齐的
-   original/1080p/720p/480p。未知关键帧一律视为 false；解析不到时间时使用最近
-   8–16 个真实 fragment cadence 的中位数。主机磁盘 spool 只允许生产到观看锚点
-   的有界前向窗口，上传队列有字节/条目/磁盘高水位背压，EOF 会先排空最后分片再
-   发布 `ended` 清单。
-6. 放映端使用身份绑定、短期 HMAC 签名把 init、字幕、不可变 segment 和 revision
-   manifest 上传到 `/media/v1/`。服务端验证 room/asset/mediaVersion/rendition/
-   sequence/sha256 和对象路径，支持 Range/CORS；内存 LRU 加磁盘 LRU 默认取可用空间
-   4%、最高 5 GiB，淘汰时保护当前 manifest 及其 init/字幕。
-7. `emby-segment-relay.ts` 在每位观看者本地执行 ABR：Urgent 负责未来 0–15 秒，
-   Warm 负责 15–120 秒，Prefetch 只在 15–30 秒无 rebuffer、吞吐超过当前码率
-   1.5 倍、RTT 稳定、磁盘充足且非计费网络时运行，并最多使用剩余带宽 65%。
-   seek/切档增加 `fetchGeneration` 并取消旧请求；新档位只从对齐的真实关键帧接入。
-8. 三级缓存职责分离：内存只留即将 append 的数据；磁盘可缓存完整后续影片；
-   `SourceBuffer` 只保留播放点前少量和后方几十秒。QuotaExceeded 依次执行历史
-   trim、远未来 trim、abort、降低 buffer、本地 MediaSource 重建，超过每片重试
-   上限后触发 transport resync，不能 trim-and-retry 活锁。
-9. LiveKit/P2P 只发送播放、暂停、seek、房间时钟、媒体版本和清单刷新。控制消息按
-   类型合并，SDP/ICE 按 peer/session/attempt 分队列；Emby 连续媒体字节不再通过
-   可靠 SCTP/DataTrack，因此每位观看者可以独立选档和深缓存。
+5. `CmafRelayCoordinator` 生成共享时间轴、约 2 秒 GOP 对齐的多档媒体。默认只启动
+   1080p8/720p4；桌面高速观看端需要时启动 original，持续弱网端需要时启动 480p18，
+   无订阅 30 秒后暂停可选 producer。所有辅助 FFmpeg 都由 `-readrate` 限速，首次
+   中途启动从当前播放锚点开始；共享上传 token bucket 最多使用测速后剩余上行的 65%。
+6. 同一 rendition 的 init/segment 严格串行上传，不同 rendition 间最多三路并发。
+   清单只公布 `contiguousUploadedSequence` 之前的连续前缀；单片三次短重试失败后进入
+   独立的 1/2/4/8/15/30 秒抖动退避 actor，网络恢复不依赖令牌轮换。越过播放保留窗的
+   失败片会安全回收，EOF 则先排空可用尾片再发布 rendition-local `ended`/最终序号。
+7. 每次 `EmbyBroadcastController` 创建一个随机 `sessionId`。中继和本机 spool 路径均为
+   `/media/v1/rooms/{room}/sessions/{sessionId}/assets/{assetId}/versions/{version}/…`，
+   所以同一房间重播相同影片并从版本 1 开始也不会碰撞。服务端验证完整身份、连续序号、
+   字节数与 SHA-256；不可变 PUT 使用锁内 exclusive link，竞争写不能覆盖已有对象。
+8. 服务端以信令明确登记 active session，不再用最近访问时间猜当前版本。磁盘 LRU
+   pin 当前/过渡清单、init、字幕及播放点前 60 秒到后 120 秒的 segment；删除仍被
+   清单引用的冷片前先原子裁剪清单，观看端遇到 404 会刷新清单并从下一关键帧恢复。
+9. `emby-segment-relay.ts` 在每位观看者本地执行 ABR：Urgent 负责未来 0–15 秒，
+   Warm 负责 15–120 秒，Prefetch 仅在长期稳定、吞吐有 1.5 倍余量、RTT 稳定且非
+   计费网络时运行。原画还必须同时满足前向缓存不少于 20 秒和实测吞吐不低于原画真实
+   码率的 1.5 倍；P2P 可达性不会限制 HTTPS ABR。升级保护只禁止继续升档，不阻止降档。
+10. 清单按缓冲状态在 400 ms–5 秒之间轮询并发送 `If-None-Match`；304 不重复解析，
+    失败指数退避到 30 秒。客户端拒绝跨越超过 250 ms 的时间洞。seek/切档增加
+    `fetchGeneration` 并取消旧请求；新档位只从对齐的真实关键帧接入。
+11. 三级缓存职责分离：内存只留即将 append 的数据；CacheStorage 精确命中不等待
+    全局扫描，LRU 元数据保存在 IndexedDB，至多 10,000 个旧键在后台迁移；`SourceBuffer`
+    只保留播放点前少量和后方几十秒。QuotaExceeded 依次执行历史 trim、远未来 trim、
+    abort、降低 buffer 和本地 MediaSource 重建，不能形成 trim-and-retry 活锁。
+12. LiveKit/P2P 控制链切换只替换 control channel，保留 `EmbyMsePlayer`、ABR actor
+    和已缓存媒体。连续三次 manifest/segment 请求失败时，观看端发送
+    `segment-fallback-request`，主播仅为该观看端启用部分可靠媒体 DataChannel，并发送
+    最近 30–60 秒主档缓存；连续三次 HTTPS 探测恢复后释放应急链路并回到原 ABR 缓存。
 
 成员在入房时就上报 MSE/H.264/HEVC/AAC 能力。默认选全员兼容的 H.264/AAC；只有
 所有当前观众都支持时才允许 HEVC，晚加入的不兼容客户端会看到明确错误而不是黑屏。
@@ -680,7 +693,8 @@ Electron 保持 `contextIsolation: true`、`nodeIntegration: false`、`sandbox: 
 - 语音采集约束；
 - 依赖兼容与安全。
 - Emby 地址与重定向安全、媒体库/PlaybackInfo、真实 FFmpeg 重封装、MP4 时间轴；
-- CMAF manifest 路径/身份/哈希校验、最终分片排空、Range/idle retry、独立 ABR 与三级缓存；
+- CMAF session 隔离、连续清单前缀、并发不可变 PUT、独立失败重试、active-session
+  LRU、ETag/304、时间洞恢复、最终分片与 P2P 媒体应急链路；
 - 遗留 DataChannel 固定包头、CRC、乱序重组、独立背压和 token bucket；
 - MSE QuotaExceeded 终止恢复、信令分队列、流控 generation 与统计失败隔离；
 - WebGL2 GPU 增强策略、p95/丢帧/冷却边界；
@@ -871,8 +885,9 @@ npm test
    转码配置。
 5. HEVC 仅在所有成员上报支持时启用；不兼容成员应改用最新版客户端或 H.264。
 6. PGS 等图片字幕需改选文本字幕，或明确让 Emby 烧录转码。
-7. 检查 `/media/v1/` manifest、init 和 segment 是否返回 200/206，签名中的
-   room/asset/mediaVersion 是否与当前房间一致，磁盘缓存目录是否可写。
+7. 检查 `/media/v1/` manifest、init 和 segment 是否返回 200/206/304，路径与清单中的
+   room/sessionId/asset/mediaVersion 是否全部一致，磁盘缓存目录是否可写。segment
+   404 应先刷新 manifest；409 通常表示客户端错误复用了不可变对象键。
 8. 运行 `npm run check:ffmpeg`、`npm run smoke:emby` 和
    `npm run smoke:emby-ui`，分别定位运行时、CMAF/MSE 数据面和实际 UI/IPC。
 
@@ -927,9 +942,10 @@ journalctl -u coturn -f           # 仅腾讯云
 
 ## 12. 修改时必须守住的约束
 
-1. 保持 LiveKit SFU 为普通屏幕主链路、P2P/TURN 为有预算的故障备用；Emby 媒体
-   必须走签名 HTTPS CMAF。阿里云只能运行 443 上的备用信令/分片缓存，不能部署
-   LiveKit、TURN 或额外媒体端口。
+1. 保持 LiveKit SFU 为普通屏幕主链路、P2P/TURN 为有预算的故障备用；Emby 正常
+   数据面必须走签名 HTTPS CMAF，仅在中继连续失败时为单个观看端临时启用部分可靠
+   P2P 媒体应急通道。阿里云只能运行 443 上的备用信令/分片缓存，不能部署 LiveKit、
+   TURN 或额外媒体端口。
 2. 不要重新用 Canvas 合成电影画面和弹幕，会重新引入黑屏、HDR 和性能问题。
 3. 不要在渲染器打开 Node 集成；系统能力必须通过窄 IPC/Capacitor API。
 4. 不要把频道主私有凭证、Android 签名文件或 TURN secret 提交到 Git。

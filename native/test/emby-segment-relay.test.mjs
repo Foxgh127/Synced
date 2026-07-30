@@ -72,7 +72,8 @@ test("tuple manifests infer immutable segment paths and treat unknown keys as no
     sessionId: "session",
   };
   const initPath =
-    `/media/v1/rooms/${expected.roomId}/assets/${expected.assetId}/` +
+    `/media/v1/rooms/${expected.roomId}/sessions/${expected.sessionId}/` +
+    `assets/${expected.assetId}/` +
     `versions/3/renditions/720p4/init.mp4`;
   const parsed = parseEmbySegmentManifest(
     {
@@ -214,6 +215,54 @@ test("ABR downgrades immediately but upgrades one rung after 20 seconds and 1.5x
   );
 });
 
+test("original rendition requires both a 20 second buffer and 1.5x measured throughput", async () => {
+  const { selectEmbyAbrRendition } = await loadModule();
+  const renditions = [
+    rendition("1080p8", 1_080, 8_000_000),
+    rendition("original", 2_160, 60_000_000),
+  ];
+  assert.equal(
+    selectEmbyAbrRendition(renditions, {
+      throughputBps: 100_000_000,
+      currentId: "1080p8",
+      bufferAheadSeconds: 19.9,
+      stableForMs: 60_000,
+      upgradeHoldRemainingMs: 0,
+    }).id,
+    "1080p8",
+  );
+  assert.equal(
+    selectEmbyAbrRendition(renditions, {
+      throughputBps: 89_000_000,
+      currentId: "1080p8",
+      bufferAheadSeconds: 30,
+      stableForMs: 60_000,
+      upgradeHoldRemainingMs: 0,
+    }).id,
+    "1080p8",
+  );
+  assert.equal(
+    selectEmbyAbrRendition(renditions, {
+      throughputBps: 100_000_000,
+      currentId: "1080p8",
+      bufferAheadSeconds: 30,
+      stableForMs: 60_000,
+      upgradeHoldRemainingMs: 0,
+    }).id,
+    "original",
+  );
+});
+
+test("manifest polling is urgent only near starvation and backs off exponentially", async () => {
+  const { embyManifestPollDelayMs } = await loadModule();
+  assert.equal(embyManifestPollDelayMs(2, 0, false), 400);
+  assert.equal(embyManifestPollDelayMs(10, 0, true), 650);
+  assert.equal(embyManifestPollDelayMs(20, 0, false), 2_500);
+  assert.equal(embyManifestPollDelayMs(50, 0, false), 5_000);
+  assert.equal(embyManifestPollDelayMs(0, 1, false), 650);
+  assert.equal(embyManifestPollDelayMs(0, 7, false), 30_000);
+});
+
 test("paced deep prefetch cannot poison the foreground ABR estimate", async () => {
   const { updateEmbyThroughputEstimate } = await loadModule();
   assert.equal(
@@ -236,8 +285,10 @@ test("ABR polling advances an existing rendition snapshot without replaying old 
   const roomId = "23456789";
   const assetId = "0123456789abcdef0123456789abcdef01234567";
   const mediaVersion = 9;
+  const sessionId = "session-fixture";
   const root =
-    `/media/v1/rooms/${roomId}/assets/${assetId}/versions/${mediaVersion}`;
+    `/media/v1/rooms/${roomId}/sessions/${sessionId}/assets/` +
+    `${assetId}/versions/${mediaVersion}`;
   const initPath = `${root}/renditions/720p4/init.mp4`;
   const media = new Map([
     [initPath, Uint8Array.of(1, 2, 3)],
@@ -248,7 +299,7 @@ test("ABR polling advances an existing rendition snapshot without replaying old 
   const manifest = (segments) => ({
     protocol: "synced-cmaf-v1",
     roomId,
-    sessionId: "session-fixture",
+    sessionId,
     assetId,
     mediaVersion,
     title: "Fixture",
@@ -267,6 +318,13 @@ test("ABR polling advances an existing rendition snapshot without replaying old 
     const pathname = new URL(url).pathname;
     if (pathname.endsWith("/manifest.json")) {
       manifestCalls += 1;
+      if (manifestCalls === 2) {
+        assert.equal(options.headers["if-none-match"], '"fixture-v1"');
+        return new Response(null, {
+          status: 304,
+          headers: { etag: '"fixture-v1"' },
+        });
+      }
       return new Response(
         JSON.stringify(
           manifest(
@@ -278,7 +336,15 @@ test("ABR polling advances an existing rendition snapshot without replaying old 
                 ],
           ),
         ),
-        { status: 200 },
+        {
+          status: 200,
+          headers: {
+            etag:
+              manifestCalls === 1
+                ? '"fixture-v1"'
+                : '"fixture-v2"',
+          },
+        },
       );
     }
     const bytes = media.get(pathname);
@@ -326,7 +392,7 @@ test("ABR polling advances an existing rendition snapshot without replaying old 
     client.start(
       {
         roomId,
-        sessionId: "session-fixture",
+        sessionId,
         mediaVersion,
         mimeType: 'video/mp4; codecs="avc1.64001f,mp4a.40.2"',
         plan: {},
@@ -334,6 +400,7 @@ test("ABR polling advances an existing rendition snapshot without replaying old 
       },
       {
         protocol: "synced-cmaf-v1",
+        sessionId,
         assetId,
         mediaVersion,
         manifestPath: `${root}/manifest.json`,
@@ -343,7 +410,7 @@ test("ABR polling advances an existing rendition snapshot without replaying old 
     while (fragments.length < 2 && performance.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 20));
     }
-    assert.ok(manifestCalls >= 2);
+    assert.ok(manifestCalls >= 3);
     assert.deepEqual(
       fragments.map(({ sequence, data }) => [sequence, [...data]]),
       [
@@ -370,6 +437,353 @@ test("ABR polling advances an existing rendition snapshot without replaying old 
         bitrate: 4_000_000,
       },
     );
+  } finally {
+    client.destroy();
+  }
+});
+
+test("ABR never appends across a manifest timeline hole and resumes when the missing time arrives", async () => {
+  const { EmbyAbrSegmentClient } = await loadModule();
+  globalThis.window = globalThis;
+  const roomId = "23456789";
+  const sessionId = "session-gap";
+  const assetId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const mediaVersion = 2;
+  const root =
+    `/media/v1/rooms/${roomId}/sessions/${sessionId}/assets/` +
+    `${assetId}/versions/${mediaVersion}`;
+  const initPath = `${root}/renditions/720p4/init.mp4`;
+  const media = new Map([
+    [initPath, Uint8Array.of(1)],
+    [`${root}/renditions/720p4/segments/1.m4s`, Uint8Array.of(11)],
+    [`${root}/renditions/720p4/segments/2.m4s`, Uint8Array.of(22)],
+  ]);
+  let manifestCalls = 0;
+  let segmentTwoFetches = 0;
+  const manifest = (timelineTimeMs, segments = 2) => ({
+    protocol: "synced-cmaf-v1",
+    roomId,
+    sessionId,
+    assetId,
+    mediaVersion,
+    title: "Gap fixture",
+    startTimeTicks: 0,
+    updatedAt: manifestCalls,
+    renditions: [
+      {
+        ...rendition("720p4", 720, 4_000_000),
+        initPath,
+        segments: [
+          [1, 0, 0, 2_000, 1, 1],
+          ...(segments === 2
+            ? [[2, 2_000, timelineTimeMs, 2_000, 1, 1]]
+            : []),
+        ],
+      },
+    ],
+  });
+  const fetchImpl = async (url) => {
+    const pathname = new URL(url).pathname;
+    if (pathname.endsWith("/manifest.json")) {
+      manifestCalls += 1;
+      return new Response(
+        JSON.stringify(
+          manifest(
+            manifestCalls === 2 ? 4_000 : 2_000,
+            manifestCalls === 1 ? 1 : 2,
+          ),
+        ),
+        { status: 200, headers: { etag: `"gap-${manifestCalls}"` } },
+      );
+    }
+    if (pathname.endsWith("/segments/2.m4s")) segmentTwoFetches += 1;
+    const bytes = media.get(pathname);
+    return bytes
+      ? new Response(bytes, { status: 200 })
+      : new Response(null, { status: 404 });
+  };
+  const fragments = [];
+  const player = {
+    currentTime: 0,
+    bufferedAhead: 0,
+    bufferProfile: { targetSeconds: 20 },
+    configure() {},
+    appendInit() {},
+    appendFragment(fragment) {
+      fragments.push(fragment);
+    },
+    applySubtitle() {},
+    markEnded() {},
+  };
+  const client = new EmbyAbrSegmentClient({
+    player,
+    signalUrl: "wss://relay.example/signal",
+    access: {
+      basePath: "/media/v1",
+      token: "token",
+      scope: "read",
+      expiresAt: Date.now() + 60_000,
+    },
+    fetchImpl,
+    cache: {
+      async get() {},
+      async put() {},
+      async delete() {},
+      async close() {},
+    },
+  });
+  try {
+    client.start(
+      {
+        roomId,
+        sessionId,
+        mediaVersion,
+        mimeType: 'video/mp4; codecs="avc1.64001f,mp4a.40.2"',
+        plan: {},
+        title: "Gap fixture",
+      },
+      {
+        protocol: "synced-cmaf-v1",
+        sessionId,
+        assetId,
+        mediaVersion,
+        manifestPath: `${root}/manifest.json`,
+      },
+    );
+    const deadline = performance.now() + 2_500;
+    while (fragments.length < 2 && performance.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.deepEqual(
+      fragments.map(({ data }) => [...data]),
+      [[11], [22]],
+      JSON.stringify(client.diagnostics),
+    );
+    assert.ok(manifestCalls >= 3);
+    assert.equal(
+      segmentTwoFetches,
+      1,
+      "the segment beyond the hole is not fetched until continuity is restored",
+    );
+  } finally {
+    client.destroy();
+  }
+});
+
+test("ended CMAF manifests close MSE using rendition-local final sequence", async () => {
+  const { EmbyAbrSegmentClient } = await loadModule();
+  globalThis.window = globalThis;
+  const roomId = "23456789";
+  const sessionId = "session-ended";
+  const assetId = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const mediaVersion = 4;
+  const root =
+    `/media/v1/rooms/${roomId}/sessions/${sessionId}/assets/` +
+    `${assetId}/versions/${mediaVersion}`;
+  const initPath = `${root}/renditions/720p4/init.mp4`;
+  let ended = 0;
+  const player = {
+    currentTime: 0,
+    bufferedAhead: 0,
+    bufferProfile: { targetSeconds: 20 },
+    configure() {},
+    appendInit() {},
+    appendFragment() {},
+    applySubtitle() {},
+    markEnded() {
+      ended += 1;
+    },
+  };
+  const client = new EmbyAbrSegmentClient({
+    player,
+    signalUrl: "wss://relay.example/signal",
+    access: {
+      basePath: "/media/v1",
+      token: "token",
+      scope: "read",
+      expiresAt: Date.now() + 60_000,
+    },
+    fetchImpl: async (url) => {
+      const pathname = new URL(url).pathname;
+      if (pathname.endsWith("/manifest.json")) {
+        return new Response(
+          JSON.stringify({
+            protocol: "synced-cmaf-v1",
+            roomId,
+            sessionId,
+            assetId,
+            mediaVersion,
+            title: "Ended",
+            startTimeTicks: 0,
+            updatedAt: 1,
+            ended: true,
+            renditions: [
+              {
+                ...rendition("720p4", 720, 4_000_000),
+                initPath,
+                ended: true,
+                finalSequence: 1,
+                finalTimelineEndMs: 2_000,
+                segments: [[1, 0, 0, 2_000, 1, 1]],
+              },
+            ],
+          }),
+          { status: 200, headers: { etag: '"ended"' } },
+        );
+      }
+      if (pathname === initPath) {
+        return new Response(Uint8Array.of(1), { status: 200 });
+      }
+      if (pathname.endsWith("/segments/1.m4s")) {
+        return new Response(Uint8Array.of(2), { status: 200 });
+      }
+      return new Response(null, { status: 404 });
+    },
+    cache: {
+      async get() {},
+      async put() {},
+      async delete() {},
+      async close() {},
+    },
+  });
+  try {
+    client.start(
+      {
+        roomId,
+        sessionId,
+        mediaVersion,
+        mimeType: 'video/mp4; codecs="avc1.64001f,mp4a.40.2"',
+        plan: {},
+        title: "Ended",
+      },
+      {
+        protocol: "synced-cmaf-v1",
+        sessionId,
+        assetId,
+        mediaVersion,
+        manifestPath: `${root}/manifest.json`,
+      },
+    );
+    const deadline = performance.now() + 1_500;
+    while (ended === 0 && performance.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(ended, 1, JSON.stringify(client.diagnostics));
+  } finally {
+    client.destroy();
+  }
+});
+
+test("three relay failures request media fallback and three healthy probes announce recovery", async () => {
+  const { EmbyAbrSegmentClient } = await loadModule();
+  globalThis.window = globalThis;
+  const roomId = "23456789";
+  const sessionId = "session-fallback";
+  const assetId = "cccccccccccccccccccccccccccccccccccccccc";
+  const mediaVersion = 5;
+  const root =
+    `/media/v1/rooms/${roomId}/sessions/${sessionId}/assets/` +
+    `${assetId}/versions/${mediaVersion}`;
+  const initPath = `${root}/renditions/720p4/init.mp4`;
+  let manifestCalls = 0;
+  let fallbackRequests = 0;
+  let recovered = 0;
+  let client;
+  const manifest = {
+    protocol: "synced-cmaf-v1",
+    roomId,
+    sessionId,
+    assetId,
+    mediaVersion,
+    title: "Fallback",
+    startTimeTicks: 0,
+    updatedAt: 1,
+    renditions: [
+      {
+        ...rendition("720p4", 720, 4_000_000),
+        initPath,
+        segments: [[1, 0, 0, 2_000, 1, 1]],
+      },
+    ],
+  };
+  const player = {
+    currentTime: 0,
+    bufferedAhead: 0,
+    bufferProfile: { targetSeconds: 20 },
+    configure() {},
+    appendInit() {},
+    appendFragment() {},
+    applySubtitle() {},
+    markEnded() {},
+  };
+  client = new EmbyAbrSegmentClient({
+    player,
+    signalUrl: "wss://relay.example/signal",
+    access: {
+      basePath: "/media/v1",
+      token: "token",
+      scope: "read",
+      expiresAt: Date.now() + 60_000,
+    },
+    fetchImpl: async (url, options) => {
+      const pathname = new URL(url).pathname;
+      if (pathname.endsWith("/manifest.json")) {
+        manifestCalls += 1;
+        if (manifestCalls <= 3) {
+          return new Response(null, { status: 503 });
+        }
+        return new Response(JSON.stringify(manifest), {
+          status: 200,
+          headers: { etag: '"fallback-ready"' },
+        });
+      }
+      if (
+        options.method === "HEAD" &&
+        pathname.endsWith("/segments/1.m4s")
+      ) {
+        return new Response(null, { status: 200 });
+      }
+      return new Response(null, { status: 404 });
+    },
+    cache: {
+      async get() {},
+      async put() {},
+      async delete() {},
+      async close() {},
+    },
+    onMediaFallbackNeeded() {
+      fallbackRequests += 1;
+      client.activateMediaFallback();
+    },
+    onRelayRecovered() {
+      recovered += 1;
+    },
+  });
+  try {
+    client.start(
+      {
+        roomId,
+        sessionId,
+        mediaVersion,
+        mimeType: 'video/mp4; codecs="avc1.64001f,mp4a.40.2"',
+        plan: {},
+        title: "Fallback",
+      },
+      {
+        protocol: "synced-cmaf-v1",
+        sessionId,
+        assetId,
+        mediaVersion,
+        manifestPath: `${root}/manifest.json`,
+      },
+    );
+    const deadline = performance.now() + 7_000;
+    while (recovered === 0 && performance.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.equal(fallbackRequests, 1);
+    assert.equal(recovered, 1, JSON.stringify(client.diagnostics));
+    assert.equal(client.diagnostics.relayFallbackActive, true);
   } finally {
     client.destroy();
   }
@@ -425,7 +839,8 @@ test("a stalled segment body aborts the underlying fetch before Range retry", as
   const parent = new AbortController();
   const operation = client.fetchMediaBytes(
     new URL(
-      "https://relay.example/media/v1/rooms/23456789/assets/" +
+      "https://relay.example/media/v1/rooms/23456789/sessions/" +
+        "session-fixture/assets/" +
         "0123456789abcdef0123456789abcdef01234567/versions/1/" +
         "renditions/720p4/segments/1.m4s",
     ),

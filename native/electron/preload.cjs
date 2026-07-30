@@ -146,6 +146,8 @@ contextBridge.exposeInMainWorld("roomDesktop", {
     ipcRenderer.invoke("emby:get-flow-state", expectedPipelineId),
   embyUpdateSegmentRelay: (input) =>
     ipcRenderer.invoke("emby:update-segment-relay", input),
+  embyUpdateRenditionDemand: (input) =>
+    ipcRenderer.invoke("emby:update-rendition-demand", input),
   embyReportPlayback: (input) =>
     ipcRenderer.invoke("emby:report-playback", input),
   onEmbyStreamEvent: (callback) => {

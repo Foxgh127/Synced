@@ -5,6 +5,7 @@ import path from "node:path";
 import { test } from "node:test";
 import {
   CmafRelayCoordinator,
+  EmbyService,
   renditionIdForQuality,
 } from "../electron/emby-service.cjs";
 
@@ -16,6 +17,14 @@ async function waitFor(predicate, timeoutMs = 3_000) {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   throw new Error("timed out waiting for relay coordinator");
+}
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
 }
 
 function plan(id, height, bitrate, method = "Transcode") {
@@ -94,7 +103,7 @@ test("CMAF coordinator publishes aligned compact rendition snapshots", async () 
     }
 
     const manifestPath =
-      "/media/v1/rooms/23456789/assets/" +
+      "/media/v1/rooms/23456789/sessions/session-fixture/assets/" +
       "0123456789abcdef0123456789abcdef01234567/versions/5/manifest.json";
     const manifest = await waitFor(() => {
       const body = uploads.get(manifestPath);
@@ -191,7 +200,7 @@ test("CMAF coordinator anchors its window to playback and backpressures deep pro
 
     await waitFor(() => pauses > 0);
     const manifestPath =
-      "/media/v1/rooms/23456789/assets/" +
+      "/media/v1/rooms/23456789/sessions/session-window/assets/" +
       "fedcba9876543210fedcba9876543210fedcba98/versions/1/manifest.json";
     const manifest = await waitFor(() => {
       const body = uploads.get(manifestPath);
@@ -260,7 +269,7 @@ test("CMAF coordinator drains the final segment before publishing ended", async 
     await coordinator.close(true);
 
     const root =
-      "/media/v1/rooms/23456789/assets/" +
+      "/media/v1/rooms/23456789/sessions/session-final-drain/assets/" +
       "abcdef0123456789abcdef0123456789abcdef01/versions/9";
     assert.equal(
       uploads.get(`${root}/renditions/720p4/segments/1.m4s`)?.toString(),
@@ -336,6 +345,213 @@ test("CMAF manifest failures back off and recover without freezing publication",
   } finally {
     await coordinator.close();
     globalThis.fetch = originalFetch;
+    await rm(cacheDir, { recursive: true, force: true });
+  }
+});
+
+test("CMAF uploads are serial within a rendition and concurrent across renditions", async () => {
+  const cacheDir = await mkdtemp(path.join(tmpdir(), "synced-cmaf-order-"));
+  const originalFetch = globalThis.fetch;
+  const started = [];
+  const uploads = new Map();
+  const blocked = deferred();
+  globalThis.fetch = async (url, options) => {
+    const pathname = new URL(url).pathname;
+    started.push(pathname);
+    if (pathname.endsWith("/renditions/720p4/segments/1.m4s")) {
+      await blocked.promise;
+    }
+    const chunks = [];
+    for await (const chunk of options.body) chunks.push(Buffer.from(chunk));
+    uploads.set(pathname, Buffer.concat(chunks));
+    return new Response(null, { status: 201 });
+  };
+  const coordinator = new CmafRelayCoordinator(
+    {
+      baseUrl: new URL("https://relay.example/media/v1/"),
+      token: "t".repeat(96),
+      roomId: "23456789",
+      sessionId: "session-order",
+      assetId: "2222222222222222222222222222222222222222",
+      mediaVersion: 1,
+    },
+    { cacheDir, maxDiskBytes: 256 * 1024 * 1024 },
+  );
+  try {
+    for (const [id, height, bitrate] of [
+      ["720p4", 720, 4_000_000],
+      ["1080p8", 1_080, 8_000_000],
+    ]) {
+      coordinator.publishInit(
+        id,
+        plan(id, height, bitrate),
+        'video/mp4; codecs="avc1.64001f,mp4a.40.2"',
+        Buffer.from(`init-${id}`),
+        "Ordering",
+      );
+      coordinator.publishFragment(id, {
+        sequence: 1,
+        mediaTimeMs: 0,
+        keyframe: true,
+        data: Buffer.from(`${id}-one`),
+      });
+      coordinator.publishFragment(id, {
+        sequence: 2,
+        mediaTimeMs: 2_000,
+        keyframe: true,
+        data: Buffer.from(`${id}-two`),
+      });
+    }
+    await waitFor(() =>
+      started.some((value) =>
+        value.endsWith("/renditions/720p4/segments/1.m4s"),
+      ),
+    );
+    await waitFor(() =>
+      started.some((value) =>
+        value.endsWith("/renditions/1080p8/segments/1.m4s"),
+      ),
+    );
+    assert.equal(
+      started.some((value) =>
+        value.endsWith("/renditions/720p4/segments/2.m4s"),
+      ),
+      false,
+      "a later segment must not overtake the blocked head of its rendition",
+    );
+    blocked.resolve();
+    const manifestPath =
+      "/media/v1/rooms/23456789/sessions/session-order/assets/" +
+      "2222222222222222222222222222222222222222/versions/1/manifest.json";
+    const manifest = await waitFor(() => {
+      const body = uploads.get(manifestPath);
+      if (!body) return undefined;
+      const parsed = JSON.parse(body);
+      return parsed.renditions.length === 2 &&
+        parsed.renditions.every((item) => item.segments.length === 2)
+        ? parsed
+        : undefined;
+    });
+    for (const rendition of manifest.renditions) {
+      assert.deepEqual(
+        rendition.segments.map((segment) => segment[0]),
+        [1, 2],
+      );
+    }
+  } finally {
+    blocked.resolve();
+    await coordinator.close();
+    globalThis.fetch = originalFetch;
+    await rm(cacheDir, { recursive: true, force: true });
+  }
+});
+
+test("failed CMAF records recover on their own without a token change", async () => {
+  const cacheDir = await mkdtemp(path.join(tmpdir(), "synced-cmaf-actor-"));
+  const originalFetch = globalThis.fetch;
+  let segmentAttempts = 0;
+  let publishedManifest;
+  globalThis.fetch = async (url, options) => {
+    const pathname = new URL(url).pathname;
+    const chunks = [];
+    for await (const chunk of options.body) chunks.push(Buffer.from(chunk));
+    if (pathname.endsWith("/renditions/720p4/segments/1.m4s")) {
+      segmentAttempts += 1;
+      if (segmentAttempts <= 3) {
+        return new Response(null, { status: 503 });
+      }
+    }
+    if (pathname.endsWith("/manifest.json")) {
+      publishedManifest = JSON.parse(Buffer.concat(chunks));
+    }
+    return new Response(null, { status: 201 });
+  };
+  const coordinator = new CmafRelayCoordinator(
+    {
+      baseUrl: new URL("https://relay.example/media/v1/"),
+      token: "t".repeat(96),
+      roomId: "23456789",
+      sessionId: "session-retry-actor",
+      assetId: "3333333333333333333333333333333333333333",
+      mediaVersion: 1,
+    },
+    {
+      cacheDir,
+      maxDiskBytes: 256 * 1024 * 1024,
+      random: () => 0.5,
+    },
+  );
+  try {
+    coordinator.publishInit(
+      "720p4",
+      plan("720p4", 720, 4_000_000),
+      'video/mp4; codecs="avc1.64001f,mp4a.40.2"',
+      Buffer.from("init"),
+      "Retry actor",
+    );
+    coordinator.publishFragment("720p4", {
+      sequence: 1,
+      mediaTimeMs: 0,
+      keyframe: true,
+      data: Buffer.from("eventually-uploaded"),
+    });
+    const recovered = await waitFor(
+      () =>
+        publishedManifest?.renditions?.[0]?.segments?.[0]?.[0] === 1,
+      4_500,
+    );
+    assert.equal(recovered, true);
+    assert.equal(segmentAttempts, 4);
+  } finally {
+    await coordinator.close();
+    globalThis.fetch = originalFetch;
+    await rm(cacheDir, { recursive: true, force: true });
+  }
+});
+
+test("CMAF auxiliary demand defaults to 1080p and 720p and caps measured upload at 65 percent", async () => {
+  const cacheDir = await mkdtemp(path.join(tmpdir(), "synced-cmaf-demand-"));
+  const coordinator = new CmafRelayCoordinator(
+    {
+      baseUrl: new URL("https://relay.example/media/v1/"),
+      token: "t".repeat(96),
+      roomId: "23456789",
+      sessionId: "session-demand",
+      assetId: "4444444444444444444444444444444444444444",
+      mediaVersion: 1,
+    },
+    { cacheDir, maxDiskBytes: 256 * 1024 * 1024 },
+  );
+  try {
+    const service = new EmbyService({ relayCoordinator: coordinator });
+    const initial = service.updateRenditionDemand({
+      availableUploadBps: 20_000_000,
+    });
+    assert.deepEqual(initial.active, ["1080p8", "720p4"]);
+    assert.equal(initial.uploadBudgetBps, 13_000_000);
+    const expanded = service.updateRenditionDemand({
+      original: true,
+      low: true,
+      availableUploadBps: 20_000_000,
+    });
+    assert.deepEqual(
+      new Set(expanded.active),
+      new Set(["original", "1080p8", "720p4", "480p18"]),
+    );
+    assert.equal(coordinator.renditions.get("original").demandPaused, false);
+    assert.equal(coordinator.renditions.get("480p18").demandPaused, false);
+    const exhausted = service.updateRenditionDemand({
+      availableUploadBps: 100_000,
+    });
+    assert.equal(exhausted.uploadBudgetBps, 0);
+    assert.equal(coordinator.renditions.get("1080p8").budgetPaused, true);
+    const restored = service.updateRenditionDemand({
+      availableUploadBps: 20_000_000,
+    });
+    assert.equal(restored.uploadBudgetBps, 13_000_000);
+    assert.equal(coordinator.renditions.get("1080p8").budgetPaused, false);
+  } finally {
+    await coordinator.close();
     await rm(cacheDir, { recursive: true, force: true });
   }
 });

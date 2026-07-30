@@ -89,6 +89,7 @@ export interface EmbyTimelinePoint {
 
 export interface EmbySegmentSessionDescriptor {
   protocol: "synced-cmaf-v1";
+  sessionId: string;
   assetId: string;
   mediaVersion: number;
   manifestPath: string;
@@ -281,6 +282,17 @@ export type EmbyControlMessage =
       mediaVersion: number;
       transportEpoch?: number;
       targetTime: number;
+    }
+  | {
+      type: "segment-fallback-request";
+      sessionId: string;
+      mediaVersion: number;
+      targetTime: number;
+    }
+  | {
+      type: "segment-fallback-release";
+      sessionId: string;
+      mediaVersion: number;
     }
   | {
       type: "resync";

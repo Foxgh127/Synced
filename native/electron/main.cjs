@@ -1992,6 +1992,10 @@ app.whenReady().then(() => {
     assertMainRenderer(event);
     return embyAccounts.updateSegmentRelayAccess(input);
   });
+  ipcMain.handle("emby:update-rendition-demand", (event, input) => {
+    assertMainRenderer(event);
+    return embyAccounts.updateRenditionDemand(input);
+  });
   ipcMain.handle("emby:report-playback", (event, input) => {
     assertMainRenderer(event);
     return embyAccounts.reportPlayback(input);

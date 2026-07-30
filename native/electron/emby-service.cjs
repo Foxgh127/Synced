@@ -33,7 +33,45 @@ const RELAY_MAX_DISK_BYTES = 5 * 1024 * 1024 * 1024;
 const RELAY_UPLOAD_CONCURRENCY = 3;
 const RELAY_UPLOAD_IDLE_TIMEOUT_MS = 15_000;
 const RELAY_UPLOAD_MAX_ATTEMPTS = 3;
+const RELAY_FAILED_RETRY_DELAYS_MS = [
+  1_000,
+  2_000,
+  4_000,
+  8_000,
+  15_000,
+  30_000,
+];
+const RELAY_FAILED_RECORD_RETENTION_MS = 120_000;
 const RELAY_FINAL_DRAIN_TIMEOUT_MS = 10_000;
+const RELAY_UPLOAD_BUDGET_SHARE = 0.65;
+const RELAY_MIN_VIABLE_UPLOAD_BPS = 128_000;
+const AUXILIARY_RENDITION_IDLE_MS = 30_000;
+const CMAF_AUXILIARY_RENDITIONS = Object.freeze([
+  Object.freeze({
+    id: "original",
+    quality: "original",
+    forceVideoTranscode: false,
+    defaultActive: false,
+  }),
+  Object.freeze({
+    id: "1080p8",
+    quality: "1080p-8",
+    forceVideoTranscode: true,
+    defaultActive: true,
+  }),
+  Object.freeze({
+    id: "720p4",
+    quality: "720p-4",
+    forceVideoTranscode: true,
+    defaultActive: true,
+  }),
+  Object.freeze({
+    id: "480p18",
+    quality: "480p-1.8",
+    forceVideoTranscode: true,
+    defaultActive: false,
+  }),
+]);
 
 function cleanText(value, maxLength = 256) {
   return String(value || "").trim().slice(0, maxLength);
@@ -2403,6 +2441,7 @@ class CmafRelayCoordinator {
     this.rootDir = path.resolve(
       options.cacheDir ||
         path.join(process.cwd(), ".synced-emby-segment-cache"),
+      config.sessionId,
       config.assetId,
       String(config.mediaVersion),
     );
@@ -2414,9 +2453,13 @@ class CmafRelayCoordinator {
     this.renditions = new Map();
     this.records = new Map();
     this.failedRecords = new Set();
-    this.uploadQueue = [];
-    this.uploadHead = 0;
     this.activeUploads = 0;
+    this.failedRetryTimer = undefined;
+    this.retryRandom =
+      typeof options.random === "function" ? options.random : Math.random;
+    this.uploadBudgetBps = Number.POSITIVE_INFINITY;
+    this.uploadBudgetTokens = Number.POSITIVE_INFINITY;
+    this.uploadBudgetUpdatedAt = performance.now();
     this.memoryQueuedBytes = 0;
     this.diskBytes = 0;
     this.manifestDirty = false;
@@ -2435,11 +2478,10 @@ class CmafRelayCoordinator {
     const next = cleanText(token, 2_048);
     if (next.length < 64 || next === this.token) return false;
     this.token = next;
-    for (const record of this.failedRecords) {
-      record.failed = false;
-      this.uploadQueue.push(record);
-    }
-    this.failedRecords.clear();
+    // Authentication refresh may unblock 401/403 failures immediately, but
+    // the independent retry actor below remains responsible for ordinary
+    // relay outages and never waits for a token rotation.
+    this.retryFailedRecords(true);
     this.pumpUploads();
     this.scheduleManifest();
     return true;
@@ -2450,6 +2492,7 @@ class CmafRelayCoordinator {
     state.pause = typeof controls.pause === "function" ? controls.pause : () => {};
     state.resume =
       typeof controls.resume === "function" ? controls.resume : () => {};
+    this.applyProducerPause(state);
     this.updatePressure();
   }
 
@@ -2460,6 +2503,56 @@ class CmafRelayCoordinator {
     state.resume = () => {};
   }
 
+  setRenditionDemandActive(renditionId, active) {
+    const state = this.ensureRendition(renditionId);
+    state.demandPaused = active !== true;
+    this.applyProducerPause(state);
+    this.scheduleManifest();
+  }
+
+  setUploadBudget(availableUploadBps) {
+    const measured = Number(availableUploadBps);
+    const now = performance.now();
+    const previousBudgetBps = this.uploadBudgetBps;
+    if (Number.isFinite(previousBudgetBps) && previousBudgetBps > 0) {
+      const previousBurstBytes = (previousBudgetBps / 8) * 2;
+      this.uploadBudgetTokens = Math.min(
+        previousBurstBytes,
+        this.uploadBudgetTokens +
+          (Math.max(0, now - this.uploadBudgetUpdatedAt) *
+            previousBudgetBps) /
+            8_000,
+      );
+    }
+    const requestedBudgetBps =
+      Number.isFinite(measured) && measured >= 0
+        ? measured * RELAY_UPLOAD_BUDGET_SHARE
+        : Number.POSITIVE_INFINITY;
+    this.uploadBudgetBps =
+      Number.isFinite(requestedBudgetBps) &&
+      requestedBudgetBps < RELAY_MIN_VIABLE_UPLOAD_BPS
+        ? 0
+        : requestedBudgetBps;
+    if (Number.isFinite(this.uploadBudgetBps)) {
+      const maximumBurstBytes = (this.uploadBudgetBps / 8) * 2;
+      this.uploadBudgetTokens = Number.isFinite(previousBudgetBps)
+        ? Math.min(maximumBurstBytes, Math.max(0, this.uploadBudgetTokens))
+        : maximumBurstBytes;
+    } else {
+      this.uploadBudgetTokens = Number.POSITIVE_INFINITY;
+    }
+    this.uploadBudgetUpdatedAt = now;
+    for (const state of this.renditions.values()) {
+      state.budgetPaused = this.uploadBudgetBps === 0;
+      this.applyProducerPause(state);
+    }
+    if (this.uploadBudgetBps > 0) {
+      this.pumpUploads();
+      this.scheduleManifest();
+    }
+    return this.uploadBudgetBps;
+  }
+
   updatePlaybackAnchor(positionTicks) {
     const ticks = Number(positionTicks);
     if (!Number.isFinite(ticks) || ticks < 0 || this.closed) return false;
@@ -2468,7 +2561,9 @@ class CmafRelayCoordinator {
       this.playbackAnchorTimeMs === undefined ||
       Math.abs(next - this.playbackAnchorTimeMs) >= 250;
     this.playbackAnchorTimeMs = next;
+    this.retireExpiredFailedRecords();
     this.updatePressure();
+    this.pumpUploads();
     if (changed) this.scheduleManifest();
     return changed;
   }
@@ -2507,10 +2602,16 @@ class CmafRelayCoordinator {
         initPath: "",
         initUploaded: false,
         segments: new Map(),
+        uploadedDescriptors: new Map(),
         descriptors: new Map(),
+        firstSegmentSequence: undefined,
+        contiguousUploadedSequence: undefined,
         pending: [],
         pendingHead: 0,
         spooling: false,
+        uploadQueue: [],
+        uploadHead: 0,
+        uploadActive: false,
         recentCadenceMs: [],
         previousRawTimeMs: undefined,
         previousTimelineTimeMs: undefined,
@@ -2518,6 +2619,9 @@ class CmafRelayCoordinator {
         pause: () => {},
         resume: () => {},
         pressurePaused: false,
+        demandPaused: false,
+        budgetPaused: this.uploadBudgetBps === 0,
+        producerPaused: false,
         ended: false,
       };
       this.renditions.set(id, state);
@@ -2593,6 +2697,10 @@ class CmafRelayCoordinator {
     state.previousRawTimeMs = rawTimeMs;
     state.previousTimelineTimeMs = timelineTimeMs;
     const sequence = Number(fragment.sequence);
+    state.firstSegmentSequence =
+      state.firstSegmentSequence === undefined
+        ? sequence
+        : Math.min(state.firstSegmentSequence, sequence);
     const relativePath = this.relativeMediaPath(
       state.id,
       `segments/${sequence}.m4s`,
@@ -2618,6 +2726,7 @@ class CmafRelayCoordinator {
       contentType: "video/iso.segment",
       headers: {
         "x-synced-media-time-ms": String(rawTimeMs),
+        "x-synced-timeline-time-ms": String(timelineTimeMs),
         "x-synced-duration-ms": String(
           Math.max(
             1,
@@ -2646,7 +2755,8 @@ class CmafRelayCoordinator {
   relativeMediaPath(renditionId, suffix) {
     const base = this.config.baseUrl.pathname;
     return (
-      `${base}rooms/${this.config.roomId}/assets/${this.config.assetId}/` +
+      `${base}rooms/${this.config.roomId}/sessions/${this.config.sessionId}/` +
+      `assets/${this.config.assetId}/` +
       `versions/${this.config.mediaVersion}/renditions/${renditionId}/${suffix}`
     );
   }
@@ -2654,7 +2764,8 @@ class CmafRelayCoordinator {
   manifestPath() {
     const base = this.config.baseUrl.pathname;
     return (
-      `${base}rooms/${this.config.roomId}/assets/${this.config.assetId}/` +
+      `${base}rooms/${this.config.roomId}/sessions/${this.config.sessionId}/` +
+      `assets/${this.config.assetId}/` +
       `versions/${this.config.mediaVersion}/manifest.json`
     );
   }
@@ -2662,7 +2773,8 @@ class CmafRelayCoordinator {
   subtitlePath() {
     const base = this.config.baseUrl.pathname;
     return (
-      `${base}rooms/${this.config.roomId}/assets/${this.config.assetId}/` +
+      `${base}rooms/${this.config.roomId}/sessions/${this.config.sessionId}/` +
+      `assets/${this.config.assetId}/` +
       `versions/${this.config.mediaVersion}/subtitle.vtt`
     );
   }
@@ -2776,11 +2888,14 @@ class CmafRelayCoordinator {
             bytes: item.data.length,
             uploaded: false,
             failed: false,
+            retired: false,
+            retryAttempts: 0,
+            nextRetryAt: 0,
             cachedAt: Date.now(),
           };
           this.records.set(key, record);
           this.diskBytes += record.bytes;
-          this.uploadQueue.push(record);
+          state.uploadQueue.push(record);
           this.pumpUploads();
         } catch (error) {
           await fsp.unlink(temporaryPath).catch(() => undefined);
@@ -2813,18 +2928,47 @@ class CmafRelayCoordinator {
   }
 
   pumpUploads() {
-    while (
-      !this.closed &&
-      this.activeUploads < RELAY_UPLOAD_CONCURRENCY &&
-      this.uploadHead < this.uploadQueue.length
-    ) {
-      const record = this.uploadQueue[this.uploadHead++];
-      if (record.uploaded || record.failed) continue;
+    if (this.uploadBudgetBps === 0) return;
+    this.retireExpiredFailedRecords();
+    while (!this.closed && this.activeUploads < RELAY_UPLOAD_CONCURRENCY) {
+      const now = Date.now();
+      let selectedState;
+      let record;
+      for (const state of this.renditions.values()) {
+        if (state.uploadActive) continue;
+        while (state.uploadHead < state.uploadQueue.length) {
+          const candidate = state.uploadQueue[state.uploadHead];
+          if (candidate.uploaded || candidate.retired) {
+            state.uploadHead += 1;
+            continue;
+          }
+          if (candidate.failed && candidate.nextRetryAt > now) break;
+          if (candidate.failed) {
+            candidate.failed = false;
+            this.failedRecords.delete(candidate);
+          }
+          selectedState = state;
+          record = candidate;
+          break;
+        }
+        if (record) break;
+      }
+      if (!record || !selectedState) {
+        this.scheduleFailedRetry();
+        break;
+      }
+      selectedState.uploadActive = true;
       this.activeUploads += 1;
+      const recoveryProbe = record.retryAttempts > 0;
       void this.uploadRecord(record)
+        .then(() => {
+          record.retryAttempts = 0;
+          record.nextRetryAt = 0;
+          selectedState.uploadHead += 1;
+          if (recoveryProbe) this.retryFailedRecords(true);
+        })
         .catch((error) => {
-          record.failed = true;
-          this.failedRecords.add(record);
+          this.markRecordFailed(record);
           this.sendEvent({
             type: "warning",
             code: "segment-relay-upload-failed",
@@ -2833,18 +2977,160 @@ class CmafRelayCoordinator {
           });
         })
         .finally(() => {
+          selectedState.uploadActive = false;
           this.activeUploads = Math.max(0, this.activeUploads - 1);
           if (
-            this.uploadHead > 1_024 &&
-            this.uploadHead * 2 >= this.uploadQueue.length
+            selectedState.uploadHead > 1_024 &&
+            selectedState.uploadHead * 2 >= selectedState.uploadQueue.length
           ) {
-            this.uploadQueue = this.uploadQueue.slice(this.uploadHead);
-            this.uploadHead = 0;
+            selectedState.uploadQueue = selectedState.uploadQueue.slice(
+              selectedState.uploadHead,
+            );
+            selectedState.uploadHead = 0;
           }
           this.evictDisk();
           this.updatePressure();
           this.pumpUploads();
         });
+    }
+  }
+
+  recordInUrgentWindow(record) {
+    if (record.kind === "init") return true;
+    const timelineTimeMs = Number(record.descriptor?.timelineTimeMs);
+    if (
+      !Number.isFinite(timelineTimeMs) ||
+      this.playbackAnchorTimeMs === undefined
+    ) {
+      return true;
+    }
+    return (
+      timelineTimeMs >=
+        this.playbackAnchorTimeMs - RELAY_FAILED_RECORD_RETENTION_MS &&
+      timelineTimeMs <= this.playbackAnchorTimeMs + 120_000
+    );
+  }
+
+  markRecordFailed(record) {
+    if (record.retired || record.uploaded || this.closed) return;
+    record.failed = true;
+    record.retryAttempts = Math.min(
+      1_000_000,
+      Math.max(0, Number(record.retryAttempts) || 0) + 1,
+    );
+    const baseDelay =
+      RELAY_FAILED_RETRY_DELAYS_MS[
+        Math.min(
+          RELAY_FAILED_RETRY_DELAYS_MS.length - 1,
+          record.retryAttempts - 1,
+        )
+      ];
+    const jitter = 0.8 + Math.max(0, Math.min(1, this.retryRandom())) * 0.4;
+    record.nextRetryAt = Date.now() + Math.round(baseDelay * jitter);
+    this.failedRecords.add(record);
+    this.scheduleFailedRetry();
+  }
+
+  retryFailedRecords(urgentOnly = false) {
+    const now = Date.now();
+    for (const record of this.failedRecords) {
+      if (
+        record.retired ||
+        record.uploaded ||
+        (urgentOnly && !this.recordInUrgentWindow(record))
+      ) {
+        continue;
+      }
+      record.failed = false;
+      record.nextRetryAt = now;
+      this.failedRecords.delete(record);
+    }
+    this.scheduleFailedRetry();
+  }
+
+  scheduleFailedRetry() {
+    if (this.closed) return;
+    if (this.failedRetryTimer) {
+      clearTimeout(this.failedRetryTimer);
+      this.failedRetryTimer = undefined;
+    }
+    let earliest = Number.POSITIVE_INFINITY;
+    for (const record of this.failedRecords) {
+      if (!record.retired && !record.uploaded) {
+        earliest = Math.min(earliest, Number(record.nextRetryAt) || 0);
+      }
+    }
+    if (!Number.isFinite(earliest)) return;
+    this.failedRetryTimer = setTimeout(() => {
+      this.failedRetryTimer = undefined;
+      const now = Date.now();
+      for (const record of this.failedRecords) {
+        if (record.nextRetryAt > now || record.retired || record.uploaded) {
+          continue;
+        }
+        record.failed = false;
+        this.failedRecords.delete(record);
+      }
+      this.pumpUploads();
+    }, Math.max(25, earliest - Date.now()));
+    this.failedRetryTimer.unref?.();
+  }
+
+  retireExpiredFailedRecords() {
+    if (this.playbackAnchorTimeMs === undefined) return;
+    const cutoff =
+      this.playbackAnchorTimeMs - RELAY_FAILED_RECORD_RETENTION_MS;
+    for (const record of [...this.failedRecords]) {
+      const endTimeMs =
+        Number(record.descriptor?.timelineTimeMs) +
+        Math.max(1, Number(record.descriptor?.durationMs) || 1);
+      if (
+        record.kind !== "segment" ||
+        !Number.isFinite(endTimeMs) ||
+        endTimeMs >= cutoff
+      ) {
+        continue;
+      }
+      record.retired = true;
+      record.failed = false;
+      this.failedRecords.delete(record);
+      this.records.delete(record.key);
+      this.diskBytes = Math.max(0, this.diskBytes - record.bytes);
+      const state = this.renditions.get(record.renditionId);
+      state?.descriptors.delete(record.sequence);
+      state?.uploadedDescriptors.delete(record.sequence);
+      state?.segments.delete(record.sequence);
+      if (state) {
+        // A retired failure was the serial upload head, so every later
+        // segment is still unpublished. Start a fresh contiguous prefix
+        // after the obsolete hole; otherwise one abandoned sequence would
+        // suppress this rendition forever.
+        state.firstSegmentSequence = record.sequence + 1;
+        state.contiguousUploadedSequence = undefined;
+        state.segments.clear();
+        for (const sequence of state.uploadedDescriptors.keys()) {
+          if (sequence < state.firstSegmentSequence) {
+            state.uploadedDescriptors.delete(sequence);
+          }
+        }
+      }
+      void fsp.unlink(record.filePath).catch(() => undefined);
+      this.scheduleManifest();
+    }
+  }
+
+  publishContiguousSegments(state) {
+    let next =
+      state.contiguousUploadedSequence === undefined
+        ? state.firstSegmentSequence
+        : state.contiguousUploadedSequence + 1;
+    if (!Number.isSafeInteger(next)) return;
+    while (state.uploadedDescriptors.has(next)) {
+      const descriptor = state.uploadedDescriptors.get(next);
+      state.uploadedDescriptors.delete(next);
+      state.segments.set(next, descriptor);
+      state.contiguousUploadedSequence = next;
+      next += 1;
     }
   }
 
@@ -2861,9 +3147,54 @@ class CmafRelayCoordinator {
     if (record.kind === "init") {
       state.initUploaded = true;
     } else if (record.descriptor) {
-      state.segments.set(record.sequence, record.descriptor);
+      state.uploadedDescriptors.set(record.sequence, record.descriptor);
+      this.publishContiguousSegments(state);
     }
     this.scheduleManifest();
+  }
+
+  async waitForUploadBudget(bytes, signal) {
+    if (!Number.isFinite(this.uploadBudgetBps)) return;
+    if (this.uploadBudgetBps <= 0) {
+      throw new Error("HTTPS 分片上传已等待可用上行预算");
+    }
+    const now = performance.now();
+    const elapsedMs = Math.max(0, now - this.uploadBudgetUpdatedAt);
+    const maximumBurstBytes = (this.uploadBudgetBps / 8) * 2;
+    this.uploadBudgetTokens = Math.min(
+      maximumBurstBytes,
+      this.uploadBudgetTokens +
+        (elapsedMs * this.uploadBudgetBps) / 8_000,
+    );
+    this.uploadBudgetUpdatedAt = now;
+    this.uploadBudgetTokens -= Math.max(0, Number(bytes) || 0);
+    if (this.uploadBudgetTokens >= 0) return;
+    const waitMs = Math.min(
+      30_000,
+      (-this.uploadBudgetTokens * 8_000) / this.uploadBudgetBps,
+    );
+    await new Promise((resolve, reject) => {
+      if (signal.aborted) {
+        reject(signal.reason || new Error("segment-upload-cancelled"));
+        return;
+      }
+      let timer;
+      const cleanup = () => {
+        clearTimeout(timer);
+        signal.removeEventListener("abort", aborted);
+      };
+      const finish = () => {
+        cleanup();
+        resolve();
+      };
+      const aborted = () => {
+        cleanup();
+        reject(signal.reason || new Error("segment-upload-cancelled"));
+      };
+      timer = setTimeout(finish, Math.max(1, waitMs));
+      timer.unref?.();
+      signal.addEventListener("abort", aborted, { once: true });
+    });
   }
 
   async uploadFile(url, filePath, bytes, headers) {
@@ -2888,10 +3219,14 @@ class CmafRelayCoordinator {
       refreshIdle();
       const monitoredBody = (async function* () {
         for await (const chunk of stream) {
+          await this.waitForUploadBudget(
+            chunk.byteLength,
+            controller.signal,
+          );
           refreshIdle();
           yield chunk;
         }
-      })();
+      }).call(this);
       try {
         const response = await fetch(url, {
           method: "PUT",
@@ -2928,6 +3263,7 @@ class CmafRelayCoordinator {
   scheduleManifest() {
     this.manifestDirty = true;
     if (
+      this.uploadBudgetBps === 0 ||
       this.manifestUploading ||
       this.manifestRetryTimer ||
       this.closed
@@ -3003,6 +3339,7 @@ class CmafRelayCoordinator {
         startTimeTicks: Number(primary.plan.startTimeTicks) || 0,
         runtimeTicks: Number(primary.plan.runtimeTicks) || undefined,
         updatedAt: Date.now(),
+        playbackTimeMs: anchorTimeMs,
         ended: this.manifestEnded,
         subtitle: this.manifestSubtitle,
         renditions: ready
@@ -3016,6 +3353,26 @@ class CmafRelayCoordinator {
             mimeType: state.mimeType,
             switchGroup: state.switchGroup,
             initPath: state.initPath,
+            ended:
+              (this.manifestEnded || state.ended) &&
+              !state.spooling &&
+              state.pendingHead >= state.pending.length &&
+              !state.uploadActive &&
+              state.uploadHead >= state.uploadQueue.length,
+            finalSequence:
+              state.contiguousUploadedSequence === undefined
+                ? undefined
+                : state.contiguousUploadedSequence,
+            finalTimelineEndMs: (() => {
+              const finalSegment =
+                state.contiguousUploadedSequence === undefined
+                  ? undefined
+                  : state.segments.get(state.contiguousUploadedSequence);
+              return finalSegment
+                ? finalSegment.timelineTimeMs +
+                    Math.max(1, finalSegment.durationMs)
+                : undefined;
+            })(),
             segments: [...state.segments.values()]
               .filter(
                 (segment) =>
@@ -3083,6 +3440,17 @@ class CmafRelayCoordinator {
     }
   }
 
+  applyProducerPause(state) {
+    const shouldPause =
+      state.pressurePaused === true ||
+      state.demandPaused === true ||
+      state.budgetPaused === true;
+    if (shouldPause === state.producerPaused) return;
+    state.producerPaused = shouldPause;
+    if (shouldPause) state.pause();
+    else state.resume();
+  }
+
   updatePressure() {
     const storagePressured =
       this.memoryQueuedBytes >= RELAY_MEMORY_HIGH_WATER_BYTES ||
@@ -3104,25 +3472,25 @@ class CmafRelayCoordinator {
         !state.pressurePaused
       ) {
         state.pressurePaused = true;
-        state.pause();
       } else if (
         storageRecovered &&
         horizonRecovered &&
         state.pressurePaused
       ) {
         state.pressurePaused = false;
-        state.resume();
       }
+      this.applyProducerPause(state);
     }
   }
 
   dataQueuesDrained() {
     return (
       this.activeUploads === 0 &&
-      this.uploadHead >= this.uploadQueue.length &&
       [...this.renditions.values()].every(
         (state) =>
-          !state.spooling && state.pendingHead >= state.pending.length,
+          !state.spooling &&
+          state.pendingHead >= state.pending.length &&
+          state.uploadHead >= state.uploadQueue.length,
       )
     );
   }
@@ -3156,6 +3524,10 @@ class CmafRelayCoordinator {
       clearTimeout(this.manifestRetryTimer);
       this.manifestRetryTimer = undefined;
     }
+    if (this.failedRetryTimer) {
+      clearTimeout(this.failedRetryTimer);
+      this.failedRetryTimer = undefined;
+    }
     if (ended) {
       const drained = await this.waitForFinalDrain();
       await this.waitForManifestIdle();
@@ -3187,17 +3559,26 @@ class CmafRelayCoordinator {
       }
     }
     this.closed = true;
+    if (this.failedRetryTimer) {
+      clearTimeout(this.failedRetryTimer);
+      this.failedRetryTimer = undefined;
+    }
+    if (this.manifestRetryTimer) {
+      clearTimeout(this.manifestRetryTimer);
+      this.manifestRetryTimer = undefined;
+    }
     this.generation += 1;
     this.controller.abort("relay-closed");
     for (const state of this.renditions.values()) {
-      if (state.pressurePaused) state.resume();
+      if (state.producerPaused) state.resume();
+      state.producerPaused = false;
     }
   }
 }
 
 class EmbyService {
   constructor(options = {}) {
-    this.version = cleanText(options.version || "2.9.0", 32);
+    this.version = cleanText(options.version || "2.9.1", 32);
     this.deviceId = cleanText(options.deviceId || randomUUID(), 128);
     this.ffmpegPath = resolveFfmpegPath(options);
     this.spawnProcess =
@@ -3214,6 +3595,20 @@ class EmbyService {
     this.ownsRelayCoordinator = false;
     this.auxiliary = options.auxiliary === true;
     this.auxiliaryServices = new Map();
+    this.auxiliaryIdleTimers = new Map();
+    this.auxiliaryDemand = new Set(
+      CMAF_AUXILIARY_RENDITIONS.filter(
+        (rendition) => rendition.defaultActive,
+      ).map((rendition) => rendition.id),
+    );
+    this.auxiliarySourceInput = undefined;
+    this.auxiliaryIdleMs = Math.max(
+      1_000,
+      Math.min(
+        5 * 60_000,
+        Number(options.auxiliaryIdleMs) || AUXILIARY_RENDITION_IDLE_MS,
+      ),
+    );
     this.streamInitTimeoutMs = Math.max(
       500,
       Math.min(
@@ -4174,16 +4569,14 @@ class EmbyService {
       "-fflags",
       "+genpts+discardcorrupt",
     ];
-    if (!(relayCoordinator && input.singleRendition === true)) {
-      args.push(
-        "-readrate",
-        String(readAhead.readRate),
-        "-readrate_initial_burst",
-        String(readAhead.initialBurstSeconds),
-        "-readrate_catchup",
-        String(readAhead.catchupRate),
-      );
-    }
+    args.push(
+      "-readrate",
+      String(readAhead.readRate),
+      "-readrate_initial_burst",
+      String(readAhead.initialBurstSeconds),
+      "-readrate_catchup",
+      String(readAhead.catchupRate),
+    );
     if (
       startSeconds > 0 &&
       (["DirectPlay", "LocalRemux"].includes(plan.public.method) ||
@@ -4571,46 +4964,91 @@ class EmbyService {
       this.ownsRelayCoordinator &&
       input.singleRendition !== true
     ) {
-      void this.startAuxiliaryRenditions(input);
+      this.auxiliarySourceInput = { ...input };
+      this.updateRenditionDemand();
     }
     return { pipelineId, plan: plan.public };
   }
 
-  async startAuxiliaryRenditions(input) {
+  updateRenditionDemand(input = {}) {
+    const coordinator = this.relayCoordinator;
+    if (!coordinator || this.auxiliary) {
+      return {
+        updated: false,
+        active: [],
+        uploadBudgetBps: Number.POSITIVE_INFINITY,
+      };
+    }
+    const uploadBudgetBps =
+      Number.isFinite(Number(input.availableUploadBps)) &&
+      Number(input.availableUploadBps) >= 0
+        ? coordinator.setUploadBudget(input.availableUploadBps)
+        : coordinator.uploadBudgetBps;
+    const nextDemand = new Set(
+      CMAF_AUXILIARY_RENDITIONS.filter(
+        (rendition) => rendition.defaultActive,
+      ).map((rendition) => rendition.id),
+    );
+    if (input.original === true) nextDemand.add("original");
+    if (input.low === true) nextDemand.add("480p18");
+    this.auxiliaryDemand = nextDemand;
+
+    for (const rendition of CMAF_AUXILIARY_RENDITIONS) {
+      const existingTimer = this.auxiliaryIdleTimers.get(rendition.id);
+      if (nextDemand.has(rendition.id)) {
+        if (existingTimer) clearTimeout(existingTimer);
+        this.auxiliaryIdleTimers.delete(rendition.id);
+        coordinator.setRenditionDemandActive(rendition.id, true);
+        continue;
+      }
+      if (!this.auxiliaryServices.has(rendition.id) || existingTimer) {
+        continue;
+      }
+      const timer = setTimeout(() => {
+        this.auxiliaryIdleTimers.delete(rendition.id);
+        if (
+          this.auxiliaryDemand.has(rendition.id) ||
+          !this.auxiliaryServices.has(rendition.id) ||
+          this.relayCoordinator !== coordinator
+        ) {
+          return;
+        }
+        coordinator.setRenditionDemandActive(rendition.id, false);
+      }, this.auxiliaryIdleMs);
+      timer.unref?.();
+      this.auxiliaryIdleTimers.set(rendition.id, timer);
+    }
+    if (this.auxiliarySourceInput) {
+      void this.startAuxiliaryRenditions(
+        this.auxiliarySourceInput,
+        nextDemand,
+      );
+    }
+    return {
+      updated: true,
+      active: [...nextDemand],
+      uploadBudgetBps,
+      pipelineId: this.pipeline?.id || "",
+    };
+  }
+
+  async startAuxiliaryRenditions(input, requestedRenditions) {
     const coordinator = this.relayCoordinator;
     if (!coordinator || this.auxiliary || this.pipeline?.stopping) return;
-    const specifications = [
-      {
-        id: "original",
-        quality: "original",
-        allowHevc: input.allowHevc === true,
-        forceVideoTranscode: false,
-      },
-      {
-        id: "1080p8",
-        quality: "1080p-8",
-        allowHevc: false,
-        forceVideoTranscode: true,
-      },
-      {
-        id: "720p4",
-        quality: "720p-4",
-        allowHevc: false,
-        forceVideoTranscode: true,
-      },
-      {
-        id: "480p18",
-        quality: "480p-1.8",
-        allowHevc: false,
-        forceVideoTranscode: true,
-      },
-    ];
-    for (const [index, specification] of specifications.entries()) {
+    const desired =
+      requestedRenditions instanceof Set
+        ? requestedRenditions
+        : this.auxiliaryDemand;
+    const specifications = CMAF_AUXILIARY_RENDITIONS.filter(
+      (rendition) => desired.has(rendition.id),
+    );
+    for (const specification of specifications) {
       if (!this.pipeline || this.pipeline.stopping || this.relayCoordinator !== coordinator) {
         return;
       }
-      if (index > 0) {
-        await new Promise((resolve) => setTimeout(resolve, 200));
+      if (this.auxiliaryServices.has(specification.id)) {
+        coordinator.setRenditionDemandActive(specification.id, true);
+        continue;
       }
       const service = new EmbyService({
         ...this.childServiceOptions,
@@ -4634,11 +5072,22 @@ class EmbyService {
       });
       service.session = this.session;
       this.auxiliaryServices.set(specification.id, service);
+      const currentPlaybackTicks = Number.isFinite(
+        coordinator.playbackAnchorTimeMs,
+      )
+        ? Math.max(
+            Number(input.startTimeTicks) || 0,
+            Math.round(coordinator.playbackAnchorTimeMs * 10_000),
+          )
+        : Number(input.startTimeTicks) || 0;
       void service
         .startStream({
           ...input,
+          startTimeTicks: currentPlaybackTicks,
           quality: specification.quality,
-          allowHevc: specification.allowHevc,
+          allowHevc:
+            specification.id === "original" &&
+            input.allowHevc === true,
           forceVideoTranscode: specification.forceVideoTranscode,
           renditionId: specification.id,
           singleRendition: true,
@@ -4779,6 +5228,11 @@ class EmbyService {
     if (options.preserveGeneration !== true) {
       this.streamGeneration += 1;
     }
+    for (const timer of this.auxiliaryIdleTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.auxiliaryIdleTimers.clear();
+    this.auxiliarySourceInput = undefined;
     const auxiliaryServices = [...this.auxiliaryServices.values()];
     this.auxiliaryServices.clear();
     const stoppingAuxiliaries = Promise.allSettled(

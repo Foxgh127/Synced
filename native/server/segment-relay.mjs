@@ -18,7 +18,15 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import {
+  link,
+  mkdir,
+  readFile,
+  rename,
+  stat,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { pipeline } from "node:stream/promises";
@@ -36,6 +44,7 @@ const MIN_DISK_BYTES = 64 * 1024 * 1024;
 const MAX_DISK_BYTES = 5 * 1024 * 1024 * 1024;
 const INDEX_WRITE_DELAY_MS = 250;
 const ROOM_PATTERN = /^[23456789A-HJ-NP-Z]{8}$/;
+const SESSION_PATTERN = /^[a-z0-9-]{8,128}$/i;
 const ASSET_PATTERN = /^[a-f0-9]{24,64}$/;
 const RENDITION_PATTERN = /^[a-z0-9][a-z0-9-]{0,31}$/;
 
@@ -96,7 +105,12 @@ function recordExtension(kind) {
 }
 
 function indexedRecordKey(value) {
-  const root = `${value.room}/${value.assetId}/${value.mediaVersion}`;
+  if (!SESSION_PATTERN.test(String(value.sessionId || ""))) {
+    return undefined;
+  }
+  const root =
+    `${value.room}/${value.sessionId}/${value.assetId}/` +
+    `${value.mediaVersion}`;
   if (value.kind === "manifest") return `${root}/manifest`;
   if (value.kind === "subtitle") return `${root}/subtitle`;
   if (!RENDITION_PATTERN.test(String(value.rendition || ""))) {
@@ -147,16 +161,19 @@ function relayRoute(pathname) {
     parts[0] !== "media" ||
     parts[1] !== "v1" ||
     parts[2] !== "rooms" ||
-    parts[4] !== "assets" ||
-    parts[6] !== "versions"
+    parts[4] !== "sessions" ||
+    parts[6] !== "assets" ||
+    parts[8] !== "versions"
   ) {
     return undefined;
   }
   const room = String(parts[3] || "").toUpperCase();
-  const assetId = String(parts[5] || "").toLowerCase();
-  const mediaVersion = Number(parts[7]);
+  const sessionId = String(parts[5] || "").toLowerCase();
+  const assetId = String(parts[7] || "").toLowerCase();
+  const mediaVersion = Number(parts[9]);
   if (
     !ROOM_PATTERN.test(room) ||
+    !SESSION_PATTERN.test(sessionId) ||
     !ASSET_PATTERN.test(assetId) ||
     !Number.isSafeInteger(mediaVersion) ||
     mediaVersion < 1 ||
@@ -164,40 +181,41 @@ function relayRoute(pathname) {
   ) {
     return null;
   }
-  const root = { room, assetId, mediaVersion };
-  if (parts.length === 9 && parts[8] === "manifest.json") {
+  const root = { room, sessionId, assetId, mediaVersion };
+  const keyRoot = `${room}/${sessionId}/${assetId}/${mediaVersion}`;
+  if (parts.length === 11 && parts[10] === "manifest.json") {
     return {
       ...root,
       kind: "manifest",
-      key: `${room}/${assetId}/${mediaVersion}/manifest`,
+      key: `${keyRoot}/manifest`,
     };
   }
-  if (parts.length === 9 && parts[8] === "subtitle.vtt") {
+  if (parts.length === 11 && parts[10] === "subtitle.vtt") {
     return {
       ...root,
       kind: "subtitle",
-      key: `${room}/${assetId}/${mediaVersion}/subtitle`,
+      key: `${keyRoot}/subtitle`,
     };
   }
   if (
-    parts[8] !== "renditions" ||
-    !RENDITION_PATTERN.test(String(parts[9] || ""))
+    parts[10] !== "renditions" ||
+    !RENDITION_PATTERN.test(String(parts[11] || ""))
   ) {
     return null;
   }
-  const rendition = parts[9];
-  if (parts.length === 11 && parts[10] === "init.mp4") {
+  const rendition = parts[11];
+  if (parts.length === 13 && parts[12] === "init.mp4") {
     return {
       ...root,
       rendition,
       kind: "init",
-      key: `${room}/${assetId}/${mediaVersion}/${rendition}/init`,
+      key: `${keyRoot}/${rendition}/init`,
     };
   }
   const sequenceMatch =
-    parts.length === 12 &&
-    parts[10] === "segments" &&
-    String(parts[11] || "").match(/^(\d+)\.m4s$/);
+    parts.length === 14 &&
+    parts[12] === "segments" &&
+    String(parts[13] || "").match(/^(\d+)\.m4s$/);
   if (!sequenceMatch) return null;
   const sequence = Number(sequenceMatch[1]);
   if (
@@ -212,7 +230,7 @@ function relayRoute(pathname) {
     rendition,
     sequence,
     kind: "segment",
-    key: `${room}/${assetId}/${mediaVersion}/${rendition}/${sequence}`,
+    key: `${keyRoot}/${rendition}/${sequence}`,
   };
 }
 
@@ -226,12 +244,14 @@ function validateManifest(bytes, route) {
   if (
     manifest?.protocol !== "synced-cmaf-v1" ||
     manifest.roomId !== route.room ||
+    manifest.sessionId !== route.sessionId ||
     manifest.assetId !== route.assetId ||
     Number(manifest.mediaVersion) !== route.mediaVersion ||
-    typeof manifest.sessionId !== "string" ||
-    manifest.sessionId.length < 1 ||
-    manifest.sessionId.length > 128 ||
-    /[\u0000-\u001f\u007f]/u.test(manifest.sessionId) ||
+    (manifest.playbackTimeMs !== undefined &&
+      (!Number.isFinite(Number(manifest.playbackTimeMs)) ||
+        Number(manifest.playbackTimeMs) < 0)) ||
+    (manifest.ended !== undefined &&
+      typeof manifest.ended !== "boolean") ||
     !Array.isArray(manifest.renditions) ||
     manifest.renditions.length < 1 ||
     manifest.renditions.length > 8
@@ -239,7 +259,8 @@ function validateManifest(bytes, route) {
     throw Object.assign(new Error("manifest-schema"), { statusCode: 400 });
   }
   const versionRoot =
-    `${SEGMENT_RELAY_BASE_PATH}/rooms/${route.room}/assets/${route.assetId}/` +
+    `${SEGMENT_RELAY_BASE_PATH}/rooms/${route.room}/sessions/` +
+    `${route.sessionId}/assets/${route.assetId}/` +
     `versions/${route.mediaVersion}/`;
   if (
     manifest.subtitle !== undefined &&
@@ -270,6 +291,17 @@ function validateManifest(bytes, route) {
       !Number.isFinite(Number(rendition?.bitrate)) ||
       Number(rendition.bitrate) <= 0 ||
       Number(rendition.bitrate) > 250_000_000 ||
+      (rendition.ended !== undefined &&
+        typeof rendition.ended !== "boolean") ||
+      (rendition.finalSequence !== undefined &&
+        (!Number.isSafeInteger(Number(rendition.finalSequence)) ||
+          Number(rendition.finalSequence) < 1 ||
+          Number(rendition.finalSequence) > 0xffffffff)) ||
+      (rendition.finalTimelineEndMs !== undefined &&
+        (!Number.isFinite(Number(rendition.finalTimelineEndMs)) ||
+          Number(rendition.finalTimelineEndMs) < 0)) ||
+      (rendition.finalTimelineEndMs !== undefined &&
+        rendition.finalSequence === undefined) ||
       !Array.isArray(rendition?.segments) ||
       rendition.segments.length > 100_000
     ) {
@@ -279,6 +311,7 @@ function validateManifest(bytes, route) {
     }
     renditionIds.add(rendition.id);
     const segmentSequences = new Set();
+    let previousSequence;
     for (const segment of rendition.segments) {
       if (Array.isArray(segment)) {
         const sequence = Number(segment[0]);
@@ -307,6 +340,15 @@ function validateManifest(bytes, route) {
           });
         }
         segmentSequences.add(sequence);
+        if (
+          previousSequence !== undefined &&
+          sequence !== previousSequence + 1
+        ) {
+          throw Object.assign(new Error("manifest-segment-gap"), {
+            statusCode: 400,
+          });
+        }
+        previousSequence = sequence;
       } else {
         const sequence = Number(segment?.sequence);
         if (
@@ -335,6 +377,15 @@ function validateManifest(bytes, route) {
           });
         }
         segmentSequences.add(sequence);
+        if (
+          previousSequence !== undefined &&
+          sequence !== previousSequence + 1
+        ) {
+          throw Object.assign(new Error("manifest-segment-gap"), {
+            statusCode: 400,
+          });
+        }
+        previousSequence = sequence;
       }
     }
   }
@@ -361,9 +412,11 @@ export class SegmentRelayStore {
       1024 * 1024 * 1024,
     );
     this.records = new Map();
+    this.activeSessions = new Map();
     this.diskBytes = 0;
     this.memoryBytes = 0;
     this.indexTimer = undefined;
+    this.mutationQueue = Promise.resolve();
     this.closed = false;
     this.loadIndex();
   }
@@ -381,6 +434,7 @@ export class SegmentRelayStore {
           !/^[a-f0-9]{64}\.(?:json|vtt|mp4|m4s)$/.test(value.fileName) ||
           !["manifest", "subtitle", "init", "segment"].includes(value.kind) ||
           !ROOM_PATTERN.test(String(value.room || "")) ||
+          !SESSION_PATTERN.test(String(value.sessionId || "")) ||
           !ASSET_PATTERN.test(String(value.assetId || "")) ||
           !Number.isSafeInteger(value.mediaVersion) ||
           value.mediaVersion < 1 ||
@@ -406,8 +460,19 @@ export class SegmentRelayStore {
           contentType: contentTypeForKind(value.kind),
           etag: `"${value.sha256}"`,
           buffer: undefined,
+          manifest: undefined,
           lastAccess: Number(value.lastAccess) || Date.now(),
         };
+        if (record.kind === "manifest") {
+          try {
+            record.manifest = validateManifest(
+              readFileSync(filePath),
+              record,
+            );
+          } catch {
+            continue;
+          }
+        }
         this.records.set(record.key, record);
         this.diskBytes += record.bytes;
       }
@@ -422,7 +487,29 @@ export class SegmentRelayStore {
   }
 
   async commit(route, temporaryPath, bytes, metadata) {
+    let releaseMutation;
+    const previousMutation = this.mutationQueue;
+    this.mutationQueue = new Promise((resolve) => {
+      releaseMutation = resolve;
+    });
+    await previousMutation;
+    try {
+      return await this.commitLocked(
+        route,
+        temporaryPath,
+        bytes,
+        metadata,
+      );
+    } finally {
+      releaseMutation();
+    }
+  }
+
+  async commitLocked(route, temporaryPath, bytes, metadata) {
     if (this.closed) throw new Error("segment-store-closed");
+    if (route.kind === "manifest") {
+      this.validateManifestObjects(route, metadata.manifest);
+    }
     const existing = this.records.get(route.key);
     if (existing && route.kind !== "manifest") {
       await unlink(temporaryPath).catch(() => undefined);
@@ -442,11 +529,31 @@ export class SegmentRelayStore {
     const fileName =
       `${safeRecordName(route.key)}.${recordExtension(route.kind)}`;
     const filePath = path.join(this.rootDir, fileName);
-    await rename(temporaryPath, filePath).catch(async (error) => {
-      if (error?.code !== "EEXIST" && error?.code !== "EPERM") throw error;
-      await unlink(filePath).catch(() => undefined);
-      await rename(temporaryPath, filePath);
-    });
+    if (route.kind === "manifest") {
+      await rename(temporaryPath, filePath).catch(async (error) => {
+        if (error?.code !== "EEXIST" && error?.code !== "EPERM") throw error;
+        await unlink(filePath).catch(() => undefined);
+        await rename(temporaryPath, filePath);
+      });
+    } else {
+      try {
+        // Hard-linking is an exclusive create on every supported relay
+        // platform. Unlike rename(), it cannot silently replace an immutable
+        // object when two PUT requests for the same key finish together.
+        await link(temporaryPath, filePath);
+        await unlink(temporaryPath);
+      } catch (error) {
+        if (error?.code !== "EEXIST") throw error;
+        const onDisk = await readFile(filePath);
+        const onDiskHash = createHash("sha256").update(onDisk).digest("hex");
+        await unlink(temporaryPath).catch(() => undefined);
+        if (onDisk.length !== bytes || onDiskHash !== metadata.sha256) {
+          throw Object.assign(new Error("immutable-object-conflict"), {
+            statusCode: 409,
+          });
+        }
+      }
+    }
     if (existing) {
       this.diskBytes -= existing.bytes;
       if (existing.buffer) this.memoryBytes -= existing.buffer.byteLength;
@@ -454,6 +561,7 @@ export class SegmentRelayStore {
     const record = {
       key: route.key,
       room: route.room,
+      sessionId: route.sessionId,
       assetId: route.assetId,
       mediaVersion: route.mediaVersion,
       rendition: route.rendition,
@@ -464,6 +572,7 @@ export class SegmentRelayStore {
       etag: `"${metadata.sha256}"`,
       sha256: metadata.sha256,
       mediaTimeMs: metadata.mediaTimeMs,
+      timelineTimeMs: metadata.timelineTimeMs,
       durationMs: metadata.durationMs,
       keyframe: metadata.keyframe,
       bitrate: metadata.bitrate,
@@ -471,6 +580,8 @@ export class SegmentRelayStore {
       filePath,
       lastAccess: Date.now(),
       buffer: undefined,
+      manifest:
+        route.kind === "manifest" ? metadata.manifest : undefined,
     };
     this.records.delete(route.key);
     this.records.set(route.key, record);
@@ -483,9 +594,55 @@ export class SegmentRelayStore {
         record.buffer = undefined;
       }
     }
+    if (record.kind === "manifest") this.noteManifest(record);
     this.evict();
     this.scheduleIndex();
     return record;
+  }
+
+  validateManifestObjects(route, manifest) {
+    const root =
+      `${route.room}/${route.sessionId}/${route.assetId}/` +
+      `${route.mediaVersion}`;
+    for (const rendition of manifest.renditions) {
+      if (!this.records.has(`${root}/${rendition.id}/init`)) {
+        throw Object.assign(new Error("manifest-init-missing"), {
+          statusCode: 409,
+        });
+      }
+      for (const segment of rendition.segments) {
+        const sequence = Number(
+          Array.isArray(segment) ? segment[0] : segment.sequence,
+        );
+        const bytes = Number(
+          Array.isArray(segment) ? segment[5] : segment.bytes,
+        );
+        const sha256 = Array.isArray(segment)
+          ? segment[6]
+          : segment.sha256;
+        const record = this.records.get(
+          `${root}/${rendition.id}/${sequence}`,
+        );
+        if (
+          !record ||
+          record.kind !== "segment" ||
+          record.bytes !== bytes ||
+          (sha256 !== undefined && record.sha256 !== sha256)
+        ) {
+          throw Object.assign(new Error("manifest-segment-missing"), {
+            statusCode: 409,
+          });
+        }
+      }
+    }
+    if (
+      manifest.subtitle &&
+      !this.records.has(`${root}/subtitle`)
+    ) {
+      throw Object.assign(new Error("manifest-subtitle-missing"), {
+        statusCode: 409,
+      });
+    }
   }
 
   get(key) {
@@ -495,6 +652,268 @@ export class SegmentRelayStore {
     this.records.delete(key);
     this.records.set(key, record);
     return record;
+  }
+
+  activeSessionKey(room, sessionId) {
+    return `${room}/${sessionId}`;
+  }
+
+  activateSession(room, sessionId) {
+    const normalizedRoom = String(room || "").toUpperCase();
+    const normalizedSession = String(sessionId || "").toLowerCase();
+    if (
+      !ROOM_PATTERN.test(normalizedRoom) ||
+      !SESSION_PATTERN.test(normalizedSession)
+    ) {
+      return false;
+    }
+    const key = this.activeSessionKey(normalizedRoom, normalizedSession);
+    const existing = this.activeSessions.get(key);
+    const entry = existing || {
+      room: normalizedRoom,
+      sessionId: normalizedSession,
+      mediaVersion: undefined,
+      previousVersions: new Map(),
+    };
+    entry.activatedAt = Date.now();
+    let newestVersion = entry.mediaVersion;
+    for (const record of this.records.values()) {
+      if (
+        record.kind === "manifest" &&
+        record.room === normalizedRoom &&
+        record.sessionId === normalizedSession &&
+        (!Number.isSafeInteger(newestVersion) ||
+          record.mediaVersion > newestVersion)
+      ) {
+        newestVersion = record.mediaVersion;
+      }
+    }
+    entry.mediaVersion = newestVersion;
+    this.activeSessions.set(key, entry);
+    return true;
+  }
+
+  deactivateSession(room, sessionId) {
+    const key = this.activeSessionKey(
+      String(room || "").toUpperCase(),
+      String(sessionId || "").toLowerCase(),
+    );
+    const removed = this.activeSessions.delete(key);
+    if (removed) this.evict();
+    return removed;
+  }
+
+  noteManifest(record) {
+    const key = this.activeSessionKey(record.room, record.sessionId);
+    const entry = this.activeSessions.get(key);
+    if (!entry) return;
+    if (
+      Number.isSafeInteger(entry.mediaVersion) &&
+      record.mediaVersion > entry.mediaVersion
+    ) {
+      entry.previousVersions.set(entry.mediaVersion, Date.now() + 120_000);
+    }
+    if (
+      !Number.isSafeInteger(entry.mediaVersion) ||
+      record.mediaVersion >= entry.mediaVersion
+    ) {
+      entry.mediaVersion = record.mediaVersion;
+    }
+  }
+
+  protectedActiveKeys(now = Date.now()) {
+    const protectedKeys = new Set();
+    for (const entry of this.activeSessions.values()) {
+      for (const [version, expiresAt] of entry.previousVersions) {
+        if (expiresAt <= now) entry.previousVersions.delete(version);
+      }
+      const versions = new Set(entry.previousVersions.keys());
+      if (Number.isSafeInteger(entry.mediaVersion)) {
+        versions.add(entry.mediaVersion);
+      }
+      const matchingManifests = [];
+      for (const [key, record] of this.records) {
+        if (
+          record.room === entry.room &&
+          record.sessionId === entry.sessionId &&
+          record.kind === "manifest" &&
+          (!versions.size || versions.has(record.mediaVersion))
+        ) {
+          protectedKeys.add(key);
+          matchingManifests.push(record);
+        }
+      }
+      if (!matchingManifests.length) {
+        // Before the first manifest lands, retain the small in-flight object
+        // set for the explicitly active session. A subsequent manifest gives
+        // eviction an exact advertised window and playback anchor.
+        for (const [key, record] of this.records) {
+          if (
+            record.room === entry.room &&
+            record.sessionId === entry.sessionId &&
+            (!versions.size || versions.has(record.mediaVersion))
+          ) {
+            protectedKeys.add(key);
+          }
+        }
+        continue;
+      }
+      for (const manifestRecord of matchingManifests) {
+        let manifest = manifestRecord.manifest;
+        if (!manifest) {
+          try {
+            manifest = validateManifest(
+              readFileSync(manifestRecord.filePath),
+              manifestRecord,
+            );
+          } catch {
+            continue;
+          }
+        }
+        const root =
+          `${manifestRecord.room}/${manifestRecord.sessionId}/` +
+          `${manifestRecord.assetId}/${manifestRecord.mediaVersion}`;
+        if (manifest.subtitle) protectedKeys.add(`${root}/subtitle`);
+        const playbackTimeMs =
+          Number.isFinite(Number(manifest.playbackTimeMs))
+            ? Number(manifest.playbackTimeMs)
+            : Math.max(0, Number(manifest.startTimeTicks) || 0) / 10_000;
+        for (const rendition of manifest.renditions) {
+          protectedKeys.add(`${root}/${rendition.id}/init`);
+          for (const segment of rendition.segments) {
+            const sequence = Number(
+              Array.isArray(segment) ? segment[0] : segment.sequence,
+            );
+            const timelineTimeMs = Number(
+              Array.isArray(segment)
+                ? segment[2]
+                : segment.timelineTimeMs,
+            );
+            const durationMs = Math.max(
+              1,
+              Number(
+                Array.isArray(segment) ? segment[3] : segment.durationMs,
+              ) || 1,
+            );
+            if (
+              timelineTimeMs + durationMs >= playbackTimeMs - 60_000 &&
+              timelineTimeMs <= playbackTimeMs + 120_000
+            ) {
+              protectedKeys.add(`${root}/${rendition.id}/${sequence}`);
+            }
+          }
+        }
+      }
+    }
+    return protectedKeys;
+  }
+
+  rewriteManifestWithoutSegment(segment) {
+    const manifestKey =
+      `${segment.room}/${segment.sessionId}/${segment.assetId}/` +
+      `${segment.mediaVersion}/manifest`;
+    const manifestRecord = this.records.get(manifestKey);
+    if (!manifestRecord) return true;
+    let manifest = manifestRecord.manifest;
+    if (!manifest) {
+      try {
+        manifest = validateManifest(
+          readFileSync(manifestRecord.filePath),
+          manifestRecord,
+        );
+      } catch {
+        return false;
+      }
+    }
+    let removed = false;
+    const playbackTimeMs =
+      Number.isFinite(Number(manifest.playbackTimeMs))
+        ? Number(manifest.playbackTimeMs)
+        : Math.max(0, Number(manifest.startTimeTicks) || 0) / 10_000;
+    const trimPrefix =
+      Number(segment.timelineTimeMs) < playbackTimeMs;
+    const targetRendition = manifest.renditions.find(
+      (rendition) => rendition.id === segment.rendition,
+    );
+    const targetReferenced = targetRendition?.segments.some(
+      (entry) =>
+        Number(Array.isArray(entry) ? entry[0] : entry.sequence) ===
+        segment.sequence,
+    );
+    if (!targetReferenced) return true;
+    const nextManifest = {
+      ...manifest,
+      updatedAt: Date.now(),
+      renditions: manifest.renditions.map((rendition) => {
+        if (rendition.id !== segment.rendition) return rendition;
+        const segments = rendition.segments.filter((entry) => {
+          const sequence = Number(Array.isArray(entry) ? entry[0] : entry.sequence);
+          const discard = trimPrefix
+            ? sequence <= segment.sequence
+            : sequence >= segment.sequence;
+          if (discard) removed = true;
+          return !discard;
+        });
+        return {
+          ...rendition,
+          segments,
+          ...(!trimPrefix
+            ? {
+                ended: false,
+                finalSequence: undefined,
+                finalTimelineEndMs: undefined,
+              }
+            : {}),
+        };
+      }),
+    };
+    if (!removed) return true;
+    const body = Buffer.from(JSON.stringify(nextManifest));
+    if (body.length > MAX_MANIFEST_BYTES) return false;
+    const temporaryPath =
+      `${manifestRecord.filePath}.${randomUUID()}.tmp`;
+    try {
+      writeFileSync(temporaryPath, body, { mode: 0o600 });
+      renameSync(temporaryPath, manifestRecord.filePath);
+    } catch {
+      try {
+        rmSync(temporaryPath, { force: true });
+      } catch {
+        // A failed atomic manifest rewrite means the segment stays pinned.
+      }
+      return false;
+    }
+    this.diskBytes += body.length - manifestRecord.bytes;
+    if (manifestRecord.buffer) {
+      this.memoryBytes -= manifestRecord.buffer.byteLength;
+    }
+    manifestRecord.bytes = body.length;
+    manifestRecord.sha256 = createHash("sha256").update(body).digest("hex");
+    manifestRecord.etag = `"${manifestRecord.sha256}"`;
+    manifestRecord.buffer = body;
+    manifestRecord.manifest = nextManifest;
+    this.memoryBytes += body.byteLength;
+    return true;
+  }
+
+  removeRecord(key, record, protectedKeys) {
+    if (protectedKeys.has(key)) return false;
+    if (
+      record.kind === "segment" &&
+      !this.rewriteManifestWithoutSegment(record)
+    ) {
+      return false;
+    }
+    this.records.delete(key);
+    this.diskBytes -= record.bytes;
+    if (record.buffer) this.memoryBytes -= record.buffer.byteLength;
+    try {
+      unlinkSync(record.filePath);
+    } catch {
+      // Concurrent readers retain an already-open descriptor. The index no
+      // longer advertises this record, so a later sweep can clean leftovers.
+    }
+    return true;
   }
 
   evict() {
@@ -508,52 +927,19 @@ export class SegmentRelayStore {
     }
     if (this.diskBytes <= this.maxDiskBytes) return;
     const targetBytes = Math.floor(this.maxDiskBytes * 0.9);
-    const protectedMetadata = new Set();
-    const currentManifestByAsset = new Map();
-    for (const [key, record] of this.records) {
-      if (record.kind !== "manifest") continue;
-      const assetKey = `${record.room}/${record.assetId}`;
-      const current = currentManifestByAsset.get(assetKey);
-      if (!current || record.lastAccess > current.record.lastAccess) {
-        currentManifestByAsset.set(assetKey, { key, record });
-      }
-    }
-    for (const { key, record: manifest } of currentManifestByAsset.values()) {
-      protectedMetadata.add(key);
-      for (const [candidateKey, candidate] of this.records) {
-        if (
-          candidate.room === manifest.room &&
-          candidate.assetId === manifest.assetId &&
-          candidate.mediaVersion === manifest.mediaVersion &&
-          (candidate.kind === "init" || candidate.kind === "subtitle")
-        ) {
-          protectedMetadata.add(candidateKey);
-        }
-      }
-    }
-    const removeRecord = (key, record) => {
-      this.records.delete(key);
-      this.diskBytes -= record.bytes;
-      if (record.buffer) this.memoryBytes -= record.buffer.byteLength;
-      try {
-        unlinkSync(record.filePath);
-      } catch {
-        // Concurrent readers keep their open descriptor on supported systems.
-      }
-    };
+    const protectedKeys = this.protectedActiveKeys();
     for (const [key, record] of this.records) {
       if (this.diskBytes <= targetBytes) break;
       if (record.kind === "manifest" || record.kind === "init") continue;
-      if (protectedMetadata.has(key)) continue;
-      removeRecord(key, record);
+      this.removeRecord(key, record, protectedKeys);
     }
-    // Old versions must not accumulate unbounded manifests and init segments.
-    // The newest manifest plus its decoding metadata remain protected.
+    // Inactive sessions may be deleted as a unit. Active session identity,
+    // rather than a mutable lastAccess guess, controls protection.
     for (const [key, record] of this.records) {
       if (this.diskBytes <= targetBytes) break;
-      if (protectedMetadata.has(key)) continue;
-      removeRecord(key, record);
+      this.removeRecord(key, record, protectedKeys);
     }
+    this.scheduleIndex();
   }
 
   deleteRoom(room) {
@@ -567,6 +953,9 @@ export class SegmentRelayStore {
       } catch {
         // Best effort cleanup; the budget pass will retry on future writes.
       }
+    }
+    for (const [key, entry] of this.activeSessions) {
+      if (entry.room === room) this.activeSessions.delete(key);
     }
     this.scheduleIndex();
   }
@@ -585,7 +974,12 @@ export class SegmentRelayStore {
     const indexPath = path.join(this.rootDir, "index.json");
     const temporaryPath = `${indexPath}.${randomUUID()}.tmp`;
     const records = [...this.records.values()].map(
-      ({ buffer: _buffer, filePath: _filePath, ...record }) => record,
+      ({
+        buffer: _buffer,
+        filePath: _filePath,
+        manifest: _manifest,
+        ...record
+      }) => record,
     );
     try {
       writeFileSync(
@@ -610,6 +1004,7 @@ export class SegmentRelayStore {
       memoryBytes: this.memoryBytes,
       maxDiskBytes: this.maxDiskBytes,
       maxMemoryBytes: this.maxMemoryBytes,
+      activeSessions: this.activeSessions.size,
     };
   }
 
@@ -619,6 +1014,7 @@ export class SegmentRelayStore {
       clearTimeout(this.indexTimer);
       this.indexTimer = undefined;
     }
+    await this.mutationQueue;
     this.writeIndex();
     this.closed = true;
   }
@@ -692,13 +1088,15 @@ async function receiveUpload(request, store, route) {
       output.end(resolve);
       output.once("error", reject);
     });
-    if (route.kind === "manifest") {
-      validateManifest(await readFile(temporaryPath), route);
-    }
+    const manifest =
+      route.kind === "manifest"
+        ? validateManifest(await readFile(temporaryPath), route)
+        : undefined;
     return {
       temporaryPath,
       bytes,
       sha256: hash.digest("hex"),
+      manifest,
     };
   } catch (error) {
     output.destroy();
@@ -713,10 +1111,10 @@ function responseHeaders(origin) {
   return {
     "access-control-allow-origin": origin || "null",
     "access-control-allow-headers":
-      "authorization, content-type, range, x-content-sha256, x-synced-media-time-ms, x-synced-duration-ms, x-synced-keyframe, x-synced-bitrate",
+      "authorization, content-type, if-none-match, range, x-content-sha256, x-synced-media-time-ms, x-synced-timeline-time-ms, x-synced-duration-ms, x-synced-keyframe, x-synced-bitrate",
     "access-control-allow-methods": "GET, HEAD, PUT, OPTIONS",
     "access-control-expose-headers":
-      "accept-ranges, content-length, content-range, etag, x-synced-media-time-ms, x-synced-duration-ms, x-synced-keyframe, x-synced-bitrate",
+      "accept-ranges, content-length, content-range, etag, x-synced-media-time-ms, x-synced-timeline-time-ms, x-synced-duration-ms, x-synced-keyframe, x-synced-bitrate",
     vary: "Origin",
     "x-content-type-options": "nosniff",
   };
@@ -885,10 +1283,14 @@ export function createSegmentRelay(options = {}) {
             mediaTimeMs: Number(
               request.headers["x-synced-media-time-ms"],
             ),
+            timelineTimeMs: Number(
+              request.headers["x-synced-timeline-time-ms"],
+            ),
             durationMs: Number(request.headers["x-synced-duration-ms"]),
             keyframe:
               String(request.headers["x-synced-keyframe"]) === "true",
             bitrate: Number(request.headers["x-synced-bitrate"]),
+            manifest: upload.manifest,
           },
         );
         response.writeHead(201, {
@@ -959,6 +1361,11 @@ export function createSegmentRelay(options = {}) {
       ...(Number.isFinite(record.durationMs)
         ? { "x-synced-duration-ms": String(record.durationMs) }
         : {}),
+      ...(Number.isFinite(record.timelineTimeMs)
+        ? {
+            "x-synced-timeline-time-ms": String(record.timelineTimeMs),
+          }
+        : {}),
       ...(route.kind === "segment"
         ? { "x-synced-keyframe": String(record.keyframe === true) }
         : {}),
@@ -988,6 +1395,10 @@ export function createSegmentRelay(options = {}) {
     handle,
     issueToken,
     snapshot: () => store.snapshot(),
+    activateSession: (room, sessionId) =>
+      store.activateSession(room, sessionId),
+    deactivateSession: (room, sessionId) =>
+      store.deactivateSession(room, sessionId),
     deleteRoom: (room) => store.deleteRoom(room),
     close: () => store.close(),
     store,

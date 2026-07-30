@@ -7,10 +7,12 @@
 1. `wss://synced.com.cn/signal` 负责频道状态、临时 TURN 凭据和 LiveKit JWT。
 2. 普通屏幕共享以 LiveKit SFU 为主链路，逐观看端转发独立的
    1440p/1080p/720p/480p 层。
-3. Emby 使用 `/media/v1/` 的短期签名 HTTPS CMAF 分片；放映端并行生成
-   original/1080p/720p/480p，观看端独立 ABR、Range 重试和磁盘缓存。
-4. SFU 建连、发布或运行中断时，客户端才发送 `broadcast:watch-ready`，启用原有
-   P2P/TURN 链路作为故障备用。
+3. Emby 使用 `/media/v1/rooms/{room}/sessions/{sessionId}/…` 的短期签名 HTTPS
+   CMAF 分片；默认生成 1080p8/720p4，original/480p18 按观看需求启停，观看端独立
+   ABR、ETag/304、Range 重试和磁盘缓存。
+4. SFU 建连、发布或运行中断时，客户端发送 `broadcast:watch-ready`，启用原有
+   P2P/TURN 控制链备用；HTTPS CMAF 连续失败时，只为故障观看端临时启用部分可靠
+   P2P 媒体 DataChannel，恢复后自动释放。
 5. coturn 继续服务 P2P、连麦以及 SFU 的严格 NAT 客户端。
 
 信令、coturn 和 LiveKit 都不配置静态带宽上限。码率由端点实测吞吐和 WebRTC

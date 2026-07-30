@@ -1175,6 +1175,41 @@ test("a completely lost media fragment is repaired before creating an MSE gap", 
   }
 });
 
+test("external CMAF mode ignores RTC end boundaries from the host preview sequence space", async () => {
+  const { EmbyMsePlayer } = await loadModule();
+  globalThis.window ||= globalThis;
+  const video = Object.assign(new EventTarget(), {
+    currentTime: 0,
+    playbackRate: 1,
+    buffered: { length: 0, start: () => 0, end: () => 0 },
+    pause() {},
+    play: async () => {},
+  });
+  const player = new EmbyMsePlayer({ video });
+  player.session = {
+    roomId: "ROOM",
+    sessionId: "session_external_eos",
+    mediaVersion: 8,
+    transportEpoch: 0,
+    mimeType: 'video/mp4; codecs="avc1.640028,mp4a.40.2"',
+    plan: {},
+    title: "Fixture",
+  };
+  player.externalSegmentTransport = true;
+  player.handleControlText(
+    JSON.stringify({
+      type: "stream-ended",
+      sessionId: "session_external_eos",
+      mediaVersion: 8,
+      transportEpoch: 0,
+      finalFragmentSeq: 999,
+      finalTrackType: "muxed",
+    }),
+  );
+  assert.equal(player.endRequested, false);
+  assert.equal(player.streamComplete, false);
+});
+
 test("EOS control arriving before its final muxed fragment cannot truncate playback", async () => {
   const { EmbyMsePlayer } = await loadModule();
   globalThis.window ||= globalThis;

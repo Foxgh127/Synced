@@ -102,6 +102,9 @@ export interface SignalEnvelope {
   sentAt?: number;
   height?: number;
   frameRate?: number;
+  originalDemand?: boolean;
+  lowDemand?: boolean;
+  availableDownloadBps?: number;
   broadcastCapabilities?: BroadcastCapabilities;
   probeId?: string;
   phase?: "latency" | "upload" | "download";

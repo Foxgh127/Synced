@@ -480,6 +480,19 @@ class EmbyAccountManager {
     return this.serviceFor(id).updateSegmentRelayAccess(input);
   }
 
+  updateRenditionDemand(input = {}) {
+    const id = this.streamingAccountId || this.activeAccountId;
+    if (!id) {
+      return {
+        updated: false,
+        active: [],
+        uploadBudgetBps: Number.POSITIVE_INFINITY,
+        pipelineId: "",
+      };
+    }
+    return this.serviceFor(id).updateRenditionDemand(input);
+  }
+
   reportPlayback(input) {
     const id = this.streamingAccountId || this.activeAccountId;
     if (!id) return Promise.resolve();

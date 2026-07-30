@@ -777,6 +777,75 @@ export class EmbyMsePlayer extends EventTarget {
     this.resetPendingMediaReception(true);
   }
 
+  enableDataChannelSegmentFallback(
+    channel: RTCDataChannel,
+    targetTime = this.video.currentTime,
+  ): boolean {
+    const session = this.session;
+    if (!session || this.destroyed) return false;
+    this.externalSegmentTransport = false;
+    this.resetPendingMediaReception(true);
+    this.installFragmentAssembler(session);
+    this.attachChannel(channel);
+    this.pendingCatchUpTarget = Math.max(0, finite(targetTime));
+    this.syncHeld = true;
+    this.video.pause();
+    return this.sendControl({
+      type: "segment-fallback-request",
+      sessionId: session.sessionId,
+      mediaVersion: session.mediaVersion,
+      targetTime: this.pendingCatchUpTarget,
+    });
+  }
+
+  releaseDataChannelSegmentFallback(): boolean {
+    const session = this.session;
+    if (!session || this.destroyed) return false;
+    return this.sendControl({
+      type: "segment-fallback-release",
+      sessionId: session.sessionId,
+      mediaVersion: session.mediaVersion,
+    });
+  }
+
+  private installFragmentAssembler(session: EmbyPlayerSession): void {
+    const transportEpoch = session.transportEpoch ?? 0;
+    this.assembler?.reset();
+    this.assembler = new EmbyFragmentAssembler(
+      {
+        roomId: session.roomId,
+        sessionId: session.sessionId,
+        mediaVersion: session.mediaVersion,
+        transportEpoch,
+      },
+      (fragment) => this.appendFragment(fragment),
+      (
+        mediaVersion,
+        fragmentSeq,
+        trackType,
+        missing,
+        missingEpoch,
+      ) => {
+        this.sendControl({
+          type: "need",
+          sessionId: session.sessionId,
+          mediaVersion,
+          transportEpoch: missingEpoch,
+          fragmentSeq,
+          trackType,
+          missing,
+        });
+      },
+      (nextEpoch) =>
+        this.advanceTransportEpochFromMedia(
+          session.sessionId,
+          session.mediaVersion,
+          nextEpoch,
+        ),
+      (detail) => this.handleAssemblyAbandonment(detail),
+    );
+  }
+
   private requestCatchUp(targetTime: number, reason: string): void {
     const session = this.session;
     if (!session || this.destroyed) return;
@@ -1690,6 +1759,7 @@ export class EmbyMsePlayer extends EventTarget {
       const segmentRelayValid =
         segmentRelay === undefined ||
         (segmentRelay.protocol === "synced-cmaf-v1" &&
+          segmentRelay.sessionId === message.sessionId &&
           /^[a-f0-9]{24,64}$/u.test(segmentRelay.assetId) &&
           Number(segmentRelay.mediaVersion) ===
             Number(message.mediaVersion) &&
@@ -1775,40 +1845,12 @@ export class EmbyMsePlayer extends EventTarget {
         plan: { ...message.plan, frameRate: planFrameRate },
         title: message.title,
       });
-      this.assembler?.reset();
-      this.assembler = new EmbyFragmentAssembler(
-        {
-          roomId: message.roomId,
-          sessionId: message.sessionId,
-          mediaVersion: message.mediaVersion,
-          transportEpoch,
-        },
-        (fragment) => this.appendFragment(fragment),
-        (
-          mediaVersion,
-          fragmentSeq,
-          trackType,
-          missing,
-          missingEpoch,
-        ) => {
-          this.sendControl({
-            type: "need",
-            sessionId: message.sessionId,
-            mediaVersion,
-            transportEpoch: missingEpoch,
-            fragmentSeq,
-            trackType,
-            missing,
-          });
-        },
-        (nextEpoch) =>
-          this.advanceTransportEpochFromMedia(
-            message.sessionId,
-            message.mediaVersion,
-            nextEpoch,
-          ),
-        (detail) => this.handleAssemblyAbandonment(detail),
-      );
+      if (!segmentRelay || !this.externalSegmentTransport) {
+        this.installFragmentAssembler(this.session!);
+      } else {
+        this.assembler?.reset();
+        this.assembler = undefined;
+      }
       this.sendControl({
         type: "session-ready",
         sessionId: message.sessionId,
@@ -1958,6 +2000,12 @@ export class EmbyMsePlayer extends EventTarget {
       return;
     }
     if (message.type === "stream-ended") {
+      if (this.externalSegmentTransport) {
+        // The CMAF manifest owns end-of-stream in HTTPS mode. RTC fragment
+        // sequence numbers belong to the host preview pipeline and are not
+        // comparable with the ABR client's rendition-local delivery order.
+        return;
+      }
       const session = this.session;
       if (
         session &&
