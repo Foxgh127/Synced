@@ -2392,9 +2392,10 @@ test("logs in, browses, remuxes one authenticated stream, and never exposes the 
       /const fallbackCadenceMs =[\s\S]*?: 2_000;/,
       "unparsed fragment timing must fall back to the configured two-second GOP cadence",
     );
-    assert.match(
+    assert.doesNotMatch(
       service.pipeline.child.spawnargs.join(" "),
-      /-readrate 1\.35 -readrate_initial_burst 12 -readrate_catchup 1\.55/,
+      /-readrate(?:\s|$)/,
+      "compatible remux should prefetch according to relay and upload pressure",
     );
     assert.doesNotMatch(
       service.pipeline.child.spawnargs.join(" "),

@@ -156,15 +156,16 @@ function gatherIceRoute(
   });
 }
 
-export async function probeIceReachability(
+export async function probeIceCandidateGatherability(
   iceServers: RTCIceServer[],
   abortSignal?: AbortSignal,
   options: { networkType?: NetworkType } = {},
 ): Promise<{
-  directReachable?: boolean;
-  turnReachable?: boolean;
+  directCandidateGatherable?: boolean;
+  turnCandidateGatherable?: boolean;
 }> {
-  const [directReachable, turnReachable] = await Promise.all([
+  const [directCandidateGatherable, turnCandidateGatherable] =
+    await Promise.all([
     gatherIceRoute(
       iceServers,
       "direct",
@@ -177,10 +178,14 @@ export async function probeIceReachability(
       abortSignal,
       options.networkType === "cellular",
     ),
-  ]);
+    ]);
   return {
-    ...(directReachable === undefined ? {} : { directReachable }),
-    ...(turnReachable === undefined ? {} : { turnReachable }),
+    ...(directCandidateGatherable === undefined
+      ? {}
+      : { directCandidateGatherable }),
+    ...(turnCandidateGatherable === undefined
+      ? {}
+      : { turnCandidateGatherable }),
   };
 }
 

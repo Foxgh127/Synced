@@ -76,6 +76,7 @@ function sendMalformedWebSocketFrame(port) {
           "Upgrade: websocket",
           "Sec-WebSocket-Version: 13",
           `Sec-WebSocket-Key: ${key}`,
+          "Origin: http://localhost",
           "",
           "",
         ].join("\r\n"),
@@ -118,9 +119,12 @@ after(async () => {
   await server.close();
 });
 
-function openSocket(url = baseUrl, options) {
+function openSocket(url = baseUrl, options = {}) {
   return new Promise((resolve, reject) => {
-    const socket = new WebSocket(url, options);
+    const socket = new WebSocket(url, {
+      origin: "http://localhost",
+      ...options,
+    });
     const queue = [];
     const waiters = [];
     socket.on("message", (data) => {
@@ -167,6 +171,33 @@ function networkReport(overrides = {}) {
     measuredAt: Date.now(),
     ...overrides,
   };
+}
+
+async function completeBoundNetworkProbe(socket, overrides = {}) {
+  const report = networkReport(overrides);
+  for (const [phase, payload] of [
+    ["latency", undefined],
+    ["upload", "u"],
+    ["download", undefined],
+  ]) {
+    const response = nextMessage(socket, "network:probe-result");
+    socket.send(
+      JSON.stringify({
+        type: "network:probe",
+        probeVersion: report.probeVersion,
+        probeId: report.sampleId,
+        phase,
+        sequence: 0,
+        total: 1,
+        ...(payload === undefined ? {} : { payload }),
+        ...(phase === "download" && report.probeVersion === 2
+          ? { payloadBytes: 1 }
+          : {}),
+      }),
+    );
+    await response;
+  }
+  return report;
 }
 
 test("uses the shared 30 fps quality policy for resolution advice", () => {
@@ -319,7 +350,7 @@ test("bounds WSS latency, upload, and download network probes", async () => {
       probeId: "network-probe-too-many",
       phase: "download",
       sequence: 0,
-      total: 17,
+      total: 3,
     }),
   );
   assert.equal((await totalError).code, "network-probe-invalid");
@@ -361,14 +392,14 @@ test("publishes protocol-v3 capabilities and bounded v2 probes", async () => {
   assert.equal(capabilities.networkProbe.version2.chunkBytes, 64 * 1024);
   assert.equal(
     capabilities.networkProbe.version2.maximumBytesPerDirection,
-    2 * 1024 * 1024,
+    2 * 64 * 1024,
   );
   assert.equal(capabilities.voicePolicy.speechTargetBitrateBps, 256_000);
 
   const socket = await openSocket();
   const hello = await nextMessage(socket, "server:hello");
   assert.equal(hello.protocolVersion, 3);
-  assert.equal(hello.networkProbe.version2.maximumChunks, 32);
+  assert.equal(hello.networkProbe.version2.maximumChunks, 2);
 
   const requestedCapabilities = nextMessage(
     socket,
@@ -609,7 +640,7 @@ test("issues scoped LiveKit access and refreshable TURN credentials", async () =
   }
 });
 
-test("serves a full 2 MiB v2 download probe without tripping backpressure", async () => {
+test("serves a full bounded v2 download probe without tripping backpressure", async () => {
   const socket = await openSocket();
   const probeId = "network-probe-v2-full-download";
   for (const [phase, payload] of [
@@ -630,10 +661,10 @@ test("serves a full 2 MiB v2 download probe without tripping backpressure", asyn
     );
     await result;
   }
-  const responses = Array.from({ length: 32 }, () =>
+  const responses = Array.from({ length: 2 }, () =>
     nextMessage(socket, "network:probe-result"),
   );
-  for (let sequence = 0; sequence < 32; sequence += 1) {
+  for (let sequence = 0; sequence < 2; sequence += 1) {
     socket.send(
       JSON.stringify({
         type: "network:probe",
@@ -641,7 +672,7 @@ test("serves a full 2 MiB v2 download probe without tripping backpressure", asyn
         probeId,
         phase: "download",
         sequence,
-        total: 32,
+        total: 2,
         payloadBytes: 64 * 1024,
       }),
     );
@@ -652,7 +683,7 @@ test("serves a full 2 MiB v2 download probe without tripping backpressure", asyn
       (bytes, message) => bytes + Buffer.byteLength(message.payload),
       0,
     ),
-    2 * 1024 * 1024,
+    2 * 64 * 1024,
   );
   const pong = nextMessage(socket, "pong");
   socket.send(JSON.stringify({ type: "ping" }));
@@ -846,13 +877,22 @@ test("keeps network reports private and sends revisioned room advice", async () 
       ),
     );
 
-    const hostReportAdvice = nextMessage(host, "network:advice");
-    const viewerSawHostReport = nextMessage(viewer, "network:advice");
-    const hostSample = networkReport({
+    const unboundError = nextMessage(host, "error");
+    host.send(
+      JSON.stringify({
+        type: "network:report",
+        networkReport: networkReport(),
+      }),
+    );
+    assert.equal((await unboundError).code, "network-report-unbound");
+
+    const hostSample = await completeBoundNetworkProbe(host, {
       uploadKbps: 50_000,
       downloadKbps: 100_000,
       networkType: "ethernet",
     });
+    const hostReportAdvice = nextMessage(host, "network:advice");
+    const viewerSawHostReport = nextMessage(viewer, "network:advice");
     host.send(
       JSON.stringify({
         type: "network:report",
@@ -868,18 +908,19 @@ test("keeps network reports private and sends revisioned room advice", async () 
       adviceRevision3.revision,
     );
 
+    const viewerSample = await completeBoundNetworkProbe(viewer, {
+      uploadKbps: 20_000,
+      downloadKbps: 80_000,
+      networkType: "wifi",
+      directCandidateGatherable: false,
+      turnCandidateGatherable: true,
+    });
     const hostSawViewerReport = nextMessage(host, "network:advice");
     const viewerReportAdvice = nextMessage(viewer, "network:advice");
     viewer.send(
       JSON.stringify({
         type: "network:report",
-        networkReport: networkReport({
-          uploadKbps: 20_000,
-          downloadKbps: 80_000,
-          networkType: "wifi",
-          directReachable: false,
-          turnReachable: true,
-        }),
+        networkReport: viewerSample,
       }),
     );
     const adviceRevision4 = (await hostSawViewerReport).networkAdvice;
@@ -888,12 +929,12 @@ test("keeps network reports private and sends revisioned room advice", async () 
     assert.equal(viewerRevision4.revision, 4);
     assert.equal(adviceRevision4.measuredCount, 2);
     assert.equal(adviceRevision4.confidence, "high");
-    assert.equal(adviceRevision4.perViewerBudgetBps, 37_500_000);
-    assert.equal(adviceRevision4.recommendedResolution, "original");
-    assert.equal(adviceRevision4.maxFrameRateByResolution.original, 30);
-    assert.equal(adviceRevision4.maxFrameRateByResolution.ultra, 60);
-    assert.equal(adviceRevision4.routeMode, "relay-preferred");
-    assert.equal(viewerRevision4.routeMode, "relay-preferred");
+    assert.equal(adviceRevision4.perViewerBudgetBps, 10_000_000);
+    assert.equal(adviceRevision4.recommendedResolution, "high");
+    assert.equal(adviceRevision4.maxFrameRateByResolution.original, 24);
+    assert.equal(adviceRevision4.maxFrameRateByResolution.ultra, 24);
+    assert.equal(adviceRevision4.routeMode, "balanced");
+    assert.equal(viewerRevision4.routeMode, "balanced");
     assert.doesNotMatch(
       JSON.stringify(adviceRevision4),
       new RegExp(
@@ -962,11 +1003,14 @@ test("keeps network reports private and sends revisioned room advice", async () 
       "network-report-invalid",
     );
 
+    const secondViewerSample = await completeBoundNetworkProbe(viewer, {
+      networkType: "wifi",
+    });
     const reportRateError = nextMessage(viewer, "error");
     viewer.send(
       JSON.stringify({
         type: "network:report",
-        networkReport: networkReport(),
+        networkReport: secondViewerSample,
       }),
     );
     assert.equal(
@@ -1057,25 +1101,31 @@ test("aggregates private v2 transport telemetry into stable room advice", async 
     await hostJoinAdvice;
     await viewerJoinAdvice;
 
+    const hostSample = await completeBoundNetworkProbe(host, {
+      probeVersion: 2,
+      uploadKbps: 70_000,
+      networkType: "ethernet",
+    });
     const hostAccepted = nextMessage(host, "network:report-accepted");
     const hostReportAdvice = nextMessage(host, "network:advice");
     const viewerSawHostReport = nextMessage(viewer, "network:advice");
     host.send(
       JSON.stringify({
         type: "network:report",
-        networkReport: networkReport({
-          probeVersion: 2,
-          uploadKbps: 70_000,
-          availableOutgoingBitrateBps: 60_000_000,
-          packetLossPercent: 0.5,
-          activeCandidateType: "srflx",
-        }),
+        networkReport: hostSample,
       }),
     );
     assert.equal((await hostAccepted).nextReportAfterMs, 5_000);
     await hostReportAdvice;
     await viewerSawHostReport;
 
+    const viewerSample = await completeBoundNetworkProbe(viewer, {
+      probeVersion: 2,
+      downloadKbps: 60_000,
+      networkType: "wifi",
+      directCandidateGatherable: false,
+      turnCandidateGatherable: true,
+    });
     const viewerAccepted = nextMessage(
       viewer,
       "network:report-accepted",
@@ -1085,30 +1135,21 @@ test("aggregates private v2 transport telemetry into stable room advice", async 
     viewer.send(
       JSON.stringify({
         type: "network:report",
-        networkReport: networkReport({
-          probeVersion: 2,
-          downloadKbps: 60_000,
-          availableIncomingBitrateBps: 55_000_000,
-          directReachable: false,
-          turnReachable: true,
-          activeCandidateType: "relay",
-          relayProtocol: "udp",
-          relayRttMs: 88,
-        }),
+        networkReport: viewerSample,
       }),
     );
     await viewerAccepted;
     const hostRelayAdvice = (await hostSawViewerReport).networkAdvice;
     const viewerRelayAdvice = (await viewerReportAdvice).networkAdvice;
-    assert.equal(hostRelayAdvice.routeMode, "relay-preferred");
-    assert.equal(viewerRelayAdvice.routeMode, "relay-preferred");
-    assert.equal(hostRelayAdvice.perViewerBudgetBps, 40_500_000);
-    assert.equal(viewerRelayAdvice.perViewerBudgetBps, 40_500_000);
+    assert.equal(hostRelayAdvice.routeMode, "balanced");
+    assert.equal(viewerRelayAdvice.routeMode, "balanced");
+    assert.equal(hostRelayAdvice.perViewerBudgetBps, 10_000_000);
+    assert.equal(viewerRelayAdvice.perViewerBudgetBps, 10_000_000);
     assert.equal(
       viewerRelayAdvice.recommendedTargetBitrateBps,
-      35_640_000,
+      8_800_000,
     );
-    assert.equal(viewerRelayAdvice.recommendedResolution, "original");
+    assert.equal(viewerRelayAdvice.recommendedResolution, "high");
     assert.equal(viewerRelayAdvice.relaySessionCapacityBps, null);
     assert.equal(viewerRelayAdvice.relayCapacityEnforced, false);
 
@@ -1143,8 +1184,14 @@ test("aggregates private v2 transport telemetry into stable room advice", async 
       }),
     );
     assert.equal((await accepted).sampleId, sampleId);
-    await hostTransportAdvice;
+    const publisherAdvice = (await hostTransportAdvice).networkAdvice;
     const advice = (await viewerTransportAdvice).networkAdvice;
+    assert.equal(publisherAdvice.perViewerBudgetBps, 10_000_000);
+    assert.ok(
+      advice.perViewerBudgetBps < publisherAdvice.perViewerBudgetBps,
+      "a weak viewer must only reduce its own subscription budget",
+    );
+    assert.equal(publisherAdvice.routeMode, "balanced");
     assert.equal(advice.schemaVersion, 2);
     assert.equal(advice.routeMode, "relay-preferred");
     assert.equal(advice.congestion, "constrained");
@@ -1394,7 +1441,7 @@ test("announces participants, relays voice signaling, and broadcasts chat", asyn
   assert.equal(qualityRequest.height, 1200);
   assert.equal(qualityRequest.frameRate, 24);
 
-  const highRefreshRequest = nextMessage(host, "quality:request");
+  const highRefreshError = nextMessage(viewer, "error");
   viewer.send(
     JSON.stringify({
       type: "quality:request",
@@ -1402,9 +1449,7 @@ test("announces participants, relays voice signaling, and broadcasts chat", asyn
       frameRate: 120,
     }),
   );
-  const highRefresh = await highRefreshRequest;
-  assert.equal(highRefresh.height, 480);
-  assert.equal(highRefresh.frameRate, 120);
+  assert.match((await highRefreshError).message, /画质参数无效/);
 
   for (const height of [1440, 2160]) {
     const expandedResolutionRequest = nextMessage(
@@ -1535,6 +1580,7 @@ test("keeps the legacy host protocol from bypassing owner binding by default", a
   const socket = await new Promise((resolve, reject) => {
     const candidate = new WebSocket(
       `ws://127.0.0.1:${address.port}/signal`,
+      { origin: "http://localhost" },
     );
     candidate.once("open", () => resolve(candidate));
     candidate.once("error", reject);
@@ -1942,6 +1988,8 @@ test("lets any desktop member start and stop broadcasting in a channel", async (
     audioCodec: "aac",
     title: "Emby UHD",
     bitrate: 18_000_000,
+    allowOriginalRendition: true,
+    maxActiveRenditions: 3,
     durationTicks: 72_000_000_000,
   });
   assert.doesNotMatch(JSON.stringify(ownerGrant), /must-not-enter-room-state/);
@@ -2544,7 +2592,7 @@ test("production origin mode rejects a WebSocket with no Origin", async () => {
   const address = await originServer.listen(0, "127.0.0.1");
   const url = `ws://127.0.0.1:${address.port}/signal`;
   try {
-    await assert.rejects(openSocket(url), /403/);
+    await assert.rejects(openSocket(url, { origin: undefined }), /403/);
     const allowed = await openSocket(url, {
       origin: "https://synced.com.cn",
     });
@@ -2567,6 +2615,7 @@ test("does not advertise TCP TURN until that relay path is explicitly enabled", 
   const socket = await new Promise((resolve, reject) => {
     const candidate = new WebSocket(
       `ws://127.0.0.1:${address.port}/signal`,
+      { origin: "http://localhost" },
     );
     candidate.once("open", () => resolve(candidate));
     candidate.once("error", reject);

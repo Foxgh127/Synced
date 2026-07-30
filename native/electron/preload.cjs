@@ -40,6 +40,14 @@ ipcRenderer.on("emby:stream-event", (_event, payload) => {
 });
 
 contextBridge.exposeInMainWorld("roomDesktop", {
+  loadChannelOwnership: () =>
+    ipcRenderer.sendSync("channel-owner:load"),
+  saveChannelOwnership: (value) =>
+    ipcRenderer.sendSync("channel-owner:save", value) === true,
+  requestMediaPermissionIntent: (kind) =>
+    ipcRenderer.invoke("permission:request-media", kind),
+  releaseMediaPermission: (kind) =>
+    ipcRenderer.send("permission:release-media", kind),
   listSources: (options) =>
     ipcRenderer.invoke("capture:list-sources", options),
   selectSource: (sourceId) => ipcRenderer.invoke("capture:select-source", sourceId),

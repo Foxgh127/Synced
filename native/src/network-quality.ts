@@ -25,8 +25,8 @@ export interface NetworkReport {
   networkType: NetworkType;
   metered: boolean;
   measuredAt: number;
-  directReachable?: boolean;
-  turnReachable?: boolean;
+  directCandidateGatherable?: boolean;
+  turnCandidateGatherable?: boolean;
 }
 
 export interface NetworkAdvice {
@@ -39,6 +39,12 @@ export interface NetworkAdvice {
   maxFrameRateByResolution: Record<ResolutionKey, FrameRateOption>;
   routeMode: NetworkRouteMode;
   reason: string;
+  publisherAdvice?: {
+    participantId?: string;
+    budgetBps: number;
+    fanoutCount: number;
+    sfuPublisherActive: boolean;
+  };
   generatedAt?: number;
   validUntil?: number;
 }
@@ -50,8 +56,8 @@ const FALLBACK_FRAME_RATE_BY_RESOLUTION: Record<
   original: 30,
   ultra: 30,
   high: 30,
-  standard: 60,
-  smooth: 60,
+  standard: 30,
+  smooth: 30,
 };
 
 export function fallbackNetworkAdvice(
@@ -155,6 +161,26 @@ export function sanitizeNetworkAdvice(
       frameRates[resolution] = option;
     }
   }
+  const rawPublisherAdvice =
+    raw.publisherAdvice &&
+    typeof raw.publisherAdvice === "object" &&
+    !Array.isArray(raw.publisherAdvice)
+      ? (raw.publisherAdvice as Record<string, unknown>)
+      : undefined;
+  const publisherBudgetBps = rawPublisherAdvice
+    ? finiteInteger(
+        rawPublisherAdvice.budgetBps,
+        0,
+        2_000_000_000,
+      )
+    : undefined;
+  const publisherFanoutCount = rawPublisherAdvice
+    ? finiteInteger(
+        rawPublisherAdvice.fanoutCount,
+        1,
+        MAX_PARTICIPANTS_PER_ROOM,
+      )
+    : undefined;
   return {
     revision,
     participantCount,
@@ -165,6 +191,25 @@ export function sanitizeNetworkAdvice(
     maxFrameRateByResolution: frameRates,
     routeMode,
     reason: String(raw.reason || "已根据房间网络更新建议").slice(0, 160),
+    ...(publisherBudgetBps === undefined ||
+    publisherFanoutCount === undefined
+      ? {}
+      : {
+          publisherAdvice: {
+            ...(typeof rawPublisherAdvice?.participantId === "string"
+              ? {
+                  participantId: rawPublisherAdvice.participantId.slice(
+                    0,
+                    64,
+                  ),
+                }
+              : {}),
+            budgetBps: publisherBudgetBps,
+            fanoutCount: publisherFanoutCount,
+            sfuPublisherActive:
+              rawPublisherAdvice?.sfuPublisherActive === true,
+          },
+        }),
     ...(generatedAt === undefined ? {} : { generatedAt }),
     ...(validUntil === undefined ? {} : { validUntil }),
   };
@@ -183,6 +228,7 @@ export function frameRateForResolution(
 
 export function selectResolutionAndFrameRate(input: {
   resolution: ResolutionKey;
+  resolutionLockedByUser?: boolean;
   currentFrameRate: FrameRateOption;
   frameRateLockedByUser: boolean;
   advice?: NetworkAdvice;
@@ -191,10 +237,22 @@ export function selectResolutionAndFrameRate(input: {
   frameRate: FrameRateOption;
 } {
   return {
-    resolution: input.resolution,
+    resolution:
+      !input.resolutionLockedByUser &&
+      input.advice &&
+      input.advice.confidence !== "low"
+        ? input.advice.recommendedResolution
+        : input.resolution,
     frameRate: input.frameRateLockedByUser
       ? input.currentFrameRate
-      : frameRateForResolution(input.resolution, input.advice),
+      : frameRateForResolution(
+          !input.resolutionLockedByUser &&
+            input.advice &&
+            input.advice.confidence !== "low"
+            ? input.advice.recommendedResolution
+            : input.resolution,
+          input.advice,
+        ),
   };
 }
 

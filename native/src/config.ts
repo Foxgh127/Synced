@@ -6,7 +6,7 @@ export type ResolutionKey =
   | "high"
   | "standard"
   | "smooth";
-export type FrameRateOption = 24 | 30 | 60 | 90 | 120;
+export type FrameRateOption = 24 | 30;
 
 export interface QualityPreset {
   key: `${ResolutionKey}-${FrameRateOption}`;
@@ -66,7 +66,9 @@ export const RESOLUTION_OPTIONS: ResolutionOption[] = [
   },
 ];
 
-export const FRAME_RATE_OPTIONS: FrameRateOption[] = [24, 30, 60, 90, 120];
+// Ordinary screen sharing is deliberately capped at 30 fps. The SFU
+// publication, adaptive ladder and P2P fallback now expose the same contract.
+export const FRAME_RATE_OPTIONS: FrameRateOption[] = [24, 30];
 
 export function isResolutionKey(value: string | null): value is ResolutionKey {
   return RESOLUTION_OPTIONS.some((option) => option.key === value);
@@ -160,7 +162,7 @@ export function recommendBroadcastPreset(
   if (availableOutgoingBitrate < 28_000_000) {
     return {
       resolution: "ultra",
-      reason: "P2P 实测上行适合高帧率 2K",
+      reason: "P2P 实测上行适合高质量 2K",
     };
   }
   return {

@@ -9,23 +9,34 @@ function source(relativePath) {
 
 test("packaged renderer CSP permits the exact official CMAF origin", () => {
   const index = source("index.html");
+  const viteConfig = source("vite.config.ts");
   const policy = index.match(
     /http-equiv="Content-Security-Policy"\s+content="([^"]+)"/,
   )?.[1];
   assert.ok(policy);
+  const scriptSource = policy
+    .split(";")
+    .find((directive) => directive.trim().startsWith("script-src"));
   const connectSource = policy
     .split(";")
     .find((directive) => directive.trim().startsWith("connect-src"));
+  assert.ok(scriptSource);
+  assert.doesNotMatch(scriptSource, /(?:^|\s)blob:(?:\s|$)/);
   assert.match(connectSource, /\bhttps:\/\/synced\.com\.cn\b/);
   assert.doesNotMatch(connectSource, /(?:^|\s)https:(?:\s|$)/);
+  assert.doesNotMatch(connectSource, /(?:^|\s)wss?:(?:\s|$)/);
   assert.doesNotMatch(connectSource, /\*/);
+  assert.match(viteConfig, /synced-static-audio-worklets/);
+  assert.match(viteConfig, /deepfilter-net3-worklet\.js/);
+  assert.match(viteConfig, /process-audio-worklet\.js/);
+  assert.match(viteConfig, /ROLLUP_FILE_URL_/);
 });
 
 test("standby nginx exposes signalling only and overwrites untrusted XFF", () => {
   const nginx = source("deployment/nginx-synced-standby.conf");
   assert.match(nginx, /limit_conn_zone\s+\$binary_remote_addr/);
   assert.match(nginx, /limit_req_zone\s+\$binary_remote_addr/);
-  assert.match(nginx, /limit_conn\s+synced_signal_connections\s+8;/);
+  assert.match(nginx, /limit_conn\s+synced_signal_connections\s+64;/);
   assert.match(
     nginx,
     /proxy_set_header\s+X-Forwarded-For\s+\$remote_addr;/,
@@ -56,13 +67,19 @@ test("Docker deployment keeps the TURN secret out of argv and environment", () =
   assert.match(entrypoint, /umask 077/);
   assert.match(entrypoint, /exec turnserver -c "\$runtime_config"/);
   assert.match(compose, /--stale-nonce=600/);
-  assert.match(compose, /--max-allocate-lifetime=7200/);
+  assert.match(compose, /--max-allocate-lifetime=3600/);
   assert.match(compose, /healthcheck:/);
   assert.match(compose, /read_only:\s*true/);
-  assert.match(compose, /image:\s*coturn\/coturn:4\.15\.0-r0/);
+  assert.match(
+    compose,
+    /image:\s*coturn\/coturn:4\.15\.0-r0@sha256:[a-f0-9]{64}/,
+  );
   assert.match(compose, /user:\s*"65534:65534"/);
   assert.match(compose, /cap_drop:\s*\n\s+- ALL/);
-  assert.match(compose, /image:\s*livekit\/livekit-server:v1\.13\.4/);
+  assert.match(
+    compose,
+    /image:\s*livekit\/livekit-server:v1\.13\.4@sha256:[a-f0-9]{64}/,
+  );
   assert.match(compose, /LIVEKIT_API_SECRET_FILE:\s*"\/run\/secrets\/livekit_api_secret"/);
   const livekitEntrypoint = source("deployment/livekit-entrypoint.sh");
   assert.match(livekitEntrypoint, /bytes_per_sec: -1/);

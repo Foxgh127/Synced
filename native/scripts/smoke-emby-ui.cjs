@@ -277,8 +277,12 @@ async function main() {
   ).href;
   const { createSignalServer } = await import(serverModuleUrl);
   const signalServer = createSignalServer();
-  const signalAddress = await signalServer.listen(0, "127.0.0.1");
-  const signalUrl = `ws://127.0.0.1:${signalAddress.port}/signal`;
+  // The packaged renderer intentionally permits only the production endpoint
+  // and this fixed loopback development endpoint in connect-src. Keep the
+  // end-to-end smoke inside that exact production CSP instead of weakening it
+  // with an arbitrary test port.
+  await signalServer.listen(8_787, "127.0.0.1");
+  const signalUrl = "ws://localhost:8787/signal";
   let window;
   const screenshotPath = path.join(
     os.tmpdir(),
@@ -812,10 +816,27 @@ async function main() {
       })}\n`,
     );
   } catch (error) {
+    const diagnostics = await window?.webContents
+      .executeJavaScript(`(() => ({
+        location: location.href,
+        title: document.title,
+        bodyText: document.body?.innerText?.slice(0, 2_000) || "",
+        broadcastAction: document.querySelector("#broadcast-action")
+          ? {
+              disabled: document.querySelector("#broadcast-action").disabled,
+              hidden: document.querySelector("#broadcast-action").hidden,
+            }
+          : null,
+        toasts: [...document.querySelectorAll(".toast")].map((item) => item.textContent),
+        rendererErrors: ${JSON.stringify(rendererErrors)},
+      }))()`)
+      .catch((diagnosticError) => ({
+        evaluationError: String(diagnosticError),
+      }));
     throw new Error(
       `Emby UI smoke failed during ${phase}: ${
         error instanceof Error ? error.message : String(error)
-      }`,
+      }; diagnostics=${JSON.stringify(diagnostics)}`,
       { cause: error },
     );
   } finally {

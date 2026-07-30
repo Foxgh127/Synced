@@ -54,6 +54,26 @@ test("degrades within three bad samples and recovers only after sustained headro
     10_000,
   );
   assert.equal(decision.changed, false);
+  controller.observe(
+    {
+      connectionState: "connected",
+      packetLossRatio: 0,
+      jitter: 0.01,
+      availableBandwidthBps: 25_000_000,
+      currentRoundTripTime: 0.03,
+    },
+    11_000,
+  );
+  controller.observe(
+    {
+      connectionState: "connected",
+      packetLossRatio: 0,
+      jitter: 0.01,
+      availableBandwidthBps: 25_000_000,
+      currentRoundTripTime: 0.03,
+    },
+    12_000,
+  );
   decision = controller.observe(
     {
       connectionState: "connected",
@@ -62,7 +82,7 @@ test("degrades within three bad samples and recovers only after sustained headro
       availableBandwidthBps: 25_000_000,
       currentRoundTripTime: 0.03,
     },
-    30_000,
+    32_000,
   );
   assert.equal(decision.direction, "up");
   assert.equal(decision.requestedHeight, undefined);
@@ -89,6 +109,24 @@ test("a manual ceiling is retained and upgrade requires 1.5x bandwidth", async (
       availableBandwidthBps: 4_700_000,
     },
     10_000,
+  );
+  controller.observe(
+    {
+      connectionState: "connected",
+      packetLossRatio: 0,
+      jitter: 0,
+      availableBandwidthBps: 4_700_000,
+    },
+    11_000,
+  );
+  controller.observe(
+    {
+      connectionState: "connected",
+      packetLossRatio: 0,
+      jitter: 0,
+      availableBandwidthBps: 4_700_000,
+    },
+    12_000,
   );
   let held = controller.observe(
     {
@@ -187,6 +225,22 @@ test("an ambiguous Wi-Fi sample restarts the continuous upgrade window", async (
   controller.observe(
     {
       connectionState: "connected",
+      packetLossRatio: 0,
+      availableBandwidthBps: 25_000_000,
+    },
+    6_000,
+  );
+  controller.observe(
+    {
+      connectionState: "connected",
+      packetLossRatio: 0,
+      availableBandwidthBps: 25_000_000,
+    },
+    7_000,
+  );
+  controller.observe(
+    {
+      connectionState: "connected",
       packetLossRatio: 0.018,
       jitter: 0.02,
       availableBandwidthBps: 25_000_000,
@@ -202,6 +256,22 @@ test("an ambiguous Wi-Fi sample restarts the continuous upgrade window", async (
     25_000,
   );
   assert.equal(decision.changed, false);
+  controller.observe(
+    {
+      connectionState: "connected",
+      packetLossRatio: 0,
+      availableBandwidthBps: 25_000_000,
+    },
+    26_000,
+  );
+  controller.observe(
+    {
+      connectionState: "connected",
+      packetLossRatio: 0,
+      availableBandwidthBps: 25_000_000,
+    },
+    27_000,
+  );
 
   decision = controller.observe(
     {
@@ -209,9 +279,81 @@ test("an ambiguous Wi-Fi sample restarts the continuous upgrade window", async (
       packetLossRatio: 0,
       availableBandwidthBps: 25_000_000,
     },
-    45_000,
+    47_000,
   );
   assert.equal(decision.direction, "up");
+});
+
+test("bandwidth and RTT without media health stats never manufacture an upgrade", async () => {
+  const { AdaptivePlaybackController } = await loadModule();
+  const controller = new AdaptivePlaybackController();
+  controller.configure(1_600);
+  controller.forceDegrade("test setup", 0);
+
+  for (const now of [1_000, 2_000, 3_000, 30_000, 90_000]) {
+    const decision = controller.observe(
+      {
+        connectionState: "connected",
+        availableBandwidthBps: 100_000_000,
+        currentRoundTripTime: 0.01,
+      },
+      now,
+    );
+    assert.equal(decision.changed, false);
+    assert.equal(decision.pressure, "unknown");
+  }
+  assert.equal(controller.requestedHeight, 1_080);
+});
+
+test("ordinary sustained pressure can downgrade during the post-upgrade hold", async () => {
+  const { AdaptivePlaybackController } = await loadModule();
+  const controller = new AdaptivePlaybackController();
+  controller.configure(1_600);
+  controller.forceDegrade("test setup", 0);
+  for (const now of [1_000, 2_000, 3_000]) {
+    controller.observe(
+      {
+        connectionState: "connected",
+        packetLossRatio: 0,
+        jitter: 0.01,
+        availableBandwidthBps: 25_000_000,
+      },
+      now,
+    );
+  }
+  const upgraded = controller.observe(
+    {
+      connectionState: "connected",
+      packetLossRatio: 0,
+      jitter: 0.01,
+      availableBandwidthBps: 25_000_000,
+    },
+    23_000,
+  );
+  assert.equal(upgraded.direction, "up");
+
+  let decision;
+  for (const now of [24_000, 25_000, 26_000]) {
+    decision = controller.observe(
+      {
+        connectionState: "connected",
+        packetLossRatio: 0.05,
+        jitter: 0.09,
+      },
+      now,
+    );
+  }
+  assert.equal(decision.direction, "down");
+  assert.equal(decision.requestedHeight, 1_080);
+});
+
+test("target bitrate scales with the real source raster", async () => {
+  const { AdaptivePlaybackController } = await loadModule();
+  const wide = new AdaptivePlaybackController();
+  const narrow = new AdaptivePlaybackController();
+  wide.configure(2_160, 0, false, { sourceWidth: 3_840 });
+  narrow.configure(2_160, 0, false, { sourceWidth: 1_920 });
+  assert.ok(wide.targetBitrateBps > narrow.targetBitrateBps * 1.9);
 });
 
 test("severe receiver decode pressure degrades immediately and is classified", async () => {

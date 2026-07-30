@@ -13,15 +13,23 @@ const packageJson = JSON.parse(
 test("Electron grants media permissions only to the main renderer", () => {
   assert.match(
     mainSource,
-    /setPermissionCheckHandler\(\(webContents, permission\)[\s\S]*?isMainRenderer\(webContents\)/,
+    /setPermissionCheckHandler\(\(webContents, permission,[^)]*\)[\s\S]*?isMainRenderer\(webContents\)/,
   );
   assert.match(
     mainSource,
-    /setPermissionRequestHandler\(\(webContents, permission, callback\)[\s\S]*?isMainRenderer\(webContents\)/,
+    /setPermissionRequestHandler\(\(webContents, permission, callback,[^)]*\)[\s\S]*?isMainRenderer\(webContents\)/,
   );
   assert.match(
     mainSource,
     /setDisplayMediaRequestHandler\(async \(request, callback\)[\s\S]*?request\.frame !== mainWindow\.webContents\.mainFrame/,
+  );
+  assert.match(
+    mainSource,
+    /navigator\.userActivation\?\.isActive[\s\S]*?grantMediaPermissionIntent\("microphone"/,
+  );
+  assert.match(
+    mainSource,
+    /permission:release-media[\s\S]*?microphonePermissionSessionActive = false/,
   );
 });
 

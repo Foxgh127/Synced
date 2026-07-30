@@ -20,7 +20,8 @@ services:
       TURN_URLS: "${TURN_URLS}"
       TURN_SECRET_FILE: "/run/secrets/turn_secret"
       TURN_TCP_ENABLED: "${TURN_TCP_ENABLED:-true}"
-      TURN_CREDENTIAL_TTL_SECONDS: "${TURN_CREDENTIAL_TTL_SECONDS:-14400}"
+      TURN_CREDENTIAL_TTL_SECONDS: "${TURN_CREDENTIAL_TTL_SECONDS:-2700}"
+      SFU_TOKEN_TTL_SECONDS: "${SFU_TOKEN_TTL_SECONDS:-2700}"
       SFU_ENABLED: "${SFU_ENABLED:-true}"
       SFU_PUBLIC_URL: "${SFU_PUBLIC_URL}"
       LIVEKIT_API_KEY: "${LIVEKIT_API_KEY}"
@@ -28,20 +29,26 @@ services:
       SEGMENT_RELAY_SECRET_FILE: "/run/secrets/segment_relay_secret"
       SEGMENT_RELAY_CACHE_DIR: "/var/lib/synced/segment-relay"
       SEGMENT_RELAY_MEMORY_BYTES: "${SEGMENT_RELAY_MEMORY_BYTES:-100663296}"
+      SEGMENT_RELAY_ROOM_MEMORY_BYTES: "${SEGMENT_RELAY_ROOM_MEMORY_BYTES:-50331648}"
+      SEGMENT_RELAY_ROOM_DISK_BYTES: "${SEGMENT_RELAY_ROOM_DISK_BYTES:-1073741824}"
+      SEGMENT_RELAY_ROOM_OBJECTS: "${SEGMENT_RELAY_ROOM_OBJECTS:-20000}"
+      SEGMENT_RELAY_ROOM_ACTIVE_RENDITIONS: "${SEGMENT_RELAY_ROOM_ACTIVE_RENDITIONS:-3}"
+      SEGMENT_RELAY_ROOM_UPLOAD_BPS: "${SEGMENT_RELAY_ROOM_UPLOAD_BPS:-134217728}"
       # Leave empty for the server's quota-aware default: 4% of available
       # filesystem space, capped at 5 GiB.
       SEGMENT_RELAY_DISK_BYTES: "${SEGMENT_RELAY_DISK_BYTES:-}"
       SIGNAL_NODE_ID: "${SIGNAL_NODE_ID:-hk-edge-primary}"
       SIGNAL_REGION: "${SIGNAL_REGION:-ap-hongkong}"
       MAX_CLIENTS: "${MAX_CLIENTS:-128}"
-      MAX_CLIENTS_PER_IP: "${MAX_CLIENTS_PER_IP:-16}"
-      MAX_MESSAGES_PER_MINUTE: "${MAX_MESSAGES_PER_MINUTE:-600}"
+      MAX_CLIENTS_PER_IP: "${MAX_CLIENTS_PER_IP:-64}"
+      MAX_MESSAGES_PER_MINUTE: "${MAX_MESSAGES_PER_MINUTE:-3600}"
       SIGNAL_MAX_BUFFERED_BYTES: "${SIGNAL_MAX_BUFFERED_BYTES:-786432}"
       ALLOWED_ORIGINS: "${ALLOWED_ORIGINS:-file://,http://localhost,https://localhost,capacitor://localhost}"
       ALLOW_NO_ORIGIN: "${ALLOW_NO_ORIGIN:-false}"
       TRUST_PROXY: "true"
       TRUSTED_PROXY_CIDRS: "172.30.0.1/32"
       ALLOW_LEGACY_PROTOCOL: "false"
+      READINESS_EXTERNAL_PROBES: "${READINESS_EXTERNAL_PROBES:-true}"
     ports:
       - "127.0.0.1:8787:8787"
     networks:
@@ -71,7 +78,7 @@ services:
         max-file: "3"
 
   coturn:
-    image: coturn/coturn:4.15.0-r0
+    image: coturn/coturn:4.15.0-r0@sha256:0feee4fc1f45c7c053c8fee3e1ab941b1a1b9a0429bc01e18126735410770bfd
     restart: unless-stopped
     user: "65534:65534"
     network_mode: host
@@ -103,7 +110,7 @@ services:
       - --stale-nonce=600
       - --channel-lifetime=600
       - --permission-lifetime=300
-      - --max-allocate-lifetime=7200
+      - --max-allocate-lifetime=3600
       - --denied-peer-ip=0.0.0.0-0.255.255.255
       - --denied-peer-ip=10.0.0.0-10.255.255.255
       - --denied-peer-ip=100.64.0.0-100.127.255.255
@@ -129,7 +136,7 @@ services:
         max-file: "3"
 
   livekit:
-    image: livekit/livekit-server:v1.13.4
+    image: livekit/livekit-server:v1.13.4@sha256:189f7c81b704a36642bc5c7e2d3e1ae83744627c11978a23a251bf19fbec64e0
     restart: unless-stopped
     init: true
     network_mode: host
@@ -143,7 +150,7 @@ services:
       LIVEKIT_NODE_IP: "${PUBLIC_IP}"
       LIVEKIT_TURN_HOST: "${PUBLIC_IP}"
       TURN_SECRET_FILE: "/run/secrets/turn_secret"
-      TURN_CREDENTIAL_TTL_SECONDS: "${TURN_CREDENTIAL_TTL_SECONDS:-14400}"
+      TURN_CREDENTIAL_TTL_SECONDS: "${TURN_CREDENTIAL_TTL_SECONDS:-2700}"
     secrets:
       - livekit_api_secret
       - turn_secret

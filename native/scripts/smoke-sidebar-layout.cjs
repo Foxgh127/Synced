@@ -20,7 +20,7 @@ async function waitFor(read, timeoutMs = 12_000) {
 }
 
 async function openMember(signalUrl, room, nickname) {
-  const socket = new WebSocket(signalUrl);
+  const socket = new WebSocket(signalUrl, { origin: "file://" });
   await new Promise((resolve, reject) => {
     socket.once("open", resolve);
     socket.once("error", reject);
@@ -58,8 +58,8 @@ async function main() {
   ).href;
   const { createSignalServer } = await import(serverModuleUrl);
   const signalServer = createSignalServer();
-  const address = await signalServer.listen(0, "127.0.0.1");
-  const signalUrl = `ws://127.0.0.1:${address.port}/signal`;
+  await signalServer.listen(8_787, "127.0.0.1");
+  const signalUrl = "ws://localhost:8787/signal";
   const mainWindow = await waitFor(() =>
     BrowserWindow.getAllWindows().find(
       (candidate) =>

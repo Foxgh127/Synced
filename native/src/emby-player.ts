@@ -47,6 +47,7 @@ const EMBY_TRANSPORT_SILENCE_TIMEOUT_MS = 15_000;
 const EMBY_CATCH_UP_MIN_INTERVAL_MS = 1_200;
 const EMBY_CATCH_UP_MAX_INTERVAL_MS = 8_000;
 const EMBY_CATCH_UP_HEALTHY_RESET_SAMPLES = 12;
+const EMBY_END_REPAIR_TIMEOUT_MS = 90_000;
 // Keep a generous margin below the three-second product ceiling. Once the
 // desired timestamp is 1.8 s ahead of available media, pause stale playback
 // and request a fresh keyframe window instead of letting drift keep growing.
@@ -743,9 +744,12 @@ export class EmbyMsePlayer extends EventTarget {
   private sourceBuffer?: SourceBuffer;
   private objectUrl?: string;
   private subtitleUrl?: string;
-  private appendQueue: Uint8Array[] = [];
-  private appendTimestampOffsets: Array<number | undefined> = [];
-  private appendRetryCounts: number[] = [];
+  private appendEntries: Array<{
+    data: Uint8Array;
+    timestampOffset?: number;
+    retryCount: number;
+  }> = [];
+  private appendHead = 0;
   private appendQueueBytes = 0;
   private lastInitData?: Uint8Array;
   private appendBusy = false;
@@ -759,6 +763,7 @@ export class EmbyMsePlayer extends EventTarget {
   private clockOffsetMs = 0;
   private clockSamples = 0;
   private clockSyncSamples: Array<{ rttMs: number; offsetMs: number }> = [];
+  private readonly monotonicWallOriginMs = Date.now() - performance.now();
   private speedRestoreTimer?: number;
   private progressTimer?: number;
   private bufferTimer?: number;
@@ -773,6 +778,7 @@ export class EmbyMsePlayer extends EventTarget {
     transportEpoch: number;
     targetTime: number;
     retryIndex: number;
+    deadlineAt: number;
     offeredTransportEpoch?: number;
     offeredSignature?: string;
     readySent?: boolean;
@@ -870,6 +876,116 @@ export class EmbyMsePlayer extends EventTarget {
     this.video.addEventListener("error", this.handleVideoError);
   }
 
+  /*
+   * Compatibility accessors keep diagnostics able to inspect the queue while
+   * production operations use one entry deque. This removes the three
+   * parallel shift()-based arrays that made long sessions increasingly
+   * expensive and could let their metadata drift out of alignment.
+   */
+  get appendQueue(): Uint8Array[] {
+    return this.appendEntries
+      .slice(this.appendHead)
+      .map((entry) => entry.data);
+  }
+
+  set appendQueue(data: Uint8Array[]) {
+    this.appendEntries = data.map((entry) => ({
+      data: entry,
+      retryCount: 0,
+    }));
+    this.appendHead = 0;
+  }
+
+  get appendTimestampOffsets(): Array<number | undefined> {
+    return this.appendEntries
+      .slice(this.appendHead)
+      .map((entry) => entry.timestampOffset);
+  }
+
+  set appendTimestampOffsets(values: Array<number | undefined>) {
+    for (let index = 0; index < values.length; index += 1) {
+      const entry = this.appendEntries[this.appendHead + index];
+      if (entry) entry.timestampOffset = values[index];
+    }
+  }
+
+  get appendRetryCounts(): number[] {
+    return this.appendEntries
+      .slice(this.appendHead)
+      .map((entry) => entry.retryCount);
+  }
+
+  set appendRetryCounts(values: number[]) {
+    for (let index = 0; index < values.length; index += 1) {
+      const entry = this.appendEntries[this.appendHead + index];
+      if (entry) entry.retryCount = Math.max(0, Number(values[index]) || 0);
+    }
+  }
+
+  private get appendQueueLength(): number {
+    return this.appendEntries.length - this.appendHead;
+  }
+
+  private peekAppendEntry():
+    | {
+        data: Uint8Array;
+        timestampOffset?: number;
+        retryCount: number;
+      }
+    | undefined {
+    return this.appendEntries[this.appendHead];
+  }
+
+  private enqueueAppendEntry(
+    data: Uint8Array,
+    timestampOffset?: number,
+  ): void {
+    this.appendEntries.push({ data, timestampOffset, retryCount: 0 });
+  }
+
+  private prependAppendEntry(data: Uint8Array): void {
+    if (this.appendHead > 0) {
+      this.appendHead -= 1;
+      this.appendEntries[this.appendHead] = {
+        data,
+        retryCount: 0,
+      };
+      return;
+    }
+    this.appendEntries = [
+      { data, retryCount: 0 },
+      ...this.appendEntries,
+    ];
+  }
+
+  private dequeueAppendEntry():
+    | {
+        data: Uint8Array;
+        timestampOffset?: number;
+        retryCount: number;
+      }
+    | undefined {
+    const entry = this.appendEntries[this.appendHead];
+    if (!entry) return undefined;
+    this.appendHead += 1;
+    if (
+      this.appendHead >= 64 &&
+      this.appendHead * 2 >= this.appendEntries.length
+    ) {
+      this.appendEntries = this.appendEntries.slice(this.appendHead);
+      this.appendHead = 0;
+    }
+    return entry;
+  }
+
+  private clearAppendEntries(): boolean {
+    const hadQueuedData = this.appendQueueLength > 0;
+    this.appendEntries = [];
+    this.appendHead = 0;
+    this.appendQueueBytes = 0;
+    return hadQueuedData;
+  }
+
   get activeSession(): EmbyPlayerSession | undefined {
     return this.session;
   }
@@ -892,6 +1008,107 @@ export class EmbyMsePlayer extends EventTarget {
       return Math.max(0, this.video.buffered.end(0) - this.video.buffered.start(0));
     }
     return 0;
+  }
+
+  /**
+   * Validates a recovered HTTPS path in an isolated MediaSource. A successful
+   * manifest/HEAD alone cannot prove that init + keyframe bytes are decodable
+   * by this device's actual MSE implementation.
+   */
+  async validateRecoveryAppend(
+    mimeType: string,
+    init: Uint8Array,
+    media: Uint8Array,
+  ): Promise<boolean> {
+    const compatible = compatibleMimeType(mimeType);
+    if (
+      !compatible ||
+      typeof MediaSource === "undefined" ||
+      typeof document === "undefined" ||
+      !init.byteLength ||
+      !media.byteLength
+    ) {
+      return false;
+    }
+    const probeVideo = document.createElement("video");
+    const mediaSource = new MediaSource();
+    const objectUrl = URL.createObjectURL(mediaSource);
+    probeVideo.muted = true;
+    probeVideo.preload = "auto";
+    probeVideo.src = objectUrl;
+    try {
+      return await new Promise<boolean>((resolve) => {
+        let settled = false;
+        let sourceBuffer: SourceBuffer | undefined;
+        const finish = (value: boolean): void => {
+          if (settled) return;
+          settled = true;
+          window.clearTimeout(timeout);
+          try {
+            if (sourceBuffer?.updating) sourceBuffer.abort();
+          } catch {
+            // The disposable probe may already be closing.
+          }
+          resolve(value);
+        };
+        const append = (
+          bytes: Uint8Array,
+          next: () => void,
+        ): void => {
+          if (!sourceBuffer) {
+            finish(false);
+            return;
+          }
+          const onError = () => finish(false);
+          sourceBuffer.addEventListener("error", onError, {
+            once: true,
+          });
+          sourceBuffer.addEventListener(
+            "updateend",
+            () => {
+              sourceBuffer?.removeEventListener("error", onError);
+              next();
+            },
+            { once: true },
+          );
+          try {
+            sourceBuffer.appendBuffer(new Uint8Array(bytes));
+          } catch {
+            finish(false);
+          }
+        };
+        const timeout = window.setTimeout(() => finish(false), 8_000);
+        mediaSource.addEventListener(
+          "sourceopen",
+          () => {
+            try {
+              sourceBuffer = mediaSource.addSourceBuffer(compatible);
+              sourceBuffer.mode = "segments";
+              append(init, () =>
+                append(media, () =>
+                  finish(Boolean(sourceBuffer?.buffered.length)),
+                ),
+              );
+            } catch {
+              finish(false);
+            }
+          },
+          { once: true },
+        );
+        probeVideo.load();
+      });
+    } finally {
+      try {
+        if (mediaSource.readyState === "open") {
+          mediaSource.endOfStream();
+        }
+      } catch {
+        // Best-effort cleanup of the disposable decoder probe.
+      }
+      probeVideo.removeAttribute("src");
+      probeVideo.load();
+      URL.revokeObjectURL(objectUrl);
+    }
   }
 
   requestRecovery(): boolean {
@@ -943,6 +1160,7 @@ export class EmbyMsePlayer extends EventTarget {
       transportEpoch: session.transportEpoch ?? 0,
       targetTime: this.pendingCatchUpTarget,
       retryIndex: 0,
+      deadlineAt: performance.now() + 10_000,
     };
     return this.sendSegmentFallbackRequest();
   }
@@ -979,6 +1197,22 @@ export class EmbyMsePlayer extends EventTarget {
       this.clearSegmentFallbackRequest();
       return false;
     }
+    if (performance.now() >= request.deadlineAt) {
+      const detail = {
+        requestId: request.requestId,
+        sessionId: request.sessionId,
+        mediaVersion: request.mediaVersion,
+        targetTime: request.targetTime,
+      };
+      this.clearSegmentFallbackRequest();
+      if (this.channel?.readyState !== "closed") {
+        this.channel?.close();
+      }
+      this.dispatchEvent(
+        new CustomEvent("segmentfallbackfailed", { detail }),
+      );
+      return false;
+    }
     const sent = this.sendControl({
       type: "segment-fallback-request",
       requestId: request.requestId,
@@ -992,7 +1226,10 @@ export class EmbyMsePlayer extends EventTarget {
       request.retryIndex,
       retryDelays.length - 1,
     );
-    const delay = retryDelays[retryIndex];
+    const delay = Math.min(
+      retryDelays[retryIndex],
+      Math.max(1, request.deadlineAt - performance.now()),
+    );
     request.retryIndex = Math.min(
       retryDelays.length - 1,
       request.retryIndex + 1,
@@ -1167,6 +1404,7 @@ export class EmbyMsePlayer extends EventTarget {
         trackType,
         missing,
         missingEpoch,
+        repairGeneration,
       ) => {
         this.sendControl({
           type: "need",
@@ -1176,6 +1414,7 @@ export class EmbyMsePlayer extends EventTarget {
           fragmentSeq,
           trackType,
           missing,
+          repairGeneration,
         });
       },
       (nextEpoch) =>
@@ -1291,7 +1530,7 @@ export class EmbyMsePlayer extends EventTarget {
   }
 
   get queuedAppendBytes(): number {
-    return this.appendQueue.length ? this.appendQueueBytes : 0;
+    return this.appendQueueLength ? this.appendQueueBytes : 0;
   }
 
   get bufferProfile(): EmbyAdaptiveBufferProfile {
@@ -1340,7 +1579,7 @@ export class EmbyMsePlayer extends EventTarget {
       this.externalCacheStagingBytes +
       profile.gpuWorkingSetBytes;
     const pressured =
-      this.appendQueue.length >= profile.appendQueueMaxItems ||
+      this.appendQueueLength >= profile.appendQueueMaxItems ||
       this.queuedAppendBytes >= profile.appendQueueHighWaterBytes ||
       this.pendingMediaBytes >= profile.pendingFragmentLimitBytes ||
       p2pAssemblerBytes >= profile.p2pAssemblerLimitBytes ||
@@ -1395,7 +1634,7 @@ export class EmbyMsePlayer extends EventTarget {
     if (
       requested <= 0 ||
       requested > budget.maxSegmentBytes ||
-      this.appendQueue.length >= budget.appendQueueMaxItems ||
+      this.appendQueueLength >= budget.appendQueueMaxItems ||
       budget.appendQueueBytes + requested >
         budget.appendQueueHardLimitBytes ||
       budget.pendingFragmentBytes + requested >
@@ -1423,7 +1662,7 @@ export class EmbyMsePlayer extends EventTarget {
       sourceBufferAttached: Boolean(this.sourceBuffer),
       sourceBufferUpdating: this.sourceBuffer?.updating === true,
       appendBusy: this.appendBusy,
-      appendQueueItems: this.appendQueue.length,
+      appendQueueItems: this.appendQueueLength,
       appendQueueBytes: this.queuedAppendBytes,
       pendingMediaItems: this.pendingMediaFragments.size,
       pendingMediaBytes: this.pendingMediaBytes,
@@ -1608,9 +1847,29 @@ export class EmbyMsePlayer extends EventTarget {
             if (this.sourceBuffer !== sourceBuffer) return;
             this.clearAppendWatchdog();
             this.appendBusy = false;
+            const hadQueuedData = this.clearAppendEntries();
+            if (hadQueuedData) this.emitAppendQueueChange();
             this.emitError(
               "本地解码器拒绝了当前媒体片段，正在切换兼容 H.264 播放线路",
             );
+            window.setTimeout(() => {
+              if (
+                this.destroyed ||
+                this.sourceBuffer !== sourceBuffer
+              ) {
+                return;
+              }
+              if (!this.rebuildMediaSourceLocally("source-buffer-error")) {
+                this.requestCatchUp(
+                  Math.max(
+                    0,
+                    finite(this.video.currentTime),
+                    finite(this.latestHostTarget),
+                  ),
+                  "mse-source-buffer-error-terminal",
+                );
+              }
+            }, 0);
           });
           sourceBuffer.addEventListener("abort", () => {
             if (this.sourceBuffer !== sourceBuffer) return;
@@ -1782,29 +2041,31 @@ export class EmbyMsePlayer extends EventTarget {
   appendInit(data: Uint8Array): boolean {
     const session = this.session;
     if (this.awaitingMediaVersion !== undefined && !this.host) return false;
+    const currentInitKey = session
+      ? this.initKey(
+          session.sessionId,
+          session.mediaVersion,
+          session.transportEpoch ?? 0,
+        )
+      : "";
+    if (currentInitKey && this.receivedInitKey === currentInitKey) {
+      return true;
+    }
     const profile = this.bufferProfile;
     if (
       data.byteLength <= 0 ||
       data.byteLength > profile.maxSegmentBytes ||
-      this.appendQueue.length >= profile.appendQueueMaxItems ||
+      this.appendQueueLength >= profile.appendQueueMaxItems ||
       this.queuedAppendBytes + data.byteLength >
         profile.appendQueueHardLimitBytes
     ) {
       this.emitMediaQueuePressure("init", data.byteLength);
       return false;
     }
-    if (session) {
-      this.receivedInitKey = this.initKey(
-        session.sessionId,
-        session.mediaVersion,
-        session.transportEpoch ?? 0,
-      );
-    }
-    if (!this.appendQueue.length) this.appendQueueBytes = 0;
+    if (currentInitKey) this.receivedInitKey = currentInitKey;
+    if (!this.appendQueueLength) this.appendQueueBytes = 0;
     const retained = data.slice();
-    this.appendQueue.unshift(retained);
-    this.appendTimestampOffsets.unshift(undefined);
-    this.appendRetryCounts.unshift(0);
+    this.prependAppendEntry(retained);
     this.appendQueueBytes += data.byteLength;
     this.lastInitData = retained;
     this.emitAppendQueueChange();
@@ -1981,7 +2242,7 @@ export class EmbyMsePlayer extends EventTarget {
       if (!fragment) break;
       const profile = this.bufferProfile;
       if (
-        this.appendQueue.length >= profile.appendQueueMaxItems ||
+        this.appendQueueLength >= profile.appendQueueMaxItems ||
         this.queuedAppendBytes >= profile.appendQueueHighWaterBytes ||
         this.queuedAppendBytes + fragment.data.byteLength >
           profile.appendQueueHardLimitBytes
@@ -1997,12 +2258,11 @@ export class EmbyMsePlayer extends EventTarget {
         0,
         this.pendingMediaBytes - fragment.data.byteLength,
       );
-      if (!this.appendQueue.length) this.appendQueueBytes = 0;
-      this.appendQueue.push(fragment.data);
-      this.appendTimestampOffsets.push(
+      if (!this.appendQueueLength) this.appendQueueBytes = 0;
+      this.enqueueAppendEntry(
+        fragment.data,
         this.timestampOffsetForFragment(fragment),
       );
-      this.appendRetryCounts.push(0);
       this.appendQueueBytes += fragment.data.byteLength;
       this.nextMediaSequence = fragment.sequence + 1;
       this.lastDeliveredMediaSequence = Math.max(
@@ -2074,11 +2334,7 @@ export class EmbyMsePlayer extends EventTarget {
     this.lastDeliveredMediaSequence = undefined;
     this.missingFragmentRepairAttempts.clear();
     if (clearAppendQueue) {
-      const hadQueuedData = this.appendQueue.length > 0;
-      this.appendQueue = [];
-      this.appendTimestampOffsets = [];
-      this.appendRetryCounts = [];
-      this.appendQueueBytes = 0;
+      const hadQueuedData = this.clearAppendEntries();
       if (hadQueuedData) this.emitAppendQueueChange();
     }
   }
@@ -2142,7 +2398,7 @@ export class EmbyMsePlayer extends EventTarget {
       this.video.pause();
       return;
     }
-    const hostNow = Date.now() + this.clockOffsetMs;
+    const hostNow = this.monotonicWallNowMs() + this.clockOffsetMs;
     const desired = state.paused
       ? state.currentTime
       : state.currentTime +
@@ -2306,6 +2562,17 @@ export class EmbyMsePlayer extends EventTarget {
             transportEpoch: message.transportEpoch,
           },
         }),
+      );
+      return;
+    }
+    if (message.type === "repair-ack") {
+      this.assembler?.acknowledgeRepair(
+        message.mediaVersion,
+        message.fragmentSeq,
+        message.trackType,
+        message.transportEpoch,
+        message.repairGeneration,
+        message.accepted === true,
       );
       return;
     }
@@ -2541,7 +2808,7 @@ export class EmbyMsePlayer extends EventTarget {
         this.noteInvalidPacket();
         return;
       }
-      const wallNow = Date.now();
+      const wallNow = this.monotonicWallNowMs();
       const monotonicNow = performance.now();
       const roundTrip = Number.isFinite(message.clientMonotonicMs)
         ? monotonicNow - Number(message.clientMonotonicMs)
@@ -2553,9 +2820,23 @@ export class EmbyMsePlayer extends EventTarget {
         if (this.clockSyncSamples.length > 8) {
           this.clockSyncSamples.shift();
         }
-        this.clockOffsetMs = [...this.clockSyncSamples].sort(
+        const byRtt = [...this.clockSyncSamples].sort(
           (left, right) => left.rttMs - right.rttMs,
-        )[0].offsetMs;
+        );
+        const medianRtt = byRtt[Math.floor(byRtt.length / 2)].rttMs;
+        const trustedOffsets = byRtt
+          .filter(
+            (entry) =>
+              entry.rttMs <=
+              medianRtt + Math.max(20, medianRtt * 0.5),
+          )
+          .map((entry) => entry.offsetMs)
+          .sort((left, right) => left - right);
+        const middle = Math.floor(trustedOffsets.length / 2);
+        this.clockOffsetMs =
+          trustedOffsets.length % 2
+            ? trustedOffsets[middle]
+            : (trustedOffsets[middle - 1] + trustedOffsets[middle]) / 2;
         this.clockSamples += 1;
       }
       return;
@@ -2814,7 +3095,7 @@ export class EmbyMsePlayer extends EventTarget {
       this.assembler?.reset();
       this.flushPendingMedia(true);
       this.maybeEndStream();
-    }, 12_000);
+    }, EMBY_END_REPAIR_TIMEOUT_MS);
   }
 
   private clearEndBoundary(): void {
@@ -2874,9 +3155,13 @@ export class EmbyMsePlayer extends EventTarget {
   private sendClockPing(): void {
     this.sendControl({
       type: "sync-ping",
-      clientTimeMs: Date.now(),
+      clientTimeMs: this.monotonicWallNowMs(),
       clientMonotonicMs: performance.now(),
     });
+  }
+
+  private monotonicWallNowMs(): number {
+    return this.monotonicWallOriginMs + performance.now();
   }
 
   private isTimeBuffered(seconds: number): boolean {
@@ -2908,13 +3193,15 @@ export class EmbyMsePlayer extends EventTarget {
       this.appendBusy ||
       !this.sourceBuffer ||
       this.sourceBuffer.updating ||
-      !this.appendQueue.length
+      !this.appendQueueLength
     ) {
       this.maybeEndStream();
       return;
     }
-    const next = this.appendQueue[0];
-    const nextTimestampOffset = this.appendTimestampOffsets[0];
+    const nextEntry = this.peekAppendEntry();
+    if (!nextEntry) return;
+    const next = nextEntry.data;
+    const nextTimestampOffset = nextEntry.timestampOffset;
     try {
       this.appendBusy = true;
       if (
@@ -2936,9 +3223,7 @@ export class EmbyMsePlayer extends EventTarget {
           ? next.buffer
           : next.slice().buffer;
       this.sourceBuffer.appendBuffer(appendable);
-      this.appendQueue.shift();
-      this.appendTimestampOffsets.shift();
-      this.appendRetryCounts.shift();
+      this.dequeueAppendEntry();
       this.appendQueueBytes = Math.max(
         0,
         this.appendQueueBytes - next.byteLength,
@@ -2959,20 +3244,27 @@ export class EmbyMsePlayer extends EventTarget {
         this.recoverFromQuotaExceeded();
         return;
       }
-      this.appendQueue.shift();
-      this.appendTimestampOffsets.shift();
-      this.appendRetryCounts.shift();
-      this.appendQueueBytes = Math.max(
-        0,
-        this.appendQueueBytes - next.byteLength,
-      );
-      this.emitAppendQueueChange();
       this.emitError(
         error instanceof Error
           ? `追加媒体片段失败：${error.message}`
           : "追加媒体片段失败",
       );
-      window.setTimeout(() => this.pumpAppendQueue(), 0);
+      // Continuing after a rejected append creates a permanent media hole.
+      // Replace the local MSE and explicitly repopulate from the current
+      // timeline instead. If rebuilding is exhausted, clear the bounded queue
+      // and request a transport resync rather than appending later fragments.
+      if (!this.rebuildMediaSourceLocally("append-error")) {
+        const hadQueuedData = this.clearAppendEntries();
+        if (hadQueuedData) this.emitAppendQueueChange();
+        this.requestCatchUp(
+          Math.max(
+            0,
+            finite(this.video.currentTime),
+            finite(this.latestHostTarget),
+          ),
+          "mse-append-error-terminal",
+        );
+      }
     }
   }
 
@@ -3024,7 +3316,7 @@ export class EmbyMsePlayer extends EventTarget {
     this.stopEndRepairIfReached();
     if (
       !this.endRequested ||
-      this.appendQueue.length ||
+      this.appendQueueLength ||
       this.pendingMediaFragments.size ||
       this.mediaReorderTimer !== undefined ||
       (this.endBoundary && this.assembler?.hasPending) ||
@@ -3044,13 +3336,39 @@ export class EmbyMsePlayer extends EventTarget {
   }
 
   private inspectBuffer(urgent = false): void {
-    if (!this.session || !this.video.buffered.length) return;
+    if (!this.session) return;
     if (this.awaitingMediaVersion !== undefined) {
       this.video.pause();
       return;
     }
     if (this.awaitingResyncEpoch !== undefined) {
       this.video.pause();
+      return;
+    }
+    if (!this.video.buffered.length) {
+      const now = performance.now();
+      if (shouldReportEmbyBuffer(this.lastBufferReportAt, now)) {
+        this.lastBufferReportAt = now;
+        this.dispatchEvent(
+          new CustomEvent("buffer", {
+            detail: {
+              aheadSeconds: 0,
+              initialSeconds: this.initialBufferSeconds,
+              targetSeconds: this.targetBufferSeconds,
+              pausedForFlow: true,
+            },
+          }),
+        );
+        this.sendControl({
+          type: "buffer-state",
+          sessionId: this.session.sessionId,
+          mediaVersion: this.session.mediaVersion,
+          transportEpoch: this.session.transportEpoch ?? 0,
+          aheadSeconds: 0,
+          urgent: true,
+        });
+      }
+      if (urgent && !this.hasCurrentInit()) this.armInitRequest();
       return;
     }
     const catchUpTarget = this.pendingCatchUpTarget;
@@ -3084,10 +3402,22 @@ export class EmbyMsePlayer extends EventTarget {
       }
     }
     const ahead = this.bufferedAhead;
-    const bufferedBehind = Math.max(
-      0,
-      this.video.currentTime - this.video.buffered.start(0),
-    );
+    let bufferedBehind = 0;
+    for (
+      let index = 0;
+      index < this.video.buffered.length;
+      index += 1
+    ) {
+      const start = this.video.buffered.start(index);
+      const end = this.video.buffered.end(index);
+      if (
+        this.video.currentTime >= start - BUFFER_TIME_EPSILON_SECONDS &&
+        this.video.currentTime <= end + BUFFER_TIME_EPSILON_SECONDS
+      ) {
+        bufferedBehind = Math.max(0, this.video.currentTime - start);
+        break;
+      }
+    }
     const policy = evaluateEmbyBufferPolicy(ahead, bufferedBehind, {
       initialSeconds: this.initialBufferSeconds,
       targetSeconds: this.targetBufferSeconds,
@@ -3189,13 +3519,14 @@ export class EmbyMsePlayer extends EventTarget {
 
   private recoverFromQuotaExceeded(): void {
     const sourceBuffer = this.sourceBuffer;
-    const next = this.appendQueue[0];
-    if (!sourceBuffer || !next) {
+    const nextEntry = this.peekAppendEntry();
+    if (!sourceBuffer || !nextEntry) {
       this.pendingQuotaRecovery = false;
       return;
     }
-    const retry = (this.appendRetryCounts[0] || 0) + 1;
-    this.appendRetryCounts[0] = retry;
+    const next = nextEntry.data;
+    const retry = nextEntry.retryCount + 1;
+    nextEntry.retryCount = retry;
     this.quotaRecoveryAttempts = retry;
     if (retry === 1) {
       this.removeBufferedHistory();
@@ -3355,10 +3686,8 @@ export class EmbyMsePlayer extends EventTarget {
   }
 
   private failQuotaFragment(fragment: Uint8Array, retry: number): void {
-    if (this.appendQueue[0] === fragment) {
-      this.appendQueue.shift();
-      this.appendTimestampOffsets.shift();
-      this.appendRetryCounts.shift();
+    if (this.peekAppendEntry()?.data === fragment) {
+      this.dequeueAppendEntry();
       this.appendQueueBytes = Math.max(
         0,
         this.appendQueueBytes - fragment.byteLength,

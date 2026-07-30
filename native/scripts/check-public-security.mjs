@@ -24,7 +24,10 @@ function legacyConstructedTokenForRoom(room, fill = 97) {
   return bytes.toString("base64url");
 }
 
-function openSocketAttempt(label, options = {}) {
+function openSocketAttempt(
+  label,
+  options = { origin: "file://" },
+) {
   return new Promise((resolve, reject) => {
     const socket = new WebSocket(signalUrl, options);
     const timer = setTimeout(() => {
@@ -43,7 +46,7 @@ function openSocketAttempt(label, options = {}) {
   });
 }
 
-async function openSocket(label, options = {}) {
+async function openSocket(label, options = { origin: "file://" }) {
   let lastError;
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     try {

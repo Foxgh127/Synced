@@ -12,6 +12,7 @@ const LEGACY_HOST_CHANNEL_OWNER_KEY = "synced:host-channel-owner-v2";
 const NICKNAME_KEY = "synced:nickname";
 const CHANNEL_NAME_KEY = "synced:channel-name";
 const ROOM_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
+let volatileOwnership: HostChannelOwnership | undefined;
 
 export interface HostChannelOwnership {
   room: string;
@@ -116,6 +117,35 @@ function ownerBytesForToken(token: string): Uint8Array | undefined {
   }
 }
 
+function loadDesktopOwnership(): HostChannelOwnership | undefined {
+  try {
+    return typeof window !== "undefined"
+      ? window.roomDesktop?.loadChannelOwnership()
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function persistHostOwnership(ownership: HostChannelOwnership): void {
+  volatileOwnership = ownership;
+  try {
+    window.roomDesktop?.saveChannelOwnership(ownership);
+  } catch {
+    // Browsers and Android keep this credential only in the current process
+    // until a Keystore-backed bridge is available; never downgrade to clear
+    // localStorage persistence.
+  }
+  for (const key of [
+    HOST_CHANNEL_OWNER_KEY,
+    LEGACY_HOST_CHANNEL_OWNER_KEY,
+  ]) {
+    localStorage.removeItem(key);
+  }
+  // The public room code is not a credential and remains useful to the UI.
+  localStorage.setItem(HOST_CHANNEL_KEY, ownership.room);
+}
+
 /**
  * Returns this installation's creator credential.
  *
@@ -124,30 +154,36 @@ function ownerBytesForToken(token: string): Uint8Array | undefined {
  * code from constructing a matching creator credential.
  */
 export async function getHostChannelOwnership(): Promise<HostChannelOwnership> {
-  for (const key of [
-    HOST_CHANNEL_OWNER_KEY,
-    LEGACY_HOST_CHANNEL_OWNER_KEY,
-  ]) {
+  const candidates: unknown[] = [
+    loadDesktopOwnership(),
+    volatileOwnership,
+  ];
+  for (const key of [HOST_CHANNEL_OWNER_KEY, LEGACY_HOST_CHANNEL_OWNER_KEY]) {
     try {
-      const saved = JSON.parse(localStorage.getItem(key) || "null");
+      candidates.push(JSON.parse(localStorage.getItem(key) || "null"));
+    } catch {
+      candidates.push(undefined);
+    }
+  }
+  for (const saved of candidates) {
+    try {
       const bytes =
-        typeof saved?.ownerToken === "string"
-          ? ownerBytesForToken(saved.ownerToken)
+        typeof (saved as HostChannelOwnership | undefined)?.ownerToken ===
+        "string"
+          ? ownerBytesForToken(
+              (saved as HostChannelOwnership).ownerToken,
+            )
           : undefined;
       if (bytes) {
         const ownership = {
           room: await roomForOwnerBytes(bytes),
-          ownerToken: saved.ownerToken,
+          ownerToken: (saved as HostChannelOwnership).ownerToken,
         };
-        localStorage.setItem(
-          HOST_CHANNEL_OWNER_KEY,
-          JSON.stringify(ownership),
-        );
-        localStorage.setItem(HOST_CHANNEL_KEY, ownership.room);
+        persistHostOwnership(ownership);
         return ownership;
       }
     } catch {
-      // Try the older credential before replacing malformed local data.
+      // Try the next secure or legacy credential before rotating.
     }
   }
 
@@ -156,10 +192,7 @@ export async function getHostChannelOwnership(): Promise<HostChannelOwnership> {
     room: await roomForOwnerBytes(bytes),
     ownerToken: ownerTokenForBytes(bytes),
   };
-  localStorage.setItem(HOST_CHANNEL_OWNER_KEY, JSON.stringify(ownership));
-  // A legacy room code cannot be retained safely because it has no private
-  // credential. Rotate it once and keep the old key synchronized for UI code.
-  localStorage.setItem(HOST_CHANNEL_KEY, ownership.room);
+  persistHostOwnership(ownership);
   return ownership;
 }
 

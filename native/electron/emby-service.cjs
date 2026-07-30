@@ -46,6 +46,8 @@ const RELAY_FINAL_DRAIN_TIMEOUT_MS = 10_000;
 const RELAY_UPLOAD_BUDGET_SHARE = 0.65;
 const RELAY_MIN_VIABLE_UPLOAD_BPS = 128_000;
 const AUXILIARY_RENDITION_IDLE_MS = 30_000;
+const AUXILIARY_RETRY_MAX_MS = 30_000;
+const CMAF_MAX_TOTAL_RENDITIONS = 3;
 const CMAF_AUXILIARY_RENDITIONS = Object.freeze([
   Object.freeze({
     id: "original",
@@ -57,7 +59,7 @@ const CMAF_AUXILIARY_RENDITIONS = Object.freeze([
     id: "1080p8",
     quality: "1080p-8",
     forceVideoTranscode: true,
-    defaultActive: true,
+    defaultActive: false,
   }),
   Object.freeze({
     id: "720p4",
@@ -2609,8 +2611,10 @@ class CmafRelayCoordinator {
     }
     if (this.uploadBudgetBps > 0) {
       this.pumpUploads();
-      this.scheduleManifest();
     }
+    // Anchor, ended and rendition availability are tiny control state and
+    // must remain publishable even while media upload is paused at zero.
+    this.scheduleManifest();
     return this.uploadBudgetBps;
   }
 
@@ -2632,7 +2636,10 @@ class CmafRelayCoordinator {
   forwardWindowMs() {
     const totalBitrate = [...this.renditions.values()].reduce(
       (sum, state) =>
-        sum + Math.max(0, Number(state.plan?.bitrate) || 0),
+        sum +
+        (state.dormant || state.demandPaused
+          ? 0
+          : Math.max(0, Number(state.plan?.bitrate) || 0)),
       0,
     );
     if (!totalBitrate) return 2 * 60 * 60_000;
@@ -2938,11 +2945,11 @@ class CmafRelayCoordinator {
     const data = Buffer.isBuffer(item.data)
       ? item.data
       : Buffer.from(item.data);
-    if (data.length > 96 * 1024 * 1024) {
+    if (data.length > 32 * 1024 * 1024) {
       this.sendEvent({
         type: "warning",
         code: "segment-too-large",
-        message: `${state.id} 分片超过 96 MiB，已拒绝进入缓存`,
+        message: `${state.id} 分片超过 32 MiB，已拒绝进入缓存`,
       });
       return;
     }
@@ -3396,7 +3403,13 @@ class CmafRelayCoordinator {
     });
   }
 
-  async uploadFile(url, filePath, bytes, headers) {
+  async uploadFile(
+    url,
+    filePath,
+    bytes,
+    headers,
+    bypassMediaBudget = false,
+  ) {
     let lastError;
     for (let attempt = 1; attempt <= RELAY_UPLOAD_MAX_ATTEMPTS; attempt += 1) {
       if (this.closed || this.controller.signal.aborted) {
@@ -3418,10 +3431,12 @@ class CmafRelayCoordinator {
       refreshIdle();
       const monitoredBody = (async function* () {
         for await (const chunk of stream) {
-          await this.waitForUploadBudget(
-            chunk.byteLength,
-            controller.signal,
-          );
+          if (!bypassMediaBudget) {
+            await this.waitForUploadBudget(
+              chunk.byteLength,
+              controller.signal,
+            );
+          }
           refreshIdle();
           yield chunk;
         }
@@ -3893,7 +3908,6 @@ class CmafRelayCoordinator {
   scheduleManifest() {
     this.manifestDirty = true;
     if (
-      this.uploadBudgetBps === 0 ||
       this.manifestUploading ||
       this.manifestRetryTimer ||
       this.closed
@@ -4051,11 +4065,13 @@ class CmafRelayCoordinator {
               left.bitrate - right.bitrate || left.height - right.height,
           ),
       });
-      let deepWindowMs = this.forwardWindowMs();
+      // Publish a bounded sliding control window. Historical segments remain
+      // in relay/cache storage without being reserialized on every revision.
+      let deepWindowMs = Math.min(this.forwardWindowMs(), 15 * 60_000);
       let manifest = buildManifest(deepWindowMs);
       let body = Buffer.from(JSON.stringify(manifest));
-      while (body.length > 1_900_000 && deepWindowMs > 5 * 60_000) {
-        deepWindowMs = Math.max(5 * 60_000, Math.floor(deepWindowMs * 0.75));
+      while (body.length > 480_000 && deepWindowMs > 60_000) {
+        deepWindowMs = Math.max(60_000, Math.floor(deepWindowMs * 0.7));
         manifest = buildManifest(deepWindowMs);
         body = Buffer.from(JSON.stringify(manifest));
       }
@@ -4072,6 +4088,7 @@ class CmafRelayCoordinator {
               .update(body)
               .digest("hex"),
           },
+          true,
         );
         if (
           Number.isSafeInteger(result?.evictionRevision) &&
@@ -4263,6 +4280,8 @@ class EmbyService {
     this.auxiliary = options.auxiliary === true;
     this.auxiliaryServices = new Map();
     this.auxiliaryStopPromises = new Map();
+    this.auxiliaryRetryTimers = new Map();
+    this.auxiliaryRetryAttempts = new Map();
     this.auxiliaryServiceFactory =
       typeof options.auxiliaryServiceFactory === "function"
         ? options.auxiliaryServiceFactory
@@ -5241,14 +5260,20 @@ class EmbyService {
       "-fflags",
       "+genpts+discardcorrupt",
     ];
-    args.push(
-      "-readrate",
-      String(readAhead.readRate),
-      "-readrate_initial_burst",
-      String(readAhead.initialBurstSeconds),
-      "-readrate_catchup",
-      String(readAhead.catchupRate),
-    );
+    // Remux/direct producers are governed dynamically by the relay token
+    // bucket, memory watermarks and disk pressure. A fixed -readrate made a
+    // fast path incapable of building reserve. Only a CPU-bound local
+    // transcode keeps the conservative encoder clock.
+    if (plan.internal.localVideoTranscode === true) {
+      args.push(
+        "-readrate",
+        String(readAhead.readRate),
+        "-readrate_initial_burst",
+        String(readAhead.initialBurstSeconds),
+        "-readrate_catchup",
+        String(readAhead.catchupRate),
+      );
+    }
     if (
       startSeconds > 0 &&
       (["DirectPlay", "LocalRemux"].includes(plan.public.method) ||
@@ -5661,8 +5686,17 @@ class EmbyService {
         (rendition) => rendition.defaultActive,
       ).map((rendition) => rendition.id),
     );
-    if (input.original === true) nextDemand.add("original");
-    if (input.low === true) nextDemand.add("480p18");
+    const requestedExtras = [
+      ...(input.low === true ? ["480p18"] : []),
+      ...(input.high === true ? ["1080p8"] : []),
+      ...(input.original === true ? ["original"] : []),
+    ];
+    const maximumAuxiliaryRenditions =
+      CMAF_MAX_TOTAL_RENDITIONS - 1;
+    for (const renditionId of requestedExtras) {
+      if (nextDemand.size >= maximumAuxiliaryRenditions) break;
+      nextDemand.add(renditionId);
+    }
     this.auxiliaryDemand = nextDemand;
 
     for (const rendition of CMAF_AUXILIARY_RENDITIONS) {
@@ -5673,6 +5707,10 @@ class EmbyService {
         coordinator.setRenditionDemandActive(rendition.id, true);
         continue;
       }
+      const retryTimer = this.auxiliaryRetryTimers.get(rendition.id);
+      if (retryTimer) clearTimeout(retryTimer);
+      this.auxiliaryRetryTimers.delete(rendition.id);
+      this.auxiliaryRetryAttempts.delete(rendition.id);
       if (!this.auxiliaryServices.has(rendition.id) || existingTimer) {
         continue;
       }
@@ -5732,6 +5770,40 @@ class EmbyService {
     await stopping;
   }
 
+  scheduleAuxiliaryRetry(renditionId) {
+    if (
+      this.auxiliaryRetryTimers.has(renditionId) ||
+      !this.auxiliaryDemand.has(renditionId) ||
+      !this.auxiliarySourceInput ||
+      !this.pipeline ||
+      this.pipeline.stopping ||
+      !this.relayCoordinator
+    ) {
+      return;
+    }
+    const attempts =
+      (this.auxiliaryRetryAttempts.get(renditionId) || 0) + 1;
+    this.auxiliaryRetryAttempts.set(renditionId, attempts);
+    const delayMs = Math.min(
+      AUXILIARY_RETRY_MAX_MS,
+      500 * 2 ** Math.min(6, attempts - 1),
+    );
+    const timer = setTimeout(() => {
+      this.auxiliaryRetryTimers.delete(renditionId);
+      if (
+        this.auxiliaryDemand.has(renditionId) &&
+        this.auxiliarySourceInput
+      ) {
+        void this.startAuxiliaryRenditions(
+          this.auxiliarySourceInput,
+          new Set([renditionId]),
+        );
+      }
+    }, delayMs);
+    timer.unref?.();
+    this.auxiliaryRetryTimers.set(renditionId, timer);
+  }
+
   async startAuxiliaryRenditions(input, requestedRenditions) {
     const coordinator = this.relayCoordinator;
     if (!coordinator || this.auxiliary || this.pipeline?.stopping) return;
@@ -5773,18 +5845,7 @@ class EmbyService {
               !this.pipeline.stopping &&
               this.relayCoordinator === coordinator
             ) {
-              const timer = setTimeout(() => {
-                if (
-                  this.auxiliaryDemand.has(specification.id) &&
-                  this.auxiliarySourceInput
-                ) {
-                  void this.startAuxiliaryRenditions(
-                    this.auxiliarySourceInput,
-                    new Set([specification.id]),
-                  );
-                }
-              }, 500);
-              timer.unref?.();
+              this.scheduleAuxiliaryRetry(specification.id);
             }
           }
           if (
@@ -5825,6 +5886,9 @@ class EmbyService {
           singleRendition: true,
           skipSubtitle: true,
         })
+        .then(() => {
+          this.auxiliaryRetryAttempts.delete(specification.id);
+        })
         .catch((error) => {
           if (this.auxiliaryServices.get(specification.id) === service) {
             this.auxiliaryServices.delete(specification.id);
@@ -5841,7 +5905,12 @@ class EmbyService {
             renditionId: specification.id,
             auxiliary: true,
           });
-          return service.stopStream("auxiliary-start-failed");
+          return service
+            .stopStream("auxiliary-start-failed")
+            .catch(() => undefined)
+            .finally(() =>
+              this.scheduleAuxiliaryRetry(specification.id),
+            );
         });
     }
   }
@@ -5965,6 +6034,11 @@ class EmbyService {
       clearTimeout(timer);
     }
     this.auxiliaryIdleTimers.clear();
+    for (const timer of this.auxiliaryRetryTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.auxiliaryRetryTimers.clear();
+    this.auxiliaryRetryAttempts.clear();
     this.auxiliarySourceInput = undefined;
     const auxiliaryServices = [...this.auxiliaryServices.values()];
     this.auxiliaryServices.clear();

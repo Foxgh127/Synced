@@ -30,7 +30,7 @@ test("network advice falls back to a stable 1080p selection", async () => {
   assert.equal(frameRateForResolution("original", advice), 30);
 });
 
-test("changing from recommended 4K to 2K raises the unlocked frame rate", async () => {
+test("an unlocked selection applies the advised resolution and 30 fps ceiling", async () => {
   const { sanitizeNetworkAdvice, selectResolutionAndFrameRate } =
     await loadModule();
   const advice = sanitizeNetworkAdvice({
@@ -39,26 +39,26 @@ test("changing from recommended 4K to 2K raises the unlocked frame rate", async 
     measuredCount: 2,
     confidence: "high",
     perViewerBudgetBps: 32_000_000,
-    recommendedResolution: "original",
+    recommendedResolution: "ultra",
     routeMode: "p2p-preferred",
     reason: "两端网络稳定",
     maxFrameRateByResolution: {
       original: 24,
-      ultra: 60,
-      high: 60,
-      standard: 90,
-      smooth: 120,
+      ultra: 30,
+      high: 30,
+      standard: 30,
+      smooth: 24,
     },
   });
   assert.ok(advice);
   assert.deepEqual(
     selectResolutionAndFrameRate({
-      resolution: "ultra",
+      resolution: "original",
       currentFrameRate: 24,
       frameRateLockedByUser: false,
       advice,
     }),
-    { resolution: "ultra", frameRate: 60 },
+    { resolution: "ultra", frameRate: 30 },
   );
 });
 

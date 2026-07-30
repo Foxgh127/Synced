@@ -76,7 +76,7 @@ import {
 } from "./native-network";
 import {
   ensureNetworkProbe,
-  probeIceReachability,
+  probeIceCandidateGatherability,
 } from "./network-probe";
 import {
   fallbackNetworkAdvice,
@@ -467,8 +467,14 @@ export async function openChannelSession(
       height?: number;
       frameRate?: number;
       originalDemand?: boolean;
+      highDemand?: boolean;
       lowDemand?: boolean;
       availableDownloadBps?: number;
+      renditionPolicy?: {
+        maxActiveRenditions?: number;
+        allowOriginal?: boolean;
+        serverVerified?: boolean;
+      };
     }
   >();
   let watcherPc: RTCPeerConnection | undefined;
@@ -725,14 +731,18 @@ export async function openChannelSession(
       ? "off"
       : "auto";
   const resumeTokenKey = `synced:resume-token:${room}`;
-  let resumeToken = localStorage.getItem(resumeTokenKey) || "";
+  let resumeToken =
+    sessionStorage.getItem(resumeTokenKey) ||
+    localStorage.getItem(resumeTokenKey) ||
+    "";
+  localStorage.removeItem(resumeTokenKey);
   if (!/^[a-z0-9-]{16,128}$/i.test(resumeToken)) {
     resumeToken =
       crypto.randomUUID?.() ||
       `${Date.now().toString(36)}-${crypto
         .getRandomValues(new Uint32Array(4))
         .join("-")}`;
-    localStorage.setItem(resumeTokenKey, resumeToken);
+    sessionStorage.setItem(resumeTokenKey, resumeToken);
   }
   let dockHideTimer: number | undefined;
   let dockChatCloseTimer: number | undefined;
@@ -1013,9 +1023,6 @@ export async function openChannelSession(
             <option value="0">原帧率</option>
             <option value="24">24 帧</option>
             <option value="30">30 帧</option>
-            <option value="60">60 帧</option>
-            <option value="90">90 帧</option>
-            <option value="120">120 帧</option>
           </select>
         </label>
         <small id="receiver-capability" class="receiver-capability" hidden></small>
@@ -2150,6 +2157,12 @@ export async function openChannelSession(
       normalized.title = String(value.title || "Emby 高清播放").slice(0, 300);
       normalized.bitrate = Number(value.bitrate) || undefined;
       normalized.durationTicks = Number(value.durationTicks) || undefined;
+      normalized.allowOriginalRendition =
+        value.allowOriginalRendition !== false;
+      normalized.maxActiveRenditions = Math.max(
+        1,
+        Math.min(3, Math.round(Number(value.maxActiveRenditions) || 3)),
+      );
     }
     return normalized;
   }
@@ -2186,6 +2199,7 @@ export async function openChannelSession(
         !resetViewerPreference,
         {
           contentMode: broadcastCapabilities.contentMode,
+          sourceWidth: broadcastCapabilities.width,
           sourceFrameRate: broadcastCapabilities.frameRate,
         },
       );
@@ -3991,20 +4005,9 @@ export async function openChannelSession(
         readInboundAudioStats(peer, previousAudioSnapshot),
       ]);
       if (watcherPc !== peer || sfuViewerActive) return;
-      if (
-        typeof stats.relayed === "boolean" &&
-        networkReport &&
-        (networkReport.directReachable !== !stats.relayed ||
-          (stats.relayed && networkReport.turnReachable !== true))
-      ) {
-        networkReport = {
-          ...networkReport,
-          directReachable: !stats.relayed,
-          ...(stats.relayed ? { turnReachable: true } : {}),
-          measuredAt: Date.now(),
-        };
-        sendNetworkReportWhenAllowed();
-      }
+      // A selected two-endpoint candidate pair is reported separately through
+      // network:transport-report. Candidate gathering is only a local
+      // capability and must never be relabelled as path reachability.
       inboundSnapshot = stats.snapshot;
       inboundAudioSnapshot = audioStats.snapshot;
       if (
@@ -4804,6 +4807,8 @@ export async function openChannelSession(
               networkReport.downloadKbps * 1_000 * 0.62 >=
                 15_000_000,
           ),
+        highDemand:
+          requestedHeight === undefined || requestedHeight > 720,
         lowDemand:
           requestedHeight !== undefined && requestedHeight <= 480,
         availableDownloadBps:
@@ -5207,6 +5212,32 @@ export async function openChannelSession(
         transportEpoch: detail.transportEpoch,
         requestId: detail.requestId,
       });
+    });
+    player.addEventListener("segmentfallbackfailed", (event) => {
+      if (!isActive() || embyViewer !== player || leaving) return;
+      const detail = (
+        event as CustomEvent<{
+          requestId: string;
+          mediaVersion: number;
+          targetTime: number;
+        }>
+      ).detail;
+      embySegmentFallbackRequested = false;
+      embySegmentFallbackActive = false;
+      if (embyFallbackMediaChannel?.readyState !== "closed") {
+        embyFallbackMediaChannel?.close();
+      }
+      embyFallbackMediaChannel = undefined;
+      reportPlaybackDiagnostic("emby-segment-fallback-failed", {
+        requestId: detail.requestId,
+        mediaVersion: detail.mediaVersion,
+        targetTime: Number(detail.targetTime.toFixed(3)),
+      });
+      setStatus(
+        "P2P 媒体应急确认超时 · 正在重建备用连接",
+        "neutral",
+      );
+      void beginP2PWatching(true);
     });
     player.addEventListener("segmentrelay", (event) => {
       if (
@@ -8457,6 +8488,9 @@ export async function openChannelSession(
     if (applySelection) {
       const selected = selectResolutionAndFrameRate({
         resolution: stableRecommendation.resolution,
+        // The recommendation (including the local 2K encoder ceiling) was
+        // already resolved immediately above.
+        resolutionLockedByUser: true,
         currentFrameRate: frameRate,
         frameRateLockedByUser,
         advice: networkAdvice,
@@ -8546,7 +8580,8 @@ export async function openChannelSession(
       ) {
         return;
       }
-      const reachability = await probeIceReachability(
+      const candidateGatherability =
+        await probeIceCandidateGatherability(
         iceServers,
         networkProbeAbortController.signal,
         { networkType: baseReport.networkType },
@@ -8560,10 +8595,9 @@ export async function openChannelSession(
       }
       const report: NetworkReport = {
         ...baseReport,
-        ...reachability,
+        ...candidateGatherability,
       };
       networkReport = report;
-      measuredAvailableOutgoingBitrate = report.uploadKbps * 1_000;
       updateEmbySegmentRenditionDemand();
       sendNetworkReportWhenAllowed();
       if (
@@ -10495,21 +10529,23 @@ export async function openChannelSession(
       return;
     }
     let original = false;
+    let high = false;
     let low = false;
     const originalBitrate =
       Math.max(0, Number(selectedEmbyMediaSource()?.bitrate) || 0);
     for (const [viewerId, preference] of receiverPreferences) {
       const participant = participants.get(viewerId);
       if (!participant || viewerId === selfId) continue;
-      const height = Number(preference.height);
-      if (
-        preference.lowDemand === true ||
-        (Number.isFinite(height) && height > 0 && height <= 480)
-      ) {
+      if (preference.lowDemand === true) {
         low = true;
+      }
+      if (preference.highDemand === true) {
+        high = true;
       }
       if (
         preference.originalDemand === true &&
+        preference.renditionPolicy?.serverVerified === true &&
+        preference.renditionPolicy?.allowOriginal !== false &&
         participant.embyCapabilities?.desktop === true &&
         (originalBitrate <= 0 ||
           Number(preference.availableDownloadBps) >=
@@ -10518,20 +10554,43 @@ export async function openChannelSession(
         original = true;
       }
     }
-    const freshNetworkReport =
-      networkReport &&
-      Date.now() - networkReport.measuredAt <= 5 * 60_000
-        ? networkReport
-        : undefined;
+    const verifiedPublisherBudgetBps =
+      measuredAvailableOutgoingBitrate ??
+      networkAdvice.publisherAdvice?.budgetBps;
+    const canPublishHigh =
+      Number(verifiedPublisherBudgetBps) >= 12_000_000;
+    const canPublishOriginal =
+      originalBitrate > 0 &&
+      Number(verifiedPublisherBudgetBps) >= originalBitrate * 1.35;
+    const maximumActiveRenditions = Math.max(
+      1,
+      Math.min(
+        3,
+        Number(broadcastCapabilities?.maxActiveRenditions) || 3,
+      ),
+    );
+    let remainingAuxiliarySlots = Math.max(
+      0,
+      maximumActiveRenditions - 2,
+    );
+    const selectedLow = low && remainingAuxiliarySlots-- > 0;
+    const selectedHigh =
+      high && canPublishHigh && remainingAuxiliarySlots-- > 0;
+    const selectedOriginal =
+      original &&
+      canPublishOriginal &&
+      broadcastCapabilities?.allowOriginalRendition !== false &&
+      remainingAuxiliarySlots-- > 0;
     controller.setSegmentRenditionDemand({
-      original,
-      low,
-      ...(freshNetworkReport
+      original: selectedOriginal,
+      high: selectedHigh,
+      low: selectedLow,
+      ...(Number.isFinite(verifiedPublisherBudgetBps)
         ? {
             availableUploadBps:
               Math.max(
                 0,
-                Math.max(0, freshNetworkReport.uploadKbps) * 1_000 -
+                Math.max(0, Number(verifiedPublisherBudgetBps)) -
                   (2_000_000 +
                     Math.max(0, participants.size - 1) * 350_000),
               ),
@@ -10546,8 +10605,14 @@ export async function openChannelSession(
       height?: number;
       frameRate?: number;
       originalDemand?: boolean;
+      highDemand?: boolean;
       lowDemand?: boolean;
       availableDownloadBps?: number;
+      renditionPolicy?: {
+        maxActiveRenditions?: number;
+        allowOriginal?: boolean;
+        serverVerified?: boolean;
+      };
     },
   ): void {
     receiverPreferences.set(viewerId, preference);
@@ -11094,6 +11159,8 @@ export async function openChannelSession(
             title: detail.title,
             bitrate: detail.plan.bitrate,
             durationTicks: detail.plan.runtimeTicks,
+            allowOriginalRendition: true,
+            maxActiveRenditions: 3,
           };
           setBroadcastCapabilities(capabilities);
           updateEmbySegmentRenditionDemand();
@@ -11136,6 +11203,8 @@ export async function openChannelSession(
         title: stream.title,
         bitrate: stream.plan.bitrate,
         durationTicks: stream.plan.runtimeTicks,
+        allowOriginalRendition: true,
+        maxActiveRenditions: 3,
       };
       setBroadcastCapabilities(capabilities);
       updateEmbySegmentRenditionDemand();
@@ -12484,8 +12553,10 @@ export async function openChannelSession(
         height: message.height,
         frameRate: message.frameRate,
         originalDemand: message.originalDemand === true,
+        highDemand: message.highDemand === true,
         lowDemand: message.lowDemand === true,
         availableDownloadBps: message.availableDownloadBps,
+        renditionPolicy: message.renditionPolicy,
       };
       if (broadcastCapabilities?.mode === "emby") {
         scheduleEmbyViewerPreference(message.viewerId, preference);
@@ -13362,6 +13433,7 @@ export async function openChannelSession(
         qualitySelectionTouched = true;
         const selected = selectResolutionAndFrameRate({
           resolution: button.dataset.sessionResolution as ResolutionKey,
+          resolutionLockedByUser: true,
           currentFrameRate: frameRate,
           frameRateLockedByUser,
           advice: networkAdvice,
@@ -13644,6 +13716,7 @@ export async function openChannelSession(
           false,
           {
             contentMode: broadcastCapabilities.contentMode,
+            sourceWidth: broadcastCapabilities.width,
             sourceFrameRate: broadcastCapabilities.frameRate,
           },
         );

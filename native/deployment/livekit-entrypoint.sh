@@ -7,7 +7,7 @@ livekit_binary="${LIVEKIT_BINARY:-/livekit-server}"
 node_ip="${LIVEKIT_NODE_IP:-}"
 turn_host="${LIVEKIT_TURN_HOST:-}"
 turn_secret_file="${TURN_SECRET_FILE:-}"
-turn_ttl="${TURN_CREDENTIAL_TTL_SECONDS:-14400}"
+turn_ttl="${TURN_CREDENTIAL_TTL_SECONDS:-2700}"
 runtime_config="/tmp/synced-livekit.yaml"
 
 if [ ! -x "$livekit_binary" ]; then

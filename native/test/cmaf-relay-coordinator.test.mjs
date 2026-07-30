@@ -875,7 +875,7 @@ test("optional rendition idle expiry stops and removes the child before an ancho
   );
 });
 
-test("CMAF auxiliary demand defaults to 1080p and 720p and caps measured upload at 65 percent", async () => {
+test("CMAF starts one default auxiliary and allows only one demanded extra", async () => {
   const cacheDir = await mkdtemp(path.join(tmpdir(), "synced-cmaf-demand-"));
   const coordinator = new CmafRelayCoordinator(
     {
@@ -893,29 +893,26 @@ test("CMAF auxiliary demand defaults to 1080p and 720p and caps measured upload 
     const initial = service.updateRenditionDemand({
       availableUploadBps: 20_000_000,
     });
-    assert.deepEqual(initial.active, ["1080p8", "720p4"]);
+    assert.deepEqual(initial.active, ["720p4"]);
     assert.equal(initial.uploadBudgetBps, 13_000_000);
     const expanded = service.updateRenditionDemand({
       original: true,
       low: true,
       availableUploadBps: 20_000_000,
     });
-    assert.deepEqual(
-      new Set(expanded.active),
-      new Set(["original", "1080p8", "720p4", "480p18"]),
-    );
-    assert.equal(coordinator.renditions.get("original").demandPaused, false);
+    assert.deepEqual(new Set(expanded.active), new Set(["720p4", "480p18"]));
+    assert.equal(coordinator.renditions.has("original"), false);
     assert.equal(coordinator.renditions.get("480p18").demandPaused, false);
     const exhausted = service.updateRenditionDemand({
       availableUploadBps: 100_000,
     });
     assert.equal(exhausted.uploadBudgetBps, 0);
-    assert.equal(coordinator.renditions.get("1080p8").budgetPaused, true);
+    assert.equal(coordinator.renditions.get("720p4").budgetPaused, true);
     const restored = service.updateRenditionDemand({
       availableUploadBps: 20_000_000,
     });
     assert.equal(restored.uploadBudgetBps, 13_000_000);
-    assert.equal(coordinator.renditions.get("1080p8").budgetPaused, false);
+    assert.equal(coordinator.renditions.get("720p4").budgetPaused, false);
   } finally {
     await coordinator.close();
     await rm(cacheDir, { recursive: true, force: true });

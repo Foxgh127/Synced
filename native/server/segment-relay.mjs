@@ -6,6 +6,7 @@ import {
   timingSafeEqual,
 } from "node:crypto";
 import {
+  constants as fsConstants,
   createReadStream,
   createWriteStream,
   existsSync,
@@ -19,11 +20,13 @@ import {
   writeFileSync,
 } from "node:fs";
 import {
+  access,
   link,
   mkdir,
   readFile,
   rename,
   stat,
+  statfs,
   unlink,
   writeFile,
 } from "node:fs/promises";
@@ -35,11 +38,12 @@ export const SEGMENT_RELAY_BASE_PATH = "/media/v1";
 const TOKEN_VERSION = "sr1";
 const TOKEN_LIFETIME_MS = 15 * 60_000;
 const MAX_TOKEN_LIFETIME_MS = 30 * 60_000;
-const MAX_SEGMENT_BYTES = 96 * 1024 * 1024;
-const MAX_MANIFEST_BYTES = 2 * 1024 * 1024;
+const MAX_SEGMENT_BYTES = 32 * 1024 * 1024;
+const MAX_MANIFEST_BYTES = 512 * 1024;
 const MAX_SUBTITLE_BYTES = 12 * 1024 * 1024;
 const UPLOAD_IDLE_TIMEOUT_MS = 15_000;
 const DEFAULT_MEMORY_BYTES = 192 * 1024 * 1024;
+const DEFAULT_ROOM_UPLOAD_BYTES_PER_SECOND = 16 * 1024 * 1024;
 const MIN_DISK_BYTES = 64 * 1024 * 1024;
 const MAX_DISK_BYTES = 5 * 1024 * 1024 * 1024;
 const INDEX_WRITE_DELAY_MS = 250;
@@ -495,6 +499,42 @@ export class SegmentRelayStore {
       8 * 1024 * 1024,
       1024 * 1024 * 1024,
     );
+    this.maxRoomDiskBytes = boundedInteger(
+      options.maxRoomDiskBytes,
+      Math.max(
+        MIN_DISK_BYTES,
+        Math.floor(this.maxDiskBytes / 2),
+      ),
+      32 * 1024 * 1024,
+      this.maxDiskBytes,
+    );
+    this.maxRoomMemoryBytes = boundedInteger(
+      options.maxRoomMemoryBytes,
+      Math.max(8 * 1024 * 1024, Math.floor(this.maxMemoryBytes / 2)),
+      4 * 1024 * 1024,
+      this.maxMemoryBytes,
+    );
+    this.maxRoomObjects = boundedInteger(
+      options.maxRoomObjects,
+      50_000,
+      256,
+      1_000_000,
+    );
+    this.maxRoomActiveRenditions = boundedInteger(
+      options.maxRoomActiveRenditions,
+      3,
+      1,
+      8,
+    );
+    this.roomUploadBytesPerSecond = boundedInteger(
+      options.roomUploadBytesPerSecond,
+      DEFAULT_ROOM_UPLOAD_BYTES_PER_SECOND,
+      256 * 1024,
+      256 * 1024 * 1024,
+    );
+    this.roomUploadBuckets = new Map();
+    this.roomActiveUploads = new Map();
+    this.roomManifestTimestamps = new Map();
     this.records = new Map();
     this.activeSessions = new Map();
     this.diskBytes = 0;
@@ -595,6 +635,79 @@ export class SegmentRelayStore {
     return path.join(this.rootDir, `.upload-${randomUUID()}.tmp`);
   }
 
+  roomUsage(room) {
+    let diskBytes = 0;
+    let memoryBytes = 0;
+    let objects = 0;
+    const renditions = new Set();
+    for (const record of this.records.values()) {
+      if (record.room !== room) continue;
+      diskBytes += record.bytes;
+      memoryBytes += record.buffer?.byteLength || 0;
+      objects += 1;
+      if (record.rendition) renditions.add(record.rendition);
+    }
+    return {
+      diskBytes,
+      memoryBytes,
+      objects,
+      activeRenditions: renditions.size,
+    };
+  }
+
+  consumeUploadBytes(room, bytes, now = Date.now()) {
+    const rate = this.roomUploadBytesPerSecond;
+    const burst = Math.max(MAX_SEGMENT_BYTES, rate * 2);
+    const existing = this.roomUploadBuckets.get(room) || {
+      tokens: burst,
+      updatedAt: now,
+    };
+    const elapsedSeconds = Math.max(0, now - existing.updatedAt) / 1_000;
+    existing.tokens = Math.min(
+      burst,
+      existing.tokens + elapsedSeconds * rate,
+    );
+    existing.updatedAt = now;
+    if (existing.tokens < bytes) {
+      this.roomUploadBuckets.set(room, existing);
+      throw Object.assign(new Error("room-upload-rate-exceeded"), {
+        statusCode: 429,
+      });
+    }
+    existing.tokens -= bytes;
+    this.roomUploadBuckets.set(room, existing);
+  }
+
+  beginUpload(room) {
+    const active = this.roomActiveUploads.get(room) || 0;
+    if (active >= 2) return false;
+    this.roomActiveUploads.set(room, active + 1);
+    return true;
+  }
+
+  endUpload(room) {
+    const active = Math.max(
+      0,
+      (this.roomActiveUploads.get(room) || 1) - 1,
+    );
+    if (active) this.roomActiveUploads.set(room, active);
+    else this.roomActiveUploads.delete(room);
+  }
+
+  consumeManifestRevision(room, now = Date.now()) {
+    const recent = (this.roomManifestTimestamps.get(room) || []).filter(
+      (timestamp) => now - timestamp < 10_000,
+    );
+    if (recent.length >= 20) {
+      this.roomManifestTimestamps.set(room, recent);
+      throw Object.assign(new Error("room-manifest-rate-exceeded"), {
+        statusCode: 429,
+      });
+    }
+    recent.push(now);
+    this.roomManifestTimestamps.set(room, recent);
+  }
+
   async commit(route, temporaryPath, bytes, metadata) {
     let releaseMutation;
     const previousMutation = this.mutationQueue;
@@ -625,8 +738,17 @@ export class SegmentRelayStore {
         this.records.set(route.key, existing);
         return existing;
       }
+      this.consumeManifestRevision(route.room);
       this.validateManifestRevision(route, metadata.manifest, existing);
       this.validateManifestObjects(route, metadata.manifest);
+      if (
+        metadata.manifest.renditions.length >
+        this.maxRoomActiveRenditions
+      ) {
+        throw Object.assign(new Error("room-rendition-quota-exceeded"), {
+          statusCode: 429,
+        });
+      }
     }
     if (existing && route.kind !== "manifest") {
       await unlink(temporaryPath).catch(() => undefined);
@@ -649,6 +771,13 @@ export class SegmentRelayStore {
         protectedForAdmission.add(key);
       }
     }
+    this.ensureRoomCapacity(
+      route,
+      bytes,
+      existing?.bytes || 0,
+      existing ? 0 : 1,
+      protectedForAdmission,
+    );
     this.ensureCapacity(
       route,
       bytes,
@@ -734,7 +863,11 @@ export class SegmentRelayStore {
     this.records.delete(route.key);
     this.records.set(route.key, record);
     this.diskBytes += bytes;
-    if (bytes <= 8 * 1024 * 1024) {
+    if (
+      bytes <= 8 * 1024 * 1024 &&
+      this.roomUsage(route.room).memoryBytes + bytes <=
+        this.maxRoomMemoryBytes
+    ) {
       try {
         record.buffer = await readFile(filePath);
         this.memoryBytes += record.buffer.byteLength;
@@ -780,6 +913,59 @@ export class SegmentRelayStore {
         maxDiskBytes: this.maxDiskBytes,
         diskBytes: this.diskBytes,
         incomingBytes: Math.max(0, Number(incomingBytes) || 0),
+        retryAfterMs: UNADVERTISED_UPLOAD_GRACE_MS,
+      },
+    });
+  }
+
+  ensureRoomCapacity(
+    route,
+    incomingBytes,
+    replacingBytes,
+    incomingObjects,
+    protectedKeys,
+  ) {
+    const delta = Math.max(
+      0,
+      Math.max(0, Number(incomingBytes) || 0) -
+        Math.max(0, Number(replacingBytes) || 0),
+    );
+    let usage = this.roomUsage(route.room);
+    const targetBytes = this.maxRoomDiskBytes - delta;
+    const targetObjects = this.maxRoomObjects - incomingObjects;
+    if (
+      usage.diskBytes > targetBytes ||
+      usage.objects > targetObjects
+    ) {
+      this.evictRoom(
+        route.room,
+        targetBytes,
+        targetObjects,
+        protectedKeys,
+      );
+      usage = this.roomUsage(route.room);
+    }
+    if (
+      targetBytes >= 0 &&
+      targetObjects >= 0 &&
+      usage.diskBytes <= targetBytes &&
+      usage.objects <= targetObjects
+    ) {
+      return;
+    }
+    this.lastAdmissionRejectedAt = Date.now();
+    throw Object.assign(new Error("room-storage-quota-exceeded"), {
+      statusCode: 507,
+      relayBody: {
+        ...this.manifestCoordination(
+          route,
+          "room-storage-quota-exceeded",
+        ),
+        storagePressure: true,
+        roomDiskBytes: usage.diskBytes,
+        maxRoomDiskBytes: this.maxRoomDiskBytes,
+        roomObjects: usage.objects,
+        maxRoomObjects: this.maxRoomObjects,
         retryAfterMs: UNADVERTISED_UPLOAD_GRACE_MS,
       },
     });
@@ -1371,6 +1557,48 @@ export class SegmentRelayStore {
     this.scheduleIndex();
   }
 
+  evictRoom(
+    room,
+    targetBytes,
+    targetObjects,
+    extraProtectedKeys = new Set(),
+  ) {
+    const protectedKeys = this.protectedActiveKeys(
+      Date.now(),
+      extraProtectedKeys,
+    );
+    const usage = this.roomUsage(room);
+    const withinQuota = () => {
+      return (
+        usage.diskBytes <= Math.max(0, targetBytes) &&
+        usage.objects <= Math.max(0, targetObjects)
+      );
+    };
+    for (const [key, record] of this.records) {
+      if (withinQuota()) break;
+      if (
+        record.room !== room ||
+        record.kind === "manifest" ||
+        record.kind === "init"
+      ) {
+        continue;
+      }
+      if (this.removeRecord(key, record, protectedKeys)) {
+        usage.diskBytes = Math.max(0, usage.diskBytes - record.bytes);
+        usage.objects = Math.max(0, usage.objects - 1);
+      }
+    }
+    for (const [key, record] of this.records) {
+      if (withinQuota()) break;
+      if (record.room !== room) continue;
+      if (this.removeRecord(key, record, protectedKeys)) {
+        usage.diskBytes = Math.max(0, usage.diskBytes - record.bytes);
+        usage.objects = Math.max(0, usage.objects - 1);
+      }
+    }
+    this.scheduleIndex();
+  }
+
   deleteRoom(room) {
     for (const [key, record] of this.records) {
       if (record.room !== room) continue;
@@ -1386,6 +1614,9 @@ export class SegmentRelayStore {
     for (const [key, entry] of this.activeSessions) {
       if (entry.room === room) this.activeSessions.delete(key);
     }
+    this.roomUploadBuckets.delete(room);
+    this.roomActiveUploads.delete(room);
+    this.roomManifestTimestamps.delete(room);
     this.scheduleIndex();
   }
 
@@ -1427,6 +1658,18 @@ export class SegmentRelayStore {
   }
 
   snapshot() {
+    const roomUsages = new Map();
+    for (const record of this.records.values()) {
+      const usage = roomUsages.get(record.room) || {
+        diskBytes: 0,
+        memoryBytes: 0,
+        objects: 0,
+      };
+      usage.diskBytes += record.bytes;
+      usage.memoryBytes += record.buffer?.byteLength || 0;
+      usage.objects += 1;
+      roomUsages.set(record.room, usage);
+    }
     return {
       objects: this.records.size,
       diskBytes: this.diskBytes,
@@ -1435,6 +1678,16 @@ export class SegmentRelayStore {
       maxMemoryBytes: this.maxMemoryBytes,
       activeSessions: this.activeSessions.size,
       storagePressure: this.isStoragePressured(),
+      roomQuota: {
+        maxDiskBytes: this.maxRoomDiskBytes,
+        maxMemoryBytes: this.maxRoomMemoryBytes,
+        maxObjects: this.maxRoomObjects,
+        maxActiveRenditions: this.maxRoomActiveRenditions,
+        uploadBytesPerSecond: this.roomUploadBytesPerSecond,
+      },
+      roomsAtDiskQuota: [...roomUsages.values()].filter(
+        (usage) => usage.diskBytes >= this.maxRoomDiskBytes,
+      ).length,
     };
   }
 
@@ -1444,6 +1697,36 @@ export class SegmentRelayStore {
       Date.now() - this.lastAdmissionRejectedAt <=
         UNADVERTISED_UPLOAD_GRACE_MS
     );
+  }
+
+  async readiness() {
+    try {
+      await access(
+        this.rootDir,
+        fsConstants.R_OK | fsConstants.W_OK,
+      );
+      const filesystem = await statfs(this.rootDir);
+      const availableBytes =
+        Number(filesystem.bavail) * Number(filesystem.bsize);
+      const storagePressure = this.isStoragePressured();
+      return {
+        ok:
+          !this.closed &&
+          !storagePressure &&
+          Number.isFinite(availableBytes) &&
+          availableBytes >= Math.min(MIN_DISK_BYTES, this.maxDiskBytes),
+        writable: true,
+        storagePressure,
+        availableBytes,
+      };
+    } catch {
+      return {
+        ok: false,
+        writable: false,
+        storagePressure: true,
+        availableBytes: 0,
+      };
+    }
   }
 
   async close() {
@@ -1496,6 +1779,7 @@ async function receiveUpload(request, store, route) {
           statusCode: 413,
         });
       }
+      store.consumeUploadBytes(route.room, chunk.byteLength);
       hash.update(chunk);
       if (!output.write(chunk)) {
         await new Promise((resolve, reject) => {
@@ -1583,6 +1867,11 @@ export function createSegmentRelay(options = {}) {
       rootDir: options.rootDir,
       maxDiskBytes: options.maxDiskBytes,
       maxMemoryBytes: options.maxMemoryBytes,
+      maxRoomDiskBytes: options.maxRoomDiskBytes,
+      maxRoomMemoryBytes: options.maxRoomMemoryBytes,
+      maxRoomObjects: options.maxRoomObjects,
+      maxRoomActiveRenditions: options.maxRoomActiveRenditions,
+      roomUploadBytesPerSecond: options.roomUploadBytesPerSecond,
     });
   const secret = Buffer.from(
     options.secret || randomBytes(48).toString("base64url"),
@@ -1711,6 +2000,13 @@ export function createSegmentRelay(options = {}) {
         sendEmpty(response, 405, corsHeaders);
         return true;
       }
+      if (!store.beginUpload(route.room)) {
+        sendEmpty(response, 429, {
+          ...corsHeaders,
+          "retry-after": "1",
+        });
+        return true;
+      }
       let upload;
       try {
         upload = await receiveUpload(request, store, route);
@@ -1796,6 +2092,8 @@ export function createSegmentRelay(options = {}) {
         } else {
           sendEmpty(response, statusCode, corsHeaders);
         }
+      } finally {
+        store.endUpload(route.room);
       }
       return true;
     }
@@ -1899,6 +2197,7 @@ export function createSegmentRelay(options = {}) {
     handle,
     issueToken,
     snapshot: () => store.snapshot(),
+    readiness: () => store.readiness(),
     activateSession: (room, sessionId) =>
       store.activateSession(room, sessionId),
     deactivateSession: (room, sessionId) =>

@@ -10,6 +10,16 @@ const SIGNAL_OPEN_TIMEOUT_MS = 15_000;
 const SIGNAL_HEARTBEAT_INTERVAL_MS = 10_000;
 const SIGNAL_HEARTBEAT_TIMEOUT_MS = 60_000;
 const SIGNAL_TIMER_SUSPENSION_MS = 25_000;
+const SIGNAL_OUTBOUND_SOFT_BYTES = 256 * 1024;
+const SIGNAL_OUTBOUND_HARD_BYTES = 2 * 1024 * 1024;
+const LOW_PRIORITY_OUTBOUND_TYPES = new Set([
+  "network:report",
+  "network:transport-report",
+  "quality:request",
+  "sfu:status",
+  "voice:sync",
+  "ping",
+]);
 
 export interface RoomParticipant {
   id: string;
@@ -34,6 +44,8 @@ export interface BroadcastCapabilities {
   title?: string;
   bitrate?: number;
   durationTicks?: number;
+  allowOriginalRendition?: boolean;
+  maxActiveRenditions?: number;
 }
 
 export interface EmbyReceiverCapabilities {
@@ -106,8 +118,14 @@ export interface SignalEnvelope {
   height?: number;
   frameRate?: number;
   originalDemand?: boolean;
+  highDemand?: boolean;
   lowDemand?: boolean;
   availableDownloadBps?: number;
+  renditionPolicy?: {
+    maxActiveRenditions?: number;
+    allowOriginal?: boolean;
+    serverVerified?: boolean;
+  };
   broadcastCapabilities?: BroadcastCapabilities;
   probeId?: string;
   phase?: "latency" | "upload" | "download";
@@ -175,6 +193,8 @@ export class SignalClient extends EventTarget {
   private lastServerActivity = 0;
   private lastHeartbeatTickAt = 0;
   private networkProbeVersions?: Array<1 | 2>;
+  private readonly lowPriorityOutbound = new Map<string, string>();
+  private outboundFlushTimer?: number;
 
   private candidateUrls(input: string): string[] {
     const candidates = [input];
@@ -185,6 +205,7 @@ export class SignalClient extends EventTarget {
       // TCP 443, which is the most consistently reachable mobile path.
       if (url.protocol === "ws:" && url.port === "8787") {
         const fallback = new URL(url);
+        fallback.protocol = "wss:";
         fallback.port = "443";
         candidates.push(fallback.toString());
       }
@@ -280,6 +301,7 @@ export class SignalClient extends EventTarget {
     socket.addEventListener("message", (event) => {
       if (this.socket !== socket) return;
       this.lastServerActivity = Date.now();
+      this.flushLowPriorityOutbound();
       const detail = parseSignalEnvelope(event.data);
       if (!detail) return;
       if (detail.type === "server:hello") {
@@ -300,6 +322,7 @@ export class SignalClient extends EventTarget {
       if (this.socket !== socket) return;
       this.socket = undefined;
       this.stopHeartbeat();
+      this.clearOutboundQueue();
       this.dispatchEvent(new Event("close"));
     });
     socket.addEventListener("error", () => {
@@ -324,7 +347,7 @@ export class SignalClient extends EventTarget {
           return;
         }
         try {
-          socket.send(JSON.stringify({ type: "ping" }));
+          this.send({ type: "ping" });
         } catch {
           socket.close(4000, "heartbeat send failed");
         }
@@ -340,10 +363,82 @@ export class SignalClient extends EventTarget {
   }
 
   send(message: SignalEnvelope): void {
-    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+    const socket = this.socket;
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
       throw new Error("信令服务器尚未连接");
     }
-    this.socket.send(JSON.stringify(message));
+    const serialized = JSON.stringify(message);
+    const lowPriority = LOW_PRIORITY_OUTBOUND_TYPES.has(message.type);
+    if (
+      lowPriority &&
+      (socket.bufferedAmount > SIGNAL_OUTBOUND_SOFT_BYTES ||
+        this.lowPriorityOutbound.size)
+    ) {
+      const key = [
+        message.type,
+        message.target,
+        message.viewerId,
+      ].join(":");
+      this.lowPriorityOutbound.delete(key);
+      this.lowPriorityOutbound.set(key, serialized);
+      while (this.lowPriorityOutbound.size > 24) {
+        this.lowPriorityOutbound.delete(
+          this.lowPriorityOutbound.keys().next().value!,
+        );
+      }
+      this.scheduleOutboundFlush();
+      return;
+    }
+    if (
+      message.type === "network:probe" &&
+      socket.bufferedAmount > SIGNAL_OUTBOUND_SOFT_BYTES
+    ) {
+      throw new Error("信令控制通道繁忙，网络探测已暂停");
+    }
+    if (socket.bufferedAmount > SIGNAL_OUTBOUND_HARD_BYTES) {
+      socket.close(1013, "client signaling backpressure");
+      throw new Error("信令发送队列已满，正在重新连接");
+    }
+    socket.send(serialized);
+  }
+
+  private scheduleOutboundFlush(): void {
+    if (this.outboundFlushTimer !== undefined) return;
+    this.outboundFlushTimer = window.setTimeout(() => {
+      this.outboundFlushTimer = undefined;
+      this.flushLowPriorityOutbound();
+    }, 50);
+  }
+
+  private flushLowPriorityOutbound(): void {
+    const socket = this.socket;
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      this.clearOutboundQueue();
+      return;
+    }
+    let sent = 0;
+    while (
+      socket.bufferedAmount <= SIGNAL_OUTBOUND_SOFT_BYTES / 2 &&
+      this.lowPriorityOutbound.size &&
+      sent < 6
+    ) {
+      const next = this.lowPriorityOutbound.entries().next().value as
+        | [string, string]
+        | undefined;
+      if (!next) break;
+      this.lowPriorityOutbound.delete(next[0]);
+      socket.send(next[1]);
+      sent += 1;
+    }
+    if (this.lowPriorityOutbound.size) this.scheduleOutboundFlush();
+  }
+
+  private clearOutboundQueue(): void {
+    if (this.outboundFlushTimer !== undefined) {
+      window.clearTimeout(this.outboundFlushTimer);
+      this.outboundFlushTimer = undefined;
+    }
+    this.lowPriorityOutbound.clear();
   }
 
   close(): void {
@@ -357,6 +452,7 @@ export class SignalClient extends EventTarget {
     this.socket = undefined;
     this.networkProbeVersions = undefined;
     this.stopHeartbeat();
+    this.clearOutboundQueue();
     if (
       socket &&
       (socket.readyState === WebSocket.CONNECTING ||

@@ -18,7 +18,7 @@ function joinSignal({
   createIfMissing,
 }) {
   return new Promise((resolve, reject) => {
-    const socket = new WebSocket(signalUrl);
+    const socket = new WebSocket(signalUrl, { origin: "file://" });
     const timeout = setTimeout(() => {
       socket.terminate();
       reject(new Error(`等待 ${nickname} 的 SFU 凭据超时`));

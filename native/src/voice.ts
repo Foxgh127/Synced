@@ -287,6 +287,16 @@ async function requestVoiceUserMedia(
   if (signal?.aborted) {
     throw new DOMException("麦克风采集请求已取消", "AbortError");
   }
+  if (window.roomDesktop) {
+    const granted =
+      await window.roomDesktop.requestMediaPermissionIntent("microphone");
+    if (!granted) {
+      throw new DOMException(
+        "请直接点击连麦按钮后再授权麦克风",
+        "NotAllowedError",
+      );
+    }
+  }
   const request = navigator.mediaDevices.getUserMedia(constraints);
   let timeout: number | undefined;
   let abortHandler: (() => void) | undefined;
@@ -1190,6 +1200,7 @@ export class VoiceMesh extends EventTarget {
       }
     }
     this.active = false;
+    window.roomDesktop?.releaseMediaPermission("microphone");
     this.listeningOnly = false;
     this.muted = false;
     this.clearAccompaniment();

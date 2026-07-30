@@ -191,7 +191,7 @@ test("an exhausted partial keyframe reports abandonment instead of disappearing 
   );
   assembler.accept(packets[0]);
   const assembly = [...assembler.pending.values()][0];
-  assembly.createdAt = Date.now() - 10_001;
+  assembly.createdAt = performance.now() - 10_001;
   t.mock.timers.tick(800);
 
   assert.equal(assembler.hasPending, false);

@@ -131,11 +131,24 @@ const browserBundle = buildSync({
           }
           if (message.type === "need") {
             const fragment = state.cache.get(message.fragmentSeq);
+            let accepted = false;
             if (fragment) {
               state.retransmits += 1;
-              state.sender?.sendFragment(fragment, {
+              accepted = state.sender?.sendFragment(fragment, {
                 priority: true,
                 onlyChunks: message.missing,
+              }) === true;
+            }
+            if (Number.isSafeInteger(message.repairGeneration)) {
+              state.sender?.sendControl({
+                type: "repair-ack",
+                sessionId,
+                mediaVersion,
+                transportEpoch: 0,
+                fragmentSeq: message.fragmentSeq,
+                trackType: message.trackType,
+                repairGeneration: message.repairGeneration,
+                accepted,
               });
             }
             return;

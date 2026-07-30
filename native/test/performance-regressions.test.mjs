@@ -67,6 +67,14 @@ test("portable firewall checks use an exact-path TTL and coalesce callers", () =
   );
   assert.match(
     electronMain,
-    /\$requiredNames = @\([\s\S]{0,600}?if \(-not \$matched\) \{ exit 1 \}/,
+    /const ruleNames = \["Synced P2P UDP v3"\]/,
+  );
+  assert.match(
+    electronMain,
+    /rule\.Profile -ne 'Private'[\s\S]*?Protocol -eq 'UDP'/,
+  );
+  assert.match(
+    electronMain,
+    /'profile=private','protocol=UDP','edge=no'/,
   );
 });

@@ -31,10 +31,12 @@ test("movie presets prefer the broadly hardware-accelerated H.264 path", async (
 });
 
 test("client presets use the same shared bitrate table as signal advice", async () => {
-  const { buildQualityPreset } = await loadModule();
+  const { buildQualityPreset, FRAME_RATE_OPTIONS, isFrameRateOption } =
+    await loadModule();
   assert.equal(buildQualityPreset("ultra", 30).maxBitrate, 18_000_000);
-  assert.equal(buildQualityPreset("ultra", 60).maxBitrate, 28_000_000);
   assert.equal(buildQualityPreset("original", 30).maxBitrate, 32_000_000);
+  assert.deepEqual(FRAME_RATE_OPTIONS, [24, 30]);
+  assert.equal(isFrameRateOption(60), false);
 });
 
 test("broadcast recommendations use measured P2P outgoing bandwidth", async () => {

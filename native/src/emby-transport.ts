@@ -15,11 +15,13 @@ const MAGIC = new Uint8Array([0x59, 0x4b, 0x4d, 0x32]); // YKM2
 const LEGACY_HEADER_PREFIX_BYTES = 6;
 const FIXED_HEADER_BYTES = 64;
 const BINARY_FRAMING_VERSION = 2;
-const MAX_FRAGMENT_BYTES = 96 * 1024 * 1024;
+const MAX_FRAGMENT_BYTES = 32 * 1024 * 1024;
 const MAX_HEADER_BYTES = 8 * 1024;
 const MAX_PENDING_ASSEMBLY_BYTES = 128 * 1024 * 1024;
-const MAX_RELIABLE_REPAIR_REQUESTS = 1;
-const RELIABLE_REPAIR_LIFETIME_MS = 2_500;
+const MAX_RELIABLE_REPAIR_REQUESTS = 3;
+const RELIABLE_REPAIR_LIFETIME_MS = 5_000;
+const ASSEMBLY_OBJECT_OVERHEAD_BYTES = 512;
+const ASSEMBLY_CHUNK_OVERHEAD_BYTES = 256;
 // A reliable unordered SCTP stream can deliver the first chunk of many later
 // fragments while one retransmitted chunk is still in flight. Sixteen
 // assemblies represent about 32 seconds for the GOP-aligned 2 s CMAF cadence
@@ -239,6 +241,17 @@ export type EmbyControlMessage =
       fragmentSeq: number;
       trackType: EmbyTrackType;
       missing: number[];
+      repairGeneration?: number;
+    }
+  | {
+      type: "repair-ack";
+      sessionId: string;
+      mediaVersion: number;
+      transportEpoch: number;
+      fragmentSeq: number;
+      trackType: EmbyTrackType;
+      repairGeneration: number;
+      accepted: boolean;
     }
   | {
       type: "init-request";
@@ -623,10 +636,10 @@ function decodeLegacyEmbyChunk(bytes: Uint8Array): DecodedEmbyChunk {
   return { header, data };
 }
 
-export function chunkEmbyFragment(
+export function* iterateEmbyFragmentChunks(
   fragment: EmbyTransportFragment,
   onlyChunks?: ReadonlySet<number>,
-): Array<{ header: EmbyChunkHeader; packet: ArrayBuffer }> {
+): Generator<{ header: EmbyChunkHeader; packet: ArrayBuffer }> {
   if (fragment.data.byteLength > MAX_FRAGMENT_BYTES) {
     throw new Error("单个媒体片段过大");
   }
@@ -635,7 +648,6 @@ export function chunkEmbyFragment(
     1,
     Math.ceil(fragment.data.byteLength / EMBY_CHUNK_BYTES),
   );
-  const packets: Array<{ header: EmbyChunkHeader; packet: ArrayBuffer }> = [];
   for (let index = 0; index < chunkCount; index += 1) {
     if (onlyChunks && !onlyChunks.has(index)) continue;
     const start = index * EMBY_CHUNK_BYTES;
@@ -667,9 +679,20 @@ export function chunkEmbyFragment(
       chunkLength: payload.byteLength,
       checksum,
     };
-    packets.push({ header, packet: encodeEmbyChunk(header, payload) });
+    yield { header, packet: encodeEmbyChunk(header, payload) };
   }
-  return packets;
+}
+
+/**
+ * Compatibility helper for callers that explicitly need random access.
+ * The production sender consumes iterateEmbyFragmentChunks() so a large
+ * fragment never materializes every encoded SCTP packet at once.
+ */
+export function chunkEmbyFragment(
+  fragment: EmbyTransportFragment,
+  onlyChunks?: ReadonlySet<number>,
+): Array<{ header: EmbyChunkHeader; packet: ArrayBuffer }> {
+  return [...iterateEmbyFragmentChunks(fragment, onlyChunks)];
 }
 
 interface CachedFragment {
@@ -837,6 +860,8 @@ const COALESCED_CONTROL_TYPES = new Set<EmbyControlMessage["type"]>([
   "resync",
 ]);
 const MAX_QUEUED_CONTROL_BYTES = 1024 * 1024;
+const CONTROL_BUFFER_HIGH_WATER_BYTES = 256 * 1024;
+const CONTROL_BUFFER_LOW_WATER_BYTES = 64 * 1024;
 
 export class EmbyPeerSender {
   private priorityQueue: QueuedPacket[] = [];
@@ -879,6 +904,7 @@ export class EmbyPeerSender {
   private readonly onBufferedLow = () => this.pump();
   private readonly onOpen = () => this.pump();
   private readonly onControlOpen = () => this.pumpControls();
+  private readonly onControlBufferedLow = () => this.pumpControls();
   private readonly onControlClose = () => {
     this.controlClosed = true;
     this.clearControlQueue();
@@ -931,6 +957,14 @@ export class EmbyPeerSender {
     channel.addEventListener("bufferedamountlow", this.onBufferedLow);
     channel.addEventListener("open", this.onOpen);
     controlChannel.addEventListener("open", this.onControlOpen);
+    if (controlChannel !== channel) {
+      controlChannel.bufferedAmountLowThreshold =
+        CONTROL_BUFFER_LOW_WATER_BYTES;
+      controlChannel.addEventListener(
+        "bufferedamountlow",
+        this.onControlBufferedLow,
+      );
+    }
     controlChannel.addEventListener("message", this.onMessage);
     controlChannel.addEventListener("close", this.onControlClose);
     channel.addEventListener("close", this.onMediaClose);
@@ -940,7 +974,11 @@ export class EmbyPeerSender {
     const packet = JSON.stringify(message);
     if (this.controlChannel !== this.channel && priority) {
       if (this.closed || this.controlClosed) return;
-      if (this.controlChannel.readyState === "open") {
+      if (
+        this.controlChannel.readyState === "open" &&
+        this.controlChannel.bufferedAmount <
+          CONTROL_BUFFER_HIGH_WATER_BYTES
+      ) {
         try {
           this.controlChannel.send(packet);
           return;
@@ -966,8 +1004,8 @@ export class EmbyPeerSender {
       onlyChunks?: number[];
       transportEpoch?: number;
     } = {},
-  ): void {
-    if (this.closed || this.mediaClosed) return;
+  ): boolean {
+    if (this.closed || this.mediaClosed) return false;
     if (
       !options.onlyChunks &&
       fragment.trackType === "muxed" &&
@@ -977,7 +1015,7 @@ export class EmbyPeerSender {
       if (!fragment.keyframe) {
         this.droppedFragments += 1;
         this.publishStats();
-        return;
+        return false;
       }
       this.awaitingRecoveryKeyframe = false;
     }
@@ -992,11 +1030,12 @@ export class EmbyPeerSender {
     if (!onlyChunks && fragment.trackType === "muxed" && fragment.sequence > 0) {
       this.observeMediaFragment(fragment);
     }
-    for (const { header, packet } of chunkEmbyFragment(
+    let acceptedPackets = 0;
+    for (const { header, packet } of iterateEmbyFragmentChunks(
       outboundFragment,
       onlyChunks,
     )) {
-      this.enqueuePacket({
+      if (this.enqueuePacket({
         packet,
         bytes: packet.byteLength,
         mediaVersion: fragment.mediaVersion,
@@ -1007,8 +1046,11 @@ export class EmbyPeerSender {
         trackType: fragment.trackType,
         keyframe: fragment.keyframe,
         priority: options.priority === true,
-      });
+      })) {
+        acceptedPackets += 1;
+      }
     }
+    return acceptedPackets > 0;
   }
 
   setMediaBitrate(bitsPerSecond: number): void {
@@ -1137,14 +1179,14 @@ export class EmbyPeerSender {
     return Math.max(
       16 * 1024 * 1024,
       Math.min(
-        96 * 1024 * 1024,
+        32 * 1024 * 1024,
         Math.floor(this.estimatedMediaBytesPerMs * 12_000),
       ),
     );
   }
 
-  private enqueuePacket(item: QueuedPacket): void {
-    if (this.closed || this.mediaClosed) return;
+  private enqueuePacket(item: QueuedPacket): boolean {
+    if (this.closed || this.mediaClosed) return false;
     if (
       item.fragmentSeq !== undefined &&
       item.chunkIndex !== undefined &&
@@ -1153,7 +1195,7 @@ export class EmbyPeerSender {
       item.packetKey =
         `${item.mediaVersion}:${item.transportEpoch ?? 0}:` +
         `${item.trackType ?? "muxed"}:${item.fragmentSeq}:${item.chunkIndex}`;
-      if (this.packetKeys.has(item.packetKey)) return;
+      if (this.packetKeys.has(item.packetKey)) return false;
       this.packetKeys.add(item.packetKey);
       if (item.fragmentSeq > 0) {
         item.fragmentKey =
@@ -1197,6 +1239,7 @@ export class EmbyPeerSender {
     this.dropSlowBacklog();
     this.publishStats();
     this.pump();
+    return true;
   }
 
   private dropSlowBacklog(): void {
@@ -1296,7 +1339,11 @@ export class EmbyPeerSender {
     ) {
       return;
     }
-    while (this.hasQueuedControls()) {
+    while (
+      this.hasQueuedControls() &&
+      this.controlChannel.bufferedAmount <
+        CONTROL_BUFFER_HIGH_WATER_BYTES
+    ) {
       const packet = this.takeNextControl();
       if (!packet) break;
       try {
@@ -1318,6 +1365,10 @@ export class EmbyPeerSender {
     this.channel.removeEventListener("bufferedamountlow", this.onBufferedLow);
     this.channel.removeEventListener("open", this.onOpen);
     this.controlChannel.removeEventListener("open", this.onControlOpen);
+    this.controlChannel.removeEventListener(
+      "bufferedamountlow",
+      this.onControlBufferedLow,
+    );
     this.controlChannel.removeEventListener("message", this.onMessage);
     this.controlChannel.removeEventListener("close", this.onControlClose);
     this.channel.removeEventListener("close", this.onMediaClose);
@@ -1616,6 +1667,8 @@ interface PendingAssembly {
   lastRequestAt: number;
   createdAt: number;
   requests: number;
+  repairGeneration: number;
+  allocatedBytes: number;
 }
 
 export interface EmbyAssemblyAbandonment {
@@ -1655,6 +1708,7 @@ export class EmbyFragmentAssembler {
       trackType: EmbyTrackType,
       missing: number[],
       transportEpoch: number,
+      repairGeneration: number,
     ) => void,
     private readonly onEpochAdvance?: (transportEpoch: number) => boolean,
     private readonly onAbandoned?: (
@@ -1711,6 +1765,32 @@ export class EmbyFragmentAssembler {
     return this.pendingDeclaredBytes;
   }
 
+  acknowledgeRepair(
+    mediaVersion: number,
+    sequence: number,
+    trackType: EmbyTrackType,
+    transportEpoch: number,
+    repairGeneration: number,
+    accepted: boolean,
+  ): boolean {
+    const key =
+      `${mediaVersion}:${transportEpoch}:${trackType}:${sequence}`;
+    const assembly = this.pending.get(key);
+    if (
+      !assembly ||
+      !Number.isSafeInteger(repairGeneration) ||
+      repairGeneration !== assembly.repairGeneration
+    ) {
+      return false;
+    }
+    if (!accepted) {
+      this.abandonAssembly(key, "repair-exhausted");
+      return true;
+    }
+    this.armMissingRequest(key, assembly);
+    return true;
+  }
+
   advanceTransportEpoch(transportEpoch: number): boolean {
     if (
       !Number.isSafeInteger(transportEpoch) ||
@@ -1756,17 +1836,21 @@ export class EmbyFragmentAssembler {
       `${header.trackType}:${header.fragmentSeq}`;
     let assembly = this.pending.get(key);
     if (!assembly) {
+      const allocatedBytes =
+        header.dataLength +
+        ASSEMBLY_OBJECT_OVERHEAD_BYTES +
+        header.chunkCount * ASSEMBLY_CHUNK_OVERHEAD_BYTES;
       while (
         this.pending.size >= this.maxPendingAssemblies ||
         (this.pending.size > 0 &&
-          this.pendingDeclaredBytes + header.dataLength >
+          this.pendingDeclaredBytes + allocatedBytes >
             this.maxPendingBytes)
       ) {
         const oldest = this.pending.keys().next().value as string | undefined;
         if (oldest) this.abandonAssembly(oldest, "capacity");
         else break;
       }
-      if (this.pendingDeclaredBytes + header.dataLength > this.maxPendingBytes) {
+      if (this.pendingDeclaredBytes + allocatedBytes > this.maxPendingBytes) {
         this.onAbandoned?.({
           mediaVersion: header.mediaVersion,
           fragmentSeq: header.fragmentSeq,
@@ -1787,9 +1871,11 @@ export class EmbyFragmentAssembler {
         lastRequestAt: 0,
         createdAt: performance.now(),
         requests: 0,
+        repairGeneration: 0,
+        allocatedBytes,
       };
       this.pending.set(key, assembly);
-      this.pendingDeclaredBytes += header.dataLength;
+      this.pendingDeclaredBytes += allocatedBytes;
     }
     if (
       assembly.header.chunkCount !== header.chunkCount ||
@@ -1810,7 +1896,7 @@ export class EmbyFragmentAssembler {
       this.pending.delete(key);
       this.pendingDeclaredBytes = Math.max(
         0,
-        this.pendingDeclaredBytes - assembly.header.dataLength,
+        this.pendingDeclaredBytes - assembly.allocatedBytes,
       );
       const complete = new Uint8Array(assembly.receivedBytes);
       let offset = 0;
@@ -1828,6 +1914,7 @@ export class EmbyFragmentAssembler {
           header.trackType,
           assembly.chunks.map((_chunk, index) => index),
           header.transportEpoch,
+          1,
         );
         return;
       }
@@ -1884,12 +1971,14 @@ export class EmbyFragmentAssembler {
         .filter((index) => index >= 0);
       if (missing.length) {
         assembly.requests += 1;
+        assembly.repairGeneration += 1;
         this.onMissing(
           assembly.header.mediaVersion,
           assembly.header.fragmentSeq,
           assembly.header.trackType,
           missing,
           assembly.header.transportEpoch,
+          assembly.repairGeneration,
         );
         this.armMissingRequest(key, assembly);
       }
@@ -1920,7 +2009,7 @@ export class EmbyFragmentAssembler {
     if (this.pending.delete(key) && assembly) {
       this.pendingDeclaredBytes = Math.max(
         0,
-        this.pendingDeclaredBytes - assembly.header.dataLength,
+        this.pendingDeclaredBytes - assembly.allocatedBytes,
       );
     }
   }

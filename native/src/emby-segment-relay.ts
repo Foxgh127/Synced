@@ -10,7 +10,7 @@ import type { SegmentRelayAccess } from "./rtc";
 
 const MEBIBYTE = 1024 * 1024;
 const GIBIBYTE = 1024 * 1024 * 1024;
-const MAX_SEGMENT_BYTES = 96 * MEBIBYTE;
+const MAX_SEGMENT_BYTES = 32 * MEBIBYTE;
 const MANIFEST_URGENT_POLL_MS = 400;
 const MANIFEST_CHANGED_POLL_MS = 650;
 const MANIFEST_NORMAL_POLL_MS = 2_500;
@@ -25,7 +25,9 @@ const WARM_WINDOW_SECONDS = 120;
 const PREFETCH_BANDWIDTH_SHARE = 0.65;
 const MAX_BACKGROUND_CACHE_MARKERS = 20_000;
 const BACKGROUND_CACHE_MARKER_TRIM = 4_000;
-const MAX_PERSISTED_CACHE_ENTRIES = 10_000;
+const MIN_PERSISTED_ENTRY_ESTIMATE_BYTES = 64 * 1024;
+const MAX_PERSISTED_CACHE_ENTRIES = 100_000;
+const CACHE_TOUCH_PERSIST_INTERVAL_MS = 30_000;
 const SEGMENT_GAP_EPSILON_MS = 250;
 
 class EmbyRelayHttpError extends Error {
@@ -36,6 +38,48 @@ class EmbyRelayHttpError extends Error {
     super(`${resource} request failed with HTTP ${status}`);
     this.name = "EmbyRelayHttpError";
   }
+}
+
+type RelayFailureKind =
+  | "network"
+  | "authentication"
+  | "manifest"
+  | "codec"
+  | "storage"
+  | "cancelled";
+
+export function classifyEmbyRelayFailure(error: unknown): RelayFailureKind {
+  if (
+    error instanceof DOMException &&
+    error.name === "AbortError"
+  ) {
+    return "cancelled";
+  }
+  if (error instanceof EmbyRelayHttpError) {
+    if (error.status === 401 || error.status === 403) {
+      return "authentication";
+    }
+    return [404, 408, 425, 429].includes(error.status) ||
+      error.status >= 500
+      ? "network"
+      : "storage";
+  }
+  if (error instanceof TypeError) return "network";
+  const message = String(
+    error instanceof Error ? error.message : error,
+  ).toLowerCase();
+  if (/凭证|认证|token|401|403/u.test(message)) return "authentication";
+  if (/清单|manifest|身份不匹配|不连续|重复序号/u.test(message)) {
+    return "manifest";
+  }
+  if (/解码|codec|mediasource|sourcebuffer|媒体追加/u.test(message)) {
+    return "codec";
+  }
+  if (/校验|hash|存储|cache|quota|预算/u.test(message)) return "storage";
+  if (/请求|fetch|network|超时|长时间无数据|响应体长度/u.test(message)) {
+    return "network";
+  }
+  return "storage";
 }
 
 export function embyManifestPollDelayMs(
@@ -317,29 +361,33 @@ export function parseEmbySegmentManifest(
       rendition.epoch === undefined
         ? `${renditionRoot}init.mp4`
         : `${renditionRoot}epochs/${epoch}/init.mp4`;
-    const segments = Array.isArray(rendition.segments)
+    const rawSegments = Array.isArray(rendition.segments)
       ? rendition.segments
-          .map((segment) =>
-            validateSegment(
-              segment,
-              (sequence) =>
-                `${renditionRoot}segments/${sequence}.m4s`,
-            ),
-          )
-          .filter(
-            (segment): segment is EmbySegmentManifestEntry =>
-              Boolean(
-                segment &&
-                  segment.path ===
-                    `${renditionRoot}segments/${segment.sequence}.m4s`,
-              ),
-          )
-          .sort(
-            (left, right) =>
-              left.timelineTimeMs - right.timelineTimeMs ||
-              left.sequence - right.sequence,
-          )
       : [];
+    const segments = rawSegments.map((segment, index) => {
+      const validated = validateSegment(
+        segment,
+        (sequence) =>
+          `${renditionRoot}segments/${sequence}.m4s`,
+      );
+      if (
+        !validated ||
+        validated.path !==
+          `${renditionRoot}segments/${validated.sequence}.m4s`
+      ) {
+        const suppliedSequence = Array.isArray(segment)
+          ? segment[0]
+          : (segment as { sequence?: unknown })?.sequence;
+        throw new Error(
+          `分片清单档位 ${renditionId || "unknown"} 的第 ${index + 1} 条记录无效（sequence=${String(suppliedSequence ?? "unknown").slice(0, 24)}）`,
+        );
+      }
+      return validated;
+    }).sort(
+      (left, right) =>
+        left.timelineTimeMs - right.timelineTimeMs ||
+        left.sequence - right.sequence,
+    );
     if (
       !/^[a-z0-9][a-z0-9-]{0,31}$/u.test(renditionId) ||
       renditionIds.has(renditionId) ||
@@ -606,6 +654,18 @@ class BrowserSegmentCache implements SegmentCacheLike {
   private backgroundIndexStarted = false;
   private closed = false;
 
+  private metadataEntryLimit(): number {
+    return Math.max(
+      1_000,
+      Math.min(
+        MAX_PERSISTED_CACHE_ENTRIES,
+        Math.ceil(
+          this.budgetBytes / MIN_PERSISTED_ENTRY_ESTIMATE_BYTES,
+        ),
+      ),
+    );
+  }
+
   constructor(
     private readonly cacheStorage: CacheStorage | undefined =
       globalThis.caches,
@@ -672,10 +732,10 @@ class BrowserSegmentCache implements SegmentCacheLike {
         const keys = await cache.keys();
         const discarded = keys.slice(
           0,
-          Math.max(0, keys.length - MAX_PERSISTED_CACHE_ENTRIES),
+          Math.max(0, keys.length - this.metadataEntryLimit()),
         );
         await Promise.all(discarded.map((request) => cache.delete(request)));
-        const kept = keys.slice(-MAX_PERSISTED_CACHE_ENTRIES);
+        const kept = keys.slice(-this.metadataEntryLimit());
         for (let offset = 0; offset < kept.length; offset += 32) {
           await Promise.all(
             kept.slice(offset, offset + 32).map(async (request) => {
@@ -752,7 +812,7 @@ class BrowserSegmentCache implements SegmentCacheLike {
         .openCursor(null, "prev");
       request.onsuccess = () => {
         const cursor = request.result;
-        if (!cursor || entries.length >= MAX_PERSISTED_CACHE_ENTRIES) {
+        if (!cursor || entries.length >= this.metadataEntryLimit()) {
           finish();
           return;
         }
@@ -790,7 +850,7 @@ class BrowserSegmentCache implements SegmentCacheLike {
         const cursor = request.result;
         if (!cursor) return;
         count += 1;
-        if (count > MAX_PERSISTED_CACHE_ENTRIES) cursor.delete();
+        if (count > this.metadataEntryLimit()) cursor.delete();
         cursor.continue();
       };
       transaction.oncomplete = () => resolve();
@@ -834,7 +894,7 @@ class BrowserSegmentCache implements SegmentCacheLike {
     const memory = this.memory.get(url);
     if (memory) {
       this.touch(url, memory.byteLength);
-      return memory.slice();
+      return memory;
     }
     const cache = await this.openCache();
     const response = await cache?.match(url);
@@ -853,7 +913,9 @@ class BrowserSegmentCache implements SegmentCacheLike {
       responseHeaders.set("x-synced-cached-at", String(Date.now()));
       await cache.put(
         url,
-        new Response(data.slice(), { headers: responseHeaders }),
+        new Response(new Uint8Array(data), {
+          headers: responseHeaders,
+        }),
       );
     } else {
       const previous = this.memory.get(url);
@@ -904,16 +966,23 @@ class BrowserSegmentCache implements SegmentCacheLike {
     if (previous) this.bytes = Math.max(0, this.bytes - previous.bytes);
     this.bytes += bytes;
     this.entries.delete(key);
-    const entry = { key, bytes, lastAccess: Date.now() };
+    const now = Date.now();
+    const entry = { key, bytes, lastAccess: now };
     this.entries.set(key, entry);
-    void this.persistMetadata(entry);
+    if (
+      !previous ||
+      previous.bytes !== bytes ||
+      now - previous.lastAccess >= CACHE_TOUCH_PERSIST_INTERVAL_MS
+    ) {
+      void this.persistMetadata(entry);
+    }
   }
 
   private async evict(cache?: Cache): Promise<void> {
     for (const [key, entry] of this.entries) {
       if (
         this.bytes <= this.budgetBytes &&
-        this.entries.size <= MAX_PERSISTED_CACHE_ENTRIES
+        this.entries.size <= this.metadataEntryLimit()
       ) {
         break;
       }
@@ -980,9 +1049,10 @@ function abortableDelay(signal: AbortSignal, milliseconds: number): Promise<void
 }
 
 async function sha256Hex(data: Uint8Array): Promise<string> {
-  const copy = new Uint8Array(data.byteLength);
-  copy.set(data);
-  const digest = await crypto.subtle.digest("SHA-256", copy.buffer);
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new Uint8Array(data),
+  );
   return [...new Uint8Array(digest)]
     .map((byte) => byte.toString(16).padStart(2, "0"))
     .join("");
@@ -1034,6 +1104,7 @@ export class EmbyAbrSegmentClient {
   private manifestEtag = "";
   private lastManifest?: EmbySegmentManifest;
   private consecutiveManifestFailures = 0;
+  private consecutiveNetworkFailures = 0;
   private relayFallbackActive = false;
   private relayFallbackRequested = false;
   private relayRecoverySuccesses = 0;
@@ -1386,6 +1457,7 @@ export class EmbyAbrSegmentClient {
         }
         this.diagnosticsState.lastError = undefined;
         this.consecutiveManifestFailures = 0;
+        this.consecutiveNetworkFailures = 0;
         this.diagnosticsState.consecutiveRelayFailures = 0;
       } catch (error) {
         if (signal.aborted) return;
@@ -1397,10 +1469,15 @@ export class EmbyAbrSegmentClient {
           20,
           this.consecutiveManifestFailures + 1,
         );
+        const failureKind = classifyEmbyRelayFailure(error);
+        this.consecutiveNetworkFailures =
+          failureKind === "network"
+            ? Math.min(20, this.consecutiveNetworkFailures + 1)
+            : 0;
         this.diagnosticsState.consecutiveRelayFailures =
-          this.consecutiveManifestFailures;
+          this.consecutiveNetworkFailures;
         if (
-          this.consecutiveManifestFailures >= 3 &&
+          this.consecutiveNetworkFailures >= 3 &&
           !this.relayFallbackRequested &&
           this.session
         ) {
@@ -1414,7 +1491,9 @@ export class EmbyAbrSegmentClient {
             sessionId: this.session.sessionId,
             mediaVersion: this.session.mediaVersion,
             reason:
-              error instanceof Error ? error.message : String(error),
+              `${failureKind}: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
           });
         }
       }
@@ -1451,24 +1530,107 @@ export class EmbyAbrSegmentClient {
       ).find((candidate) => candidate.keyframe) ||
       rendition.segments.at(-1);
     if (!segment) return manifest.ended === true;
-    const url = mediaUrl(this.baseUrl, segment.path);
+    const init = await this.fetchRecoveryResource(
+      mediaUrl(this.baseUrl, rendition.initPath),
+      signal,
+      {
+        accept: "video/mp4",
+        maximumBytes: 4 * MEBIBYTE,
+      },
+    );
+    const media = await this.fetchRecoveryResource(
+      mediaUrl(this.baseUrl, segment.path),
+      signal,
+      {
+        accept: "video/iso.segment",
+        expectedBytes: segment.bytes,
+        sha256: segment.sha256,
+        maximumBytes: MAX_SEGMENT_BYTES,
+        range: true,
+      },
+    );
+    return this.options.player.validateRecoveryAppend(
+      rendition.mimeType,
+      init,
+      media,
+    );
+  }
+
+  private async fetchRecoveryResource(
+    url: URL,
+    signal: AbortSignal,
+    options: {
+      accept: string;
+      expectedBytes?: number;
+      sha256?: string;
+      maximumBytes: number;
+      range?: boolean;
+    },
+  ): Promise<Uint8Array> {
     return this.withResponseDeadlines(
       url,
       {
-        method: "HEAD",
         headers: {
           authorization: `Bearer ${this.access.token}`,
-          accept: "video/iso.segment",
+          accept: options.accept,
+          ...(options.range && options.expectedBytes
+            ? { range: `bytes=0-${options.expectedBytes - 1}` }
+            : {}),
         },
         cache: "no-store",
       },
       signal,
-      async (response) => {
+      async (response, controller) => {
         if (response.status === 401 || response.status === 403) {
           this.options.onTokenExpiring?.();
-          return false;
+          throw new EmbyRelayHttpError(response.status, "segment");
         }
-        return response.ok;
+        if (
+          !response.ok ||
+          (options.range && response.status !== 206)
+        ) {
+          throw new EmbyRelayHttpError(response.status, "segment");
+        }
+        const reader = response.body?.getReader();
+        if (!reader) throw new Error("媒体恢复响应没有数据体");
+        const chunks: Uint8Array[] = [];
+        let bytes = 0;
+        try {
+          while (true) {
+            const result = await this.readWithIdleDeadline(
+              reader,
+              signal,
+              controller,
+            );
+            if (result.done) break;
+            bytes += result.value.byteLength;
+            if (bytes > options.maximumBytes) {
+              throw new Error("媒体恢复响应超过设备预算");
+            }
+            chunks.push(result.value);
+          }
+        } finally {
+          reader.releaseLock();
+        }
+        if (
+          options.expectedBytes !== undefined &&
+          bytes !== options.expectedBytes
+        ) {
+          throw new Error("媒体恢复响应体长度不完整");
+        }
+        const data = new Uint8Array(bytes);
+        let offset = 0;
+        for (const chunk of chunks) {
+          data.set(chunk, offset);
+          offset += chunk.byteLength;
+        }
+        if (
+          options.sha256 &&
+          (await sha256Hex(data)) !== options.sha256
+        ) {
+          throw new Error("媒体恢复分片校验失败");
+        }
+        return data;
       },
     );
   }
@@ -1504,10 +1666,10 @@ export class EmbyAbrSegmentClient {
         }
         if (response.status === 401 || response.status === 403) {
           this.options.onTokenExpiring?.();
-          throw new Error("分片访问凭证已过期");
+          throw new EmbyRelayHttpError(response.status, "manifest");
         }
         if (!response.ok) {
-          throw new Error(`分片清单请求失败（${response.status}）`);
+          throw new EmbyRelayHttpError(response.status, "manifest");
         }
         const reader = response.body?.getReader();
         const chunks: Uint8Array[] = [];
@@ -1862,6 +2024,7 @@ export class EmbyAbrSegmentClient {
     const previous = this.currentRendition;
     const needsMediaSourceRebuild =
       !previous ||
+      previous.epoch !== rendition.epoch ||
       previous.mimeType !== rendition.mimeType ||
       previous.switchGroup !== rendition.switchGroup ||
       this.options.player.activeSession?.mimeType !== rendition.mimeType;
@@ -2054,9 +2217,10 @@ export class EmbyAbrSegmentClient {
         rendition.segments,
         warmEndMs + 0.001,
       );
+      const prefetchCursorKey = `${rendition.id}:${rendition.epoch}`;
       prefetchIndex = Math.max(
         firstDeepIndex,
-        this.prefetchCursorByRendition.get(rendition.id) ??
+        this.prefetchCursorByRendition.get(prefetchCursorKey) ??
           firstDeepIndex,
       );
       while (prefetchIndex < rendition.segments.length) {
@@ -2125,7 +2289,7 @@ export class EmbyAbrSegmentClient {
         this.diagnosticsState.prefetchedSegments += 1;
         if (prefetchIndex >= 0) {
           this.prefetchCursorByRendition.set(
-            rendition.id,
+            `${rendition.id}:${rendition.epoch}`,
             prefetchIndex + 1,
           );
         }

@@ -67,8 +67,8 @@ async function main() {
     signalServer = createSignalServer({
       maxViewersPerRoom: 3,
     });
-    const address = await signalServer.listen(0, "127.0.0.1");
-    signalUrl = `ws://127.0.0.1:${address.port}/signal`;
+    await signalServer.listen(8_787, "127.0.0.1");
+    signalUrl = "ws://localhost:8787/signal";
   }
 
   await app.whenReady();
@@ -93,6 +93,19 @@ async function main() {
   ipcMain.handle("app:get-network-info", () => ({
     lanAddresses: [],
   }));
+  ipcMain.handle(
+    "permission:request-media",
+    (_event, kind) => kind === "microphone",
+  );
+  ipcMain.on("permission:release-media", () => undefined);
+  const channelOwnershipByRenderer = new Map();
+  ipcMain.on("channel-owner:load", (event) => {
+    event.returnValue = channelOwnershipByRenderer.get(event.sender.id);
+  });
+  ipcMain.on("channel-owner:save", (event, value) => {
+    channelOwnershipByRenderer.set(event.sender.id, value);
+    event.returnValue = true;
+  });
 
   const window = new BrowserWindow({
     width: 1280,
@@ -234,6 +247,18 @@ async function main() {
         sandbox: true,
       },
     });
+    viewerWindow.webContents.on("console-message", (...args) => {
+      const event = args[0];
+      const message =
+        typeof event === "object" && event && "message" in event
+          ? event.message
+          : typeof args[2] === "string"
+            ? args[2]
+            : "";
+      if (message) {
+        process.stderr.write(`[viewer-renderer] ${message}\n`);
+      }
+    });
     await withTimeout(
       viewerWindow.loadFile(
         path.join(__dirname, "..", "dist-renderer", "index.html"),
@@ -253,11 +278,31 @@ async function main() {
       document.querySelector("#viewer-signal-url").value = ${JSON.stringify(signalUrl)};
       document.querySelector("#join-room")?.click();
     })()`);
-    await waitFor(
-      viewerWindow,
-      `document.querySelectorAll(".participant-row").length === 2`,
-      "viewer channel join",
-    );
+    try {
+      await waitFor(
+        viewerWindow,
+        `Boolean(
+          document.querySelector("#broadcast-action") &&
+          !document.querySelector("#broadcast-action").disabled &&
+          document.querySelector("#voice-button")
+        )`,
+        "viewer channel join",
+      );
+    } catch (error) {
+      const diagnostics =
+        await viewerWindow.webContents.executeJavaScript(`({
+          body: document.body?.innerText?.slice(0, 2_000) || "",
+          broadcastDisabled:
+            document.querySelector("#broadcast-action")?.disabled,
+          signal: document.querySelector("#hud-signal-text")?.textContent,
+          toasts: [...document.querySelectorAll(".toast")].map(
+            (item) => item.textContent
+          ),
+        })`);
+      throw new Error(
+        `${error instanceof Error ? error.message : error}: ${JSON.stringify(diagnostics)}`,
+      );
+    }
     await viewerWindow.webContents.executeJavaScript(
       `document.querySelector("#voice-button")?.click()`,
     );

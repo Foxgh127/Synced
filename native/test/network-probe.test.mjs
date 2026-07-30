@@ -48,7 +48,7 @@ test("probe chunks stay inside Web Crypto and signal-server limits", async () =>
   );
 });
 
-test("negotiates v2 and measures two MiB in each throughput direction", async () => {
+test("negotiates v2 with a control-channel-safe 128 KiB ceiling", async () => {
   const { NETWORK_PROBE_V2_CHUNK_BYTES, runSignalNetworkProbe } =
     await loadModule();
   globalThis.window ??= globalThis;
@@ -95,8 +95,8 @@ test("negotiates v2 and measures two MiB in each throughput direction", async ()
   const download = signal.sent.filter(
     (message) => message.phase === "download",
   );
-  assert.equal(upload.length, 32);
-  assert.equal(download.length, 32);
+  assert.equal(upload.length, 2);
+  assert.equal(download.length, 2);
   assert.ok(upload.every((message) => message.probeVersion === 2));
   assert.ok(
     upload.every(
@@ -161,8 +161,8 @@ test("signal probe measures bounded latency, upload and download", async () => {
   const downloadMessages = signal.sent.filter(
     (message) => message.phase === "download",
   );
-  assert.equal(uploadMessages.length, 16);
-  assert.equal(downloadMessages.length, 16);
+  assert.equal(uploadMessages.length, 2);
+  assert.equal(downloadMessages.length, 2);
   assert.ok(
     uploadMessages.every(
       (message) =>

@@ -1,12 +1,14 @@
 import {
   createHash,
   createHmac,
+  randomBytes,
   randomUUID,
   timingSafeEqual,
 } from "node:crypto";
+import { createSocket as createUdpSocket } from "node:dgram";
 import { readFileSync } from "node:fs";
 import { createServer } from "node:http";
-import { isIP } from "node:net";
+import { createConnection, isIP } from "node:net";
 import { pathToFileURL } from "node:url";
 import { WebSocket, WebSocketServer } from "ws";
 import protocolPolicy from "./protocol-policy.json" with { type: "json" };
@@ -47,10 +49,13 @@ function signalCompatibility() {
 const MAX_PARTICIPANTS_PER_ROOM =
   protocolPolicy.maxParticipantsPerRoom;
 const DEFAULT_MAX_VIEWERS_PER_ROOM = MAX_PARTICIPANTS_PER_ROOM - 1;
-const MAX_MESSAGES_PER_MINUTE = 600;
+const MAX_MESSAGES_PER_MINUTE = 3_600;
 const MAX_CHAT_MESSAGES_PER_10_SECONDS = 20;
 const DEFAULT_MAX_CLIENTS = 128;
-const DEFAULT_MAX_CLIENTS_PER_IP = 16;
+// This is only a coarse abuse ceiling. Room membership, authenticated owner /
+// resume credentials and per-message scopes provide the finer controls, so a
+// campus or carrier-grade NAT is not limited to a tiny 16-client pool.
+const DEFAULT_MAX_CLIENTS_PER_IP = 64;
 const CLIENT_JOIN_TIMEOUT_MS = 30_000;
 const HEARTBEAT_INTERVAL_MS = 25_000;
 const ICE_CREDENTIAL_REFRESH_MAX_INTERVAL_MS = 3 * 60 * 60 * 1_000;
@@ -80,6 +85,15 @@ const TRANSPORT_REPORT_TTL_MS = 20_000;
 const NETWORK_ADVICE_VALIDITY_MS = 35_000;
 const NETWORK_ADVICE_DEBOUNCE_MS = 50;
 const SIGNAL_MAX_BUFFERED_BYTES = 768 * 1024;
+const SIGNAL_HARD_BUFFERED_BYTES_MULTIPLIER = 4;
+const SIGNAL_LOW_PRIORITY_TYPES = new Set([
+  "network:advice",
+  "network:probe-result",
+  "network:report-accepted",
+  "network:transport-accepted",
+  "server:time",
+  "voice:peers",
+]);
 const DEFAULT_PER_VIEWER_BUDGET_BPS = 10_000_000;
 const ROOM_PATTERN = /^[23456789A-HJ-NP-Z]{8}$/;
 const ROOM_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
@@ -106,9 +120,9 @@ const QUALITY_RECOMMENDATION_BASELINE_FRAME_RATE =
 function turnCredentialTtlSeconds(env = process.env) {
   return boundedInteger(
     env.TURN_CREDENTIAL_TTL_SECONDS,
-    4 * 60 * 60,
+    45 * 60,
     10 * 60,
-    24 * 60 * 60,
+    6 * 60 * 60,
   );
 }
 
@@ -213,9 +227,9 @@ function buildSfuAccess(room, state, env = process.env) {
   const nowSeconds = Math.floor(Date.now() / 1_000);
   const ttlSeconds = boundedInteger(
     env.SFU_TOKEN_TTL_SECONDS,
-    6 * 60 * 60,
+    45 * 60,
     10 * 60,
-    24 * 60 * 60,
+    6 * 60 * 60,
   );
   const expiresAt = (nowSeconds + ttlSeconds) * 1_000;
   const sfuRoom = `synced-${String(room).toLowerCase()}`;
@@ -379,6 +393,14 @@ function cleanBroadcastCapabilities(value) {
     capabilities.audioCodec = audioCodec;
     capabilities.title = title || "Emby 高清播放";
     capabilities.bitrate = Math.round(bitrate);
+    capabilities.allowOriginalRendition =
+      value.allowOriginalRendition !== false;
+    capabilities.maxActiveRenditions = boundedInteger(
+      value.maxActiveRenditions,
+      3,
+      2,
+      3,
+    );
     if (
       Number.isFinite(durationTicks) &&
       durationTicks > 0 &&
@@ -484,10 +506,10 @@ function cleanNetworkReport(value, now = Date.now()) {
     measuredAt > now + 5 * 60_000 ||
     !["ethernet", "wifi", "cellular", "unknown"].includes(networkType) ||
     typeof value.metered !== "boolean" ||
-    (value.directReachable !== undefined &&
-      typeof value.directReachable !== "boolean") ||
-    (value.turnReachable !== undefined &&
-      typeof value.turnReachable !== "boolean")
+    (value.directCandidateGatherable !== undefined &&
+      typeof value.directCandidateGatherable !== "boolean") ||
+    (value.turnCandidateGatherable !== undefined &&
+      typeof value.turnCandidateGatherable !== "boolean")
   ) {
     return undefined;
   }
@@ -501,57 +523,26 @@ function cleanNetworkReport(value, now = Date.now()) {
     networkType,
     metered: value.metered,
     measuredAt: Math.round(measuredAt),
-    ...(value.directReachable === undefined
+    ...(value.directCandidateGatherable === undefined
       ? {}
-      : { directReachable: value.directReachable }),
-    ...(value.turnReachable === undefined
+      : {
+          directCandidateGatherable:
+            value.directCandidateGatherable,
+        }),
+    ...(value.turnCandidateGatherable === undefined
       ? {}
-      : { turnReachable: value.turnReachable }),
+      : {
+          turnCandidateGatherable:
+            value.turnCandidateGatherable,
+        }),
     receivedAt: now,
   };
   if (probeVersion === 1) return report;
 
-  const optionalNumbers = {
-    packetLossPercent: [0, 100],
-    availableOutgoingBitrateBps: [10_000, 2_000_000_000],
-    availableIncomingBitrateBps: [10_000, 2_000_000_000],
-    relayRttMs: [0, 10_000],
-  };
-  for (const [field, [minimum, maximum]] of Object.entries(
-    optionalNumbers,
-  )) {
-    const candidate = value[field];
-    if (candidate === undefined) continue;
-    if (
-      typeof candidate !== "number" ||
-      !Number.isFinite(candidate) ||
-      candidate < minimum ||
-      candidate > maximum
-    ) {
-      return undefined;
-    }
-    report[field] = Math.round(candidate);
-  }
-  if (
-    value.activeCandidateType !== undefined &&
-    !["host", "srflx", "prflx", "relay", "unknown"].includes(
-      value.activeCandidateType,
-    )
-  ) {
-    return undefined;
-  }
-  if (
-    value.relayProtocol !== undefined &&
-    !["udp", "tcp", "tls", "unknown"].includes(value.relayProtocol)
-  ) {
-    return undefined;
-  }
-  if (value.activeCandidateType !== undefined) {
-    report.activeCandidateType = value.activeCandidateType;
-  }
-  if (value.relayProtocol !== undefined) {
-    report.relayProtocol = value.relayProtocol;
-  }
+  // Packet loss, selected route and available media bitrate are accepted only
+  // in network:transport-report, where they are bound to a real
+  // PeerConnection session and direction. The WSS report contains device
+  // attributes and control-path diagnostics only.
   return report;
 }
 
@@ -750,15 +741,10 @@ export function networkAdviceValidUntil(members, now = Date.now()) {
   return Math.max(now, validUntil);
 }
 
-function reportedCapacityBps(report, transportReports, direction) {
-  if (!report) return undefined;
-  const measured =
-    (direction === "send" ? report.uploadKbps : report.downloadKbps) *
-    1_000;
-  const probeEstimate =
-    direction === "send"
-      ? report.availableOutgoingBitrateBps
-      : report.availableIncomingBitrateBps;
+function reportedCapacityBps(_report, transportReports, direction) {
+  // The signaling WSS probe measures the control node, not SFU/TURN/CMAF.
+  // Capacity decisions therefore use only stats from the selected, real
+  // two-endpoint media candidate pair.
   const transportEstimates = transportReports
     .filter((candidate) => candidate.direction === direction)
     .map((candidate) =>
@@ -767,11 +753,9 @@ function reportedCapacityBps(report, transportReports, direction) {
         : candidate.availableIncomingBitrateBps,
     )
     .filter((candidate) => Number.isFinite(candidate) && candidate > 0);
-  return Math.min(
-    measured,
-    ...(Number.isFinite(probeEstimate) ? [probeEstimate] : []),
-    ...transportEstimates,
-  );
+  return transportEstimates.length
+    ? Math.min(...transportEstimates)
+    : undefined;
 }
 
 function voicePolicyFor(state, now = Date.now()) {
@@ -833,43 +817,48 @@ function buildNetworkAdvice({
     broadcaster,
     now,
   ).filter((report) => report.mediaKind === "broadcast");
-  const broadcasterBudget = broadcasterReport
-    ? reportedCapacityBps(
-        broadcasterReport,
-        broadcasterTransportReports,
-        "send",
-      ) *
-      networkSafetyRatio(
-        broadcasterReport,
-        broadcasterTransportReports,
-      )
-    : DEFAULT_PER_VIEWER_BUDGET_BPS * fanoutCount;
-  const receiverBudget = viewers.length
-    ? Math.min(
-        ...viewers.map((state) => {
-          const report = freshNetworkReport(state, now);
-          const transportReports = freshTransportReports(
-            state,
-            now,
-          ).filter((candidate) => candidate.mediaKind === "broadcast");
-          return report
-            ? reportedCapacityBps(
-                report,
-                transportReports,
-                "receive",
-              ) * networkSafetyRatio(report, transportReports)
-            : DEFAULT_PER_VIEWER_BUDGET_BPS;
-        }),
-      )
-    : Number.POSITIVE_INFINITY;
+  const measuredBroadcasterCapacity = reportedCapacityBps(
+    broadcasterReport,
+    broadcasterTransportReports,
+    "send",
+  );
+  const broadcasterBudget =
+    measuredBroadcasterCapacity === undefined
+      ? DEFAULT_PER_VIEWER_BUDGET_BPS * fanoutCount
+      : measuredBroadcasterCapacity *
+        networkSafetyRatio(
+          broadcasterReport,
+          broadcasterTransportReports,
+        );
+  const recipientIsPublisher = recipient?.id === broadcaster?.id;
+  const recipientBroadcastReports = freshTransportReports(
+    recipient,
+    now,
+  ).filter((candidate) => candidate.mediaKind === "broadcast");
+  const measuredReceiverCapacity = recipientIsPublisher
+    ? undefined
+    : reportedCapacityBps(
+        freshNetworkReport(recipient, now),
+        recipientBroadcastReports,
+        "receive",
+      );
+  const receiverBudget = recipientIsPublisher
+    ? Number.POSITIVE_INFINITY
+    : measuredReceiverCapacity === undefined
+      ? DEFAULT_PER_VIEWER_BUDGET_BPS
+      : measuredReceiverCapacity *
+        networkSafetyRatio(
+          freshNetworkReport(recipient, now),
+          recipientBroadcastReports,
+        );
   const rawBudget = Math.min(
     broadcasterBudget / fanoutCount,
     receiverBudget,
     2_000_000_000,
   );
   const perViewerBudgetBps = Math.max(
-    1_000_000,
-    Math.round(rawBudget / 250_000) * 250_000,
+    0,
+    Math.floor(rawBudget / 50_000) * 50_000,
   );
   const confidence =
     participantCount > 0 && measuredCount === participantCount
@@ -887,36 +876,15 @@ function buildNetworkAdvice({
   );
   const recipientTransportPoor =
     transportPenalty(recipientTransportReports) < 0.72;
-  const roomRequiresRelay = members.some((state) => {
-    const report = freshNetworkReport(state, now);
-    return (
-      report?.directReachable === false &&
-      report?.turnReachable === true
-    );
-  });
-  const hasVerifiedRelayPreference =
-    (recipientReport?.directReachable === false &&
-      recipientReport?.turnReachable === true) ||
-    recipientUsingRelay ||
-    roomRequiresRelay ||
-    activeRelaySessions > 0;
+  const hasVerifiedRelayPreference = recipientUsingRelay;
+  const recipientDirectPair = recipientTransportReports.some(
+    (report) =>
+      ["host", "srflx", "prflx"].includes(report.candidateType),
+  );
   const p2pConditionsLookHealthy =
-    freshReports.length === participantCount &&
-    freshReports.every(
-      (report) => {
-        const owner = members.find(
-          (state) => state.networkReport === report,
-        );
-        return (
-          report.directReachable !== false &&
-          !report.metered &&
-          ["ethernet", "wifi"].includes(report.networkType) &&
-          report.signalRttMs <= 120 &&
-          (report.packetLossPercent ?? 0) < 3 &&
-          transportPenalty(freshTransportReports(owner, now)) >= 0.82
-        );
-      },
-    );
+    recipientDirectPair &&
+    !recipientReport?.metered &&
+    transportPenalty(recipientTransportReports) >= 0.82;
   const routeMode = sfuPrimary
     ? "sfu-preferred"
     : hasVerifiedRelayPreference
@@ -986,7 +954,7 @@ function buildNetworkAdvice({
     generatedAt: now,
     validUntil: networkAdviceValidUntil(members, now),
     recommendedTargetBitrateBps: Math.max(
-      800_000,
+      0,
       Math.floor(boundedBudgetBps * 0.88),
     ),
     relayCapacityBps: null,
@@ -1004,6 +972,31 @@ function buildNetworkAdvice({
         0,
         participantCount - measuredCount,
       ),
+    },
+    publisherAdvice: {
+      participantId: broadcaster?.id,
+      budgetBps: Math.max(
+        0,
+        Math.floor(
+          broadcasterBudget / fanoutCount / 50_000,
+        ) * 50_000,
+      ),
+      fanoutCount,
+      sfuPublisherActive,
+    },
+    perViewerAdvice: recipientIsPublisher
+      ? {}
+      : {
+          [recipient.id]: {
+            budgetBps: boundedBudgetBps,
+            routeMode,
+            congestion,
+          },
+        },
+    roomOperationalAdvice: {
+      activeRelaySessions,
+      measuredParticipants: measuredCount,
+      participantCount,
     },
   };
 }
@@ -1262,7 +1255,7 @@ function originAllowed(origin, env) {
     return true;
   }
   if (!origin) {
-    return env.ALLOW_NO_ORIGIN !== "false";
+    return env.ALLOW_NO_ORIGIN === "true";
   }
   if (allowed?.length) {
     return allowed.includes(origin);
@@ -1281,40 +1274,123 @@ function originAllowed(origin, env) {
   }
 }
 
-function send(socket, payload) {
-  if (socket.readyState === WebSocket.OPEN) {
-    const configuredMaximum =
-      socket.syncedMaxBufferedBytes || SIGNAL_MAX_BUFFERED_BYTES;
-    const maximumBufferedBytes =
-      payload?.type === "network:probe-result"
-        ? Math.max(
-            configuredMaximum,
-            NETWORK_PROBE_V2_MAX_BYTES_PER_DIRECTION + 128 * 1024,
-          )
-        : configuredMaximum;
-    if (socket.bufferedAmount > maximumBufferedBytes) {
-      if (socket.syncedMetrics) {
-        socket.syncedMetrics.slowClientDropsTotal += 1;
-      }
-      try {
-        socket.close(1013, "signaling backpressure");
-      } catch {
-        socket.terminate();
-      }
-      return false;
-    }
+function lowPrioritySignalKey(payload) {
+  if (!SIGNAL_LOW_PRIORITY_TYPES.has(payload?.type)) return undefined;
+  if (payload.type === "network:probe-result") {
+    return [
+      payload.type,
+      payload.probeId,
+      payload.phase,
+      payload.sequence,
+    ].join(":");
+  }
+  return [
+    payload.type,
+    payload.recipientId,
+    payload.viewerId,
+    payload.sampleId,
+  ].join(":");
+}
+
+function flushLowPrioritySignals(socket) {
+  socket.syncedLowPriorityTimer = undefined;
+  if (
+    socket.readyState !== WebSocket.OPEN ||
+    !(socket.syncedLowPriorityQueue instanceof Map)
+  ) {
+    socket.syncedLowPriorityQueue?.clear?.();
+    return;
+  }
+  const maximumBufferedBytes =
+    socket.syncedMaxBufferedBytes || SIGNAL_MAX_BUFFERED_BYTES;
+  let sent = 0;
+  while (
+    socket.bufferedAmount <= maximumBufferedBytes / 2 &&
+    socket.syncedLowPriorityQueue.size &&
+    sent < 8
+  ) {
+    const [key, serialized] =
+      socket.syncedLowPriorityQueue.entries().next().value;
+    socket.syncedLowPriorityQueue.delete(key);
     try {
-      socket.send(JSON.stringify(payload));
-      if (socket.syncedMetrics) {
-        socket.syncedMetrics.messagesSentTotal += 1;
-      }
-      return true;
+      socket.send(serialized);
+      socket.syncedMetrics.messagesSentTotal += 1;
+      sent += 1;
     } catch {
       socket.terminate();
-      return false;
+      return;
     }
   }
-  return false;
+  if (socket.syncedLowPriorityQueue.size) {
+    socket.syncedLowPriorityTimer = setTimeout(
+      () => flushLowPrioritySignals(socket),
+      50,
+    );
+    socket.syncedLowPriorityTimer.unref?.();
+  }
+}
+
+function queueLowPrioritySignal(socket, key, serialized) {
+  socket.syncedLowPriorityQueue ||= new Map();
+  if (socket.syncedLowPriorityQueue.has(key)) {
+    socket.syncedLowPriorityQueue.delete(key);
+  }
+  socket.syncedLowPriorityQueue.set(key, serialized);
+  while (socket.syncedLowPriorityQueue.size > 32) {
+    socket.syncedLowPriorityQueue.delete(
+      socket.syncedLowPriorityQueue.keys().next().value,
+    );
+    socket.syncedMetrics.slowClientDropsTotal += 1;
+  }
+  if (!socket.syncedLowPriorityTimer) {
+    socket.syncedLowPriorityTimer = setTimeout(
+      () => flushLowPrioritySignals(socket),
+      50,
+    );
+    socket.syncedLowPriorityTimer.unref?.();
+  }
+}
+
+function send(socket, payload) {
+  if (socket.readyState !== WebSocket.OPEN) return false;
+  const maximumBufferedBytes =
+    socket.syncedMaxBufferedBytes || SIGNAL_MAX_BUFFERED_BYTES;
+  const hardMaximum =
+    maximumBufferedBytes * SIGNAL_HARD_BUFFERED_BYTES_MULTIPLIER;
+  const lowPriorityKey = lowPrioritySignalKey(payload);
+  let serialized;
+  try {
+    serialized = JSON.stringify(payload);
+  } catch {
+    return false;
+  }
+  if (
+    lowPriorityKey &&
+    (socket.bufferedAmount > maximumBufferedBytes ||
+      socket.syncedLowPriorityQueue?.size)
+  ) {
+    queueLowPrioritySignal(socket, lowPriorityKey, serialized);
+    return true;
+  }
+  if (socket.bufferedAmount > hardMaximum) {
+    socket.syncedMetrics.slowClientDropsTotal += 1;
+    try {
+      socket.close(1013, "signaling hard backpressure");
+    } catch {
+      socket.terminate();
+    }
+    return false;
+  }
+  try {
+    // Critical SDP, ICE-generation, moderation and broadcast-lifecycle
+    // messages may use the bounded reserve above the soft watermark.
+    socket.send(serialized);
+    socket.syncedMetrics.messagesSentTotal += 1;
+    return true;
+  } catch {
+    socket.terminate();
+    return false;
+  }
 }
 
 function rejectUpgrade(socket, statusCode, statusText) {
@@ -1327,6 +1403,100 @@ function rejectUpgrade(socket, statusCode, statusText) {
   } catch {
     socket.destroy();
   }
+}
+
+function signalMessagePolicy(message) {
+  const type = String(message?.type || "");
+  if (type === "signal" || type === "voice:signal") {
+    return {
+      category: "ice-sdp",
+      windowMs: 60_000,
+      maximum: 900,
+      maximumBytes: 192 * 1024,
+      targetScoped: true,
+    };
+  }
+  if (type === "network:probe") {
+    return {
+      category: "network-probe",
+      windowMs: 60_000,
+      maximum: 90,
+      maximumBytes: 80 * 1024,
+    };
+  }
+  if (
+    type === "network:report" ||
+    type === "network:transport-report"
+  ) {
+    return {
+      category: "network-report",
+      windowMs: 60_000,
+      maximum: 60,
+      maximumBytes: 24 * 1024,
+    };
+  }
+  if (type === "quality:request") {
+    return {
+      category: "quality-demand",
+      windowMs: 60_000,
+      maximum: 12,
+      maximumBytes: 8 * 1024,
+    };
+  }
+  if (type === "chat:send") {
+    return {
+      category: "chat",
+      windowMs: 10_000,
+      maximum: MAX_CHAT_MESSAGES_PER_10_SECONDS,
+      maximumBytes: 4 * 1024,
+    };
+  }
+  if (
+    type === "ping" ||
+    type === "voice:sync" ||
+    type === "sfu:status"
+  ) {
+    return {
+      category: "state",
+      windowMs: 60_000,
+      maximum: 180,
+      maximumBytes: 8 * 1024,
+    };
+  }
+  return {
+    category: type.split(":")[0] || "unknown",
+    windowMs: 60_000,
+    maximum: 300,
+    maximumBytes: 64 * 1024,
+  };
+}
+
+function consumeSignalMessageBudget(state, message, bytes, now) {
+  const policy = signalMessagePolicy(message);
+  if (bytes > policy.maximumBytes) return "payload";
+  const target = policy.targetScoped
+    ? cleanText(message.target || "", 64, "none")
+    : "all";
+  const scope = [
+    policy.category,
+    state.room || "prejoin",
+    target,
+  ].join(":");
+  const existing = state.messageRateBuckets.get(scope);
+  const bucket =
+    existing && now - existing.startedAt < policy.windowMs
+      ? existing
+      : { startedAt: now, count: 0 };
+  bucket.count += 1;
+  state.messageRateBuckets.set(scope, bucket);
+  if (state.messageRateBuckets.size > 64) {
+    for (const [key, candidate] of state.messageRateBuckets) {
+      if (now - candidate.startedAt >= policy.windowMs) {
+        state.messageRateBuckets.delete(key);
+      }
+    }
+  }
+  return bucket.count > policy.maximum ? "rate" : undefined;
 }
 
 function participantFor(state) {
@@ -1413,6 +1583,105 @@ function publicIceCapabilities(env) {
   };
 }
 
+function turnEndpoint(value) {
+  const match = String(value || "").match(
+    /^turn(s?):((?:\[[^\]]+\])|[^:?/]+)(?::(\d{1,5}))?(?:\?([^#]+))?$/iu,
+  );
+  if (!match) return undefined;
+  const port = Number(match[3] || (match[1] ? 5349 : 3478));
+  if (!Number.isInteger(port) || port < 1 || port > 65_535) {
+    return undefined;
+  }
+  const parameters = new URLSearchParams(match[4] || "");
+  return {
+    secure: Boolean(match[1]),
+    host: match[2].replace(/^\[|\]$/gu, ""),
+    port,
+    transport: parameters.get("transport") === "tcp" ? "tcp" : "udp",
+  };
+}
+
+function probeTcp(host, port, timeoutMs = 1_500) {
+  return new Promise((resolve) => {
+    const socket = createConnection({ host, port });
+    let settled = false;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.destroy();
+      resolve(ok);
+    };
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    timer.unref?.();
+    socket.once("connect", () => finish(true));
+    socket.once("error", () => finish(false));
+  });
+}
+
+function probeTurnAllocation(endpoint, timeoutMs = 1_500) {
+  if (endpoint.transport === "tcp" || endpoint.secure) {
+    return probeTcp(endpoint.host, endpoint.port, timeoutMs);
+  }
+  return new Promise((resolve) => {
+    const socket = createUdpSocket(
+      isIP(endpoint.host) === 6 ? "udp6" : "udp4",
+    );
+    const transactionId = randomBytes(12);
+    const request = Buffer.alloc(28);
+    request.writeUInt16BE(0x0003, 0);
+    request.writeUInt16BE(8, 2);
+    request.writeUInt32BE(0x2112a442, 4);
+    transactionId.copy(request, 8);
+    request.writeUInt16BE(0x0019, 20);
+    request.writeUInt16BE(4, 22);
+    request[24] = 17;
+    let settled = false;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.close();
+      resolve(ok);
+    };
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    timer.unref?.();
+    socket.once("error", () => finish(false));
+    socket.on("message", (message) => {
+      if (
+        message.length >= 20 &&
+        message.readUInt32BE(4) === 0x2112a442 &&
+        message.subarray(8, 20).equals(transactionId)
+      ) {
+        // A success or authenticated challenge proves that the TURN
+        // allocation endpoint, rather than merely DNS, is responding.
+        finish(true);
+      }
+    });
+    socket.send(request, endpoint.port, endpoint.host, (error) => {
+      if (error) finish(false);
+    });
+  });
+}
+
+async function probeLiveKit(url, timeoutMs = 1_500) {
+  const endpoint = new URL(url);
+  endpoint.protocol = endpoint.protocol === "wss:" ? "https:" : "http:";
+  endpoint.pathname = "/";
+  endpoint.search = "";
+  endpoint.hash = "";
+  try {
+    const response = await fetch(endpoint, {
+      method: "HEAD",
+      redirect: "manual",
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    return response.status < 500;
+  } catch {
+    return false;
+  }
+}
+
 export function createSignalServer(options = {}) {
   const startedAt = Date.now();
   const rooms = new Map();
@@ -1425,6 +1694,18 @@ export function createSignalServer(options = {}) {
     rootDir: env.SEGMENT_RELAY_CACHE_DIR,
     maxDiskBytes: Number(env.SEGMENT_RELAY_DISK_BYTES) || undefined,
     maxMemoryBytes: Number(env.SEGMENT_RELAY_MEMORY_BYTES) || undefined,
+    maxRoomDiskBytes:
+      Number(env.SEGMENT_RELAY_ROOM_DISK_BYTES) || undefined,
+    maxRoomMemoryBytes:
+      Number(env.SEGMENT_RELAY_ROOM_MEMORY_BYTES) || undefined,
+    maxRoomObjects:
+      Number(env.SEGMENT_RELAY_ROOM_OBJECTS) || undefined,
+    maxRoomActiveRenditions:
+      Number(env.SEGMENT_RELAY_ROOM_ACTIVE_RENDITIONS) || undefined,
+    roomUploadBytesPerSecond:
+      Number(env.SEGMENT_RELAY_ROOM_UPLOAD_BPS) > 0
+        ? Number(env.SEGMENT_RELAY_ROOM_UPLOAD_BPS) / 8
+        : undefined,
     secret: env.SEGMENT_RELAY_SECRET,
     // Chromium serializes a packaged file:// fetch origin as "null".
     // Accept it only on the independently bearer-authenticated media route;
@@ -1513,6 +1794,91 @@ export function createSignalServer(options = {}) {
     nodeId: cleanText(env.SIGNAL_NODE_ID, 64, "signal-primary"),
     region: cleanText(env.SIGNAL_REGION, 64, "unknown"),
   };
+  let readinessCache;
+
+  async function runtimeReadiness(now = Date.now()) {
+    if (readinessCache && now - readinessCache.checkedAt < 10_000) {
+      return readinessCache;
+    }
+    const relay = await segmentRelay.readiness();
+    const production = env.NODE_ENV === "production";
+    const sfuRequested =
+      env.SFU_ENABLED === "true" ||
+      Boolean(
+        env.SFU_PUBLIC_URL ||
+          env.LIVEKIT_API_KEY ||
+          env.LIVEKIT_API_SECRET,
+      );
+    const turnRequested = Boolean(env.TURN_URLS);
+    const secrets = {
+      segmentRelay:
+        !production ||
+        String(env.SEGMENT_RELAY_SECRET || "").length >= 32,
+      liveKit:
+        !sfuRequested ||
+        (
+          Boolean(normalizedSfuUrl(env.SFU_PUBLIC_URL)) &&
+          Boolean(cleanText(env.LIVEKIT_API_KEY, 128)) &&
+          String(env.LIVEKIT_API_SECRET || "").length >= 32
+        ),
+      turn:
+        !turnRequested ||
+        String(env.TURN_SECRET || "").length >= 32,
+    };
+    const externalProbes =
+      env.READINESS_EXTERNAL_PROBES === "true" ||
+      (production && env.READINESS_EXTERNAL_PROBES !== "false");
+    const liveKitReachable =
+      !sfuRequested ||
+      !externalProbes ||
+      (
+        secrets.liveKit &&
+        await probeLiveKit(normalizedSfuUrl(env.SFU_PUBLIC_URL))
+      );
+    const firstTurnEndpoint = String(env.TURN_URLS || "")
+      .split(",")
+      .map((value) => turnEndpoint(value.trim()))
+      .find(Boolean);
+    const turnAllocationReachable =
+      !turnRequested ||
+      !externalProbes ||
+      (
+        secrets.turn &&
+        firstTurnEndpoint &&
+        await probeTurnAllocation(firstTurnEndpoint)
+      );
+    const acceptingConnections = clients.size < maxClients;
+    const ok = Boolean(
+      acceptingConnections &&
+        relay.ok &&
+        Object.values(secrets).every(Boolean) &&
+        liveKitReachable &&
+        turnAllocationReachable,
+    );
+    readinessCache = {
+      ok,
+      status: ok
+        ? "ready"
+        : acceptingConnections
+          ? "dependency-unavailable"
+          : "saturated",
+      checkedAt: now,
+      acceptingConnections,
+      dependencies: {
+        relay,
+        secrets,
+        liveKit: {
+          required: sfuRequested,
+          reachable: Boolean(liveKitReachable),
+        },
+        turn: {
+          required: turnRequested,
+          allocationReachable: Boolean(turnAllocationReachable),
+        },
+      },
+    };
+    return readinessCache;
+  }
 
   function activeRelaySessions(now = Date.now()) {
     return [...clients.values()].reduce(
@@ -2126,6 +2492,7 @@ export function createSignalServer(options = {}) {
       phaseState = {
         total,
         sequences: new Set(),
+        startedAt: now,
       };
       probe.phases.set(phase, phaseState);
     }
@@ -2221,14 +2588,28 @@ export function createSignalServer(options = {}) {
     }
 
     phaseState.sequences.add(sequence);
+    phaseState.lastReceivedAt = now;
     probe.requests += 1;
     if (phaseState.sequences.size === phaseState.total) {
       phaseState.completed = true;
+      if (phase === "upload") {
+        probe.serverUploadKbps = Math.max(
+          1,
+          Math.round(
+            (probe.uploadBytes * 8) /
+              Math.max(1, now - phaseState.startedAt),
+          ),
+        );
+      }
     }
+    const previouslyCompleted = probe.completed;
     probe.completed =
       ["latency", "upload", "download"].every(
         (candidate) => probe.phases.get(candidate)?.completed === true,
       );
+    if (probe.completed && !previouslyCompleted) {
+      probe.completedAt = now;
+    }
     const serverSentAt = Date.now();
     send(socket, {
       type: "network:probe-result",
@@ -2356,11 +2737,10 @@ export function createSignalServer(options = {}) {
       return;
     }
     if (pathname === "/readyz") {
-      const acceptingConnections = clients.size < maxClients;
+      const readiness = await runtimeReadiness();
       const capabilities = serverCapabilities();
-      sendJson(acceptingConnections ? 200 : 503, {
-        ok: acceptingConnections,
-        status: acceptingConnections ? "ready" : "saturated",
+      sendJson(readiness.ok ? 200 : 503, {
+        ...readiness,
         protocolVersion: SIGNAL_PROTOCOL_VERSION,
         serverTime: Date.now(),
         limits: capabilities.limits,
@@ -2461,7 +2841,7 @@ export function createSignalServer(options = {}) {
   });
   // Upload/download body liveness is enforced by the segment relay's
   // per-byte idle watchdog. A total request deadline would incorrectly abort
-  // a healthy 96 MiB Range transfer on a slow mobile link.
+  // a healthy bounded Range transfer on a slow mobile link.
   httpServer.requestTimeout = 0;
   httpServer.headersTimeout = 6_000;
   httpServer.keepAliveTimeout = 5_000;
@@ -2577,6 +2957,8 @@ export function createSignalServer(options = {}) {
     socket.isAlive = true;
     socket.syncedMetrics = metrics;
     socket.syncedMaxBufferedBytes = maxBufferedBytes;
+    socket.syncedLowPriorityQueue = new Map();
+    socket.syncedLowPriorityTimer = undefined;
     metrics.websocketConnectionsTotal += 1;
     const state = {
       id: clientId,
@@ -2603,12 +2985,17 @@ export function createSignalServer(options = {}) {
       networkProbeRounds: 0,
       transportReports: new Map(),
       lastTransportReportAt: new Map(),
+      qualityDemandTimestamps: [],
+      lastQualityDemandAt: 0,
+      lastQualityDemandSignature: "",
+      qualityDemandPenaltyUntil: 0,
       ipLimitKey,
       superseded: false,
       disconnectTimer: undefined,
       disconnectFinalized: false,
       messages: 0,
       windowStartedAt: Date.now(),
+      messageRateBuckets: new Map(),
       chatTimestamps: [],
     };
     clients.set(clientId, { socket, state, ip, ipLimitKey });
@@ -2665,6 +3052,27 @@ export function createSignalServer(options = {}) {
       if (!message || typeof message !== "object" || Array.isArray(message)) {
         metrics.invalidMessagesTotal += 1;
         send(socket, { type: "error", message: "消息格式错误" });
+        return;
+      }
+      const budgetResult = consumeSignalMessageBudget(
+        state,
+        message,
+        Number(buffer.byteLength) || Buffer.byteLength(buffer),
+        now,
+      );
+      if (budgetResult) {
+        metrics.rateLimitedTotal += 1;
+        send(socket, {
+          type: "error",
+          code:
+            budgetResult === "payload"
+              ? "message-payload-too-large"
+              : "message-scope-rate-limit",
+          message:
+            budgetResult === "payload"
+              ? "此类消息内容过大"
+              : "此类消息发送过于频繁",
+        });
         return;
       }
 
@@ -3183,6 +3591,22 @@ export function createSignalServer(options = {}) {
           });
           return;
         }
+        const boundProbe = state.networkProbe;
+        if (
+          !boundProbe?.completed ||
+          boundProbe.reportAccepted === true ||
+          boundProbe.probeId !== networkReport.sampleId ||
+          boundProbe.probeVersion !== networkReport.probeVersion ||
+          !Number.isFinite(boundProbe.completedAt) ||
+          now - boundProbe.completedAt > NETWORK_REPORT_TTL_MS
+        ) {
+          send(socket, {
+            type: "error",
+            code: "network-report-unbound",
+            message: "网络状态未绑定到刚完成的服务端探测",
+          });
+          return;
+        }
         if (
           now - state.lastNetworkReportAt <
           NETWORK_REPORT_MIN_INTERVAL_MS
@@ -3203,7 +3627,16 @@ export function createSignalServer(options = {}) {
           });
           return;
         }
-        state.networkReport = networkReport;
+        boundProbe.reportAccepted = true;
+        state.networkReport = {
+          ...networkReport,
+          uploadKbps: Math.min(
+            networkReport.uploadKbps,
+            Math.max(1, Number(boundProbe.serverUploadKbps) || 1),
+          ),
+          serverVerified: true,
+          probeCompletedAt: boundProbe.completedAt,
+        };
         state.lastNetworkReportAt = now;
         metrics.networkReportsTotal += 1;
         if (networkReport.probeVersion === 2) {
@@ -3689,7 +4122,11 @@ export function createSignalServer(options = {}) {
         const room = rooms.get(state.room);
         const broadcaster =
           room?.broadcasterId ? clients.get(room.broadcasterId) : undefined;
-        if (!room || !broadcaster) {
+        if (
+          !room ||
+          !broadcaster ||
+          room.broadcasterId === clientId
+        ) {
           send(socket, { type: "error", message: "频道当前无人放映" });
           return;
         }
@@ -3707,7 +4144,7 @@ export function createSignalServer(options = {}) {
               requestedHeight,
             )) ||
           (requestedFrameRate !== undefined &&
-            ![24, 30, 60, 90, 120].includes(requestedFrameRate)) ||
+            ![24, 30].includes(requestedFrameRate)) ||
           (availableDownloadBps !== undefined &&
             (!Number.isFinite(availableDownloadBps) ||
               availableDownloadBps < 0 ||
@@ -3716,14 +4153,79 @@ export function createSignalServer(options = {}) {
           send(socket, { type: "error", message: "观看画质参数无效" });
           return;
         }
+        const verifiedDownloadBps = reportedCapacityBps(
+          freshNetworkReport(state, now),
+          freshTransportReports(state, now).filter(
+            (report) => report.mediaKind === "broadcast",
+          ),
+          "receive",
+        );
+        const demandSignature = [
+          message.originalDemand === true,
+          message.highDemand === true,
+          message.lowDemand === true,
+        ].join(":");
+        state.qualityDemandTimestamps = state.qualityDemandTimestamps.filter(
+          (timestamp) => now - timestamp < 60_000,
+        );
+        if (
+          demandSignature !== state.lastQualityDemandSignature &&
+          now - state.lastQualityDemandAt < 10_000
+        ) {
+          state.qualityDemandTimestamps.push(now);
+          if (state.qualityDemandTimestamps.length >= 6) {
+            state.qualityDemandPenaltyUntil = now + 60_000;
+          }
+          metrics.rateLimitedTotal += 1;
+          send(socket, {
+            type: "error",
+            code: "quality-demand-cooldown",
+            message: "附加画质切换过于频繁，请稍后重试",
+          });
+          return;
+        }
+        if (now < state.qualityDemandPenaltyUntil) {
+          metrics.rateLimitedTotal += 1;
+          return;
+        }
+        state.lastQualityDemandAt = now;
+        state.lastQualityDemandSignature = demandSignature;
+        const policy = room.broadcastCapabilities;
+        const originalDemand =
+          message.originalDemand === true &&
+          policy?.mode === "emby" &&
+          policy.allowOriginalRendition !== false &&
+          Number.isFinite(verifiedDownloadBps) &&
+          verifiedDownloadBps >=
+            Math.max(20_000_000, Number(policy.bitrate) * 1.35);
+        const highDemand =
+          !originalDemand &&
+          message.highDemand === true &&
+          Number.isFinite(verifiedDownloadBps) &&
+          verifiedDownloadBps >= 12_000_000;
+        const lowDemand =
+          !originalDemand &&
+          !highDemand &&
+          message.lowDemand === true;
         send(broadcaster.socket, {
           type: "quality:request",
           viewerId: clientId,
           height: requestedHeight,
           frameRate: requestedFrameRate,
-          originalDemand: message.originalDemand === true,
-          lowDemand: message.lowDemand === true,
-          availableDownloadBps,
+          originalDemand,
+          highDemand,
+          lowDemand,
+          availableDownloadBps: verifiedDownloadBps,
+          renditionPolicy: {
+            maxActiveRenditions: boundedInteger(
+              policy?.maxActiveRenditions,
+              3,
+              2,
+              3,
+            ),
+            allowOriginal: policy?.allowOriginalRendition !== false,
+            serverVerified: Number.isFinite(verifiedDownloadBps),
+          },
         });
         return;
       }
@@ -4048,6 +4550,11 @@ export function createSignalServer(options = {}) {
 
     socket.on("close", (code) => {
       clearTimeout(joinTimer);
+      if (socket.syncedLowPriorityTimer) {
+        clearTimeout(socket.syncedLowPriorityTimer);
+        socket.syncedLowPriorityTimer = undefined;
+      }
+      socket.syncedLowPriorityQueue?.clear();
       clientsByIp.set(
         ipLimitKey,
         Math.max(0, (clientsByIp.get(ipLimitKey) || 1) - 1),

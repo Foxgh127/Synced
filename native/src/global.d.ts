@@ -3,6 +3,17 @@ export {};
 declare global {
   interface Window {
     roomDesktop?: {
+      loadChannelOwnership: () =>
+        | { room: string; ownerToken: string }
+        | undefined;
+      saveChannelOwnership: (value: {
+        room: string;
+        ownerToken: string;
+      }) => boolean;
+      requestMediaPermissionIntent: (
+        kind: "microphone",
+      ) => Promise<boolean>;
+      releaseMediaPermission: (kind: "microphone") => void;
       listSources: (options?: {
         thumbnails?: boolean;
         audioProcesses?: boolean;
@@ -141,6 +152,7 @@ declare global {
       }) => Promise<{ updated: boolean; pipelineId: string }>;
       embyUpdateRenditionDemand?: (input: {
         original?: boolean;
+        high?: boolean;
         low?: boolean;
         availableUploadBps?: number;
       }) => Promise<{

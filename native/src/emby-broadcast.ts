@@ -321,6 +321,7 @@ export class EmbyBroadcastController {
 
   setSegmentRenditionDemand(input: {
     original?: boolean;
+    high?: boolean;
     low?: boolean;
     availableUploadBps?: number;
   }): void {
@@ -329,6 +330,7 @@ export class EmbyBroadcastController {
     }
     const normalized = {
       original: input.original === true,
+      high: input.high === true,
       low: input.low === true,
       ...(Number.isFinite(Number(input.availableUploadBps)) &&
       Number(input.availableUploadBps) >= 0
@@ -2080,6 +2082,30 @@ export class EmbyBroadcastController {
     }
     if (message.type === "need") {
       if (!Array.isArray(message.missing)) return;
+      const repairGeneration = Number(message.repairGeneration);
+      if (
+        message.repairGeneration !== undefined &&
+        (
+          !Number.isSafeInteger(repairGeneration) ||
+          repairGeneration < 1 ||
+          repairGeneration > 1_000_000
+        )
+      ) {
+        return;
+      }
+      const acknowledgeRepair = (accepted: boolean): void => {
+        if (message.repairGeneration === undefined) return;
+        state.sender.sendControl({
+          type: "repair-ack",
+          sessionId: this.sessionId,
+          mediaVersion: this.mediaVersion,
+          transportEpoch: state.transportEpoch,
+          fragmentSeq: Number(message.fragmentSeq),
+          trackType: message.trackType,
+          repairGeneration,
+          accepted,
+        });
+      };
       if (
         !Number.isSafeInteger(message.fragmentSeq) ||
         message.fragmentSeq < 0 ||
@@ -2107,7 +2133,10 @@ export class EmbyBroadcastController {
               message.fragmentSeq,
               message.trackType === "subtitle" ? "subtitle" : "muxed",
             );
-      if (!fragment) return;
+      if (!fragment) {
+        acknowledgeRepair(false);
+        return;
+      }
       const chunkCount = Math.max(
         1,
         Math.ceil(fragment.data.byteLength / EMBY_CHUNK_BYTES),
@@ -2115,7 +2144,10 @@ export class EmbyBroadcastController {
       const availableMissing = missing.filter(
         (index) => index < chunkCount,
       );
-      if (!availableMissing.length) return;
+      if (!availableMissing.length) {
+        acknowledgeRepair(false);
+        return;
+      }
       const now = Date.now();
       const elapsed = Math.max(0, now - state.repairTokenUpdatedAt);
       state.repairTokens = Math.min(
@@ -2132,9 +2164,13 @@ export class EmbyBroadcastController {
         }
       }
       if (
-        state.recentRepairRequests.has(repairKey) ||
-        state.repairTokens < availableMissing.length
+        state.recentRepairRequests.has(repairKey)
       ) {
+        acknowledgeRepair(true);
+        return;
+      }
+      if (state.repairTokens < availableMissing.length) {
+        acknowledgeRepair(false);
         return;
       }
       state.repairTokens -= availableMissing.length;
@@ -2145,11 +2181,12 @@ export class EmbyBroadcastController {
         if (!oldest) break;
         state.recentRepairRequests.delete(oldest);
       }
-      state.sender.sendFragment(fragment, {
+      const accepted = state.sender.sendFragment(fragment, {
         priority: true,
         onlyChunks: availableMissing,
         transportEpoch: state.transportEpoch,
       });
+      acknowledgeRepair(accepted);
       return;
     }
     if (message.type === "buffer-state") {

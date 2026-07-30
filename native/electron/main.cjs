@@ -52,6 +52,8 @@ let shutdownInProgress = false;
 let shutdownComplete = false;
 let gameView;
 let gameViewAttached = false;
+let mediaPermissionIntent;
+let microphonePermissionSessionActive = false;
 
 function closeEmbyStreamPort() {
   try {
@@ -138,6 +140,8 @@ let diagnosticFlushTimer;
 let diagnosticWriteQueue = Promise.resolve();
 const DIAGNOSTIC_FLUSH_DELAY_MS = 250;
 const DIAGNOSTIC_FLUSH_BYTES = 64 * 1024;
+const DIAGNOSTIC_MAX_FILE_BYTES = 2 * 1024 * 1024;
+const DIAGNOSTIC_MAX_ENTRY_BYTES = 16 * 1024;
 const FIREWALL_SUCCESS_CACHE_MS = 10 * 60_000;
 const FIREWALL_FAILURE_CACHE_MS = 15_000;
 let portableFirewallCache;
@@ -180,16 +184,107 @@ function initialiseDiagnosticLog() {
     const logDirectory = path.join(app.getPath("userData"), "logs");
     fs.mkdirSync(logDirectory, { recursive: true });
     diagnosticLogPath = path.join(logDirectory, "portable.log");
+    rotateDiagnosticLogIfNeeded(diagnosticLogPath, 0);
     try {
-      if (fs.statSync(diagnosticLogPath).size > 2 * 1024 * 1024) {
-        fs.renameSync(diagnosticLogPath, `${diagnosticLogPath}.previous`);
+      fs.chmodSync(logDirectory, 0o700);
+      if (fs.existsSync(diagnosticLogPath)) {
+        fs.chmodSync(diagnosticLogPath, 0o600);
       }
     } catch {
-      // The first launch does not have an existing log.
+      // Windows ACLs and read-only portable locations may ignore POSIX modes.
     }
   } catch {
     diagnosticLogPath = undefined;
   }
+}
+
+function rotateDiagnosticLogIfNeeded(targetPath, incomingBytes) {
+  let currentBytes = 0;
+  try {
+    currentBytes = fs.statSync(targetPath).size;
+  } catch {
+    return;
+  }
+  if (
+    currentBytes + Math.max(0, Number(incomingBytes) || 0) <=
+    DIAGNOSTIC_MAX_FILE_BYTES
+  ) {
+    return;
+  }
+  const previousPath = `${targetPath}.previous`;
+  try {
+    fs.rmSync(previousPath, { force: true });
+    fs.renameSync(targetPath, previousPath);
+    fs.chmodSync(previousPath, 0o600);
+  } catch {
+    // Enforce the hard ceiling even if antivirus or a stale .previous file
+    // prevents an atomic rotation.
+    try {
+      fs.truncateSync(targetPath, 0);
+    } catch {
+      diagnosticLogPath = undefined;
+    }
+  }
+}
+
+function sanitizeDiagnosticValue(value, key = "", depth = 0, seen = new WeakSet()) {
+  if (
+    /authorization|cookie|sdp|candidate|secret|password|token|credential|owner|resume|segment|url|uri|path/i.test(
+      key,
+    )
+  ) {
+    return "[redacted]";
+  }
+  if (depth > 5) return "[depth-limit]";
+  if (typeof value === "string") {
+    return value
+      .replace(/\bBearer\s+[A-Za-z0-9._~-]+/giu, "Bearer [redacted]")
+      .replace(
+        /\bhttps?:\/\/[^\s"'<>]+/giu,
+        (candidate) => {
+          try {
+            const parsed = new URL(candidate);
+            parsed.username = "";
+            parsed.password = "";
+            parsed.search = "";
+            parsed.hash = "";
+            return parsed.toString();
+          } catch {
+            return "[redacted-url]";
+          }
+        },
+      )
+      .slice(0, 1_000);
+  }
+  if (
+    value === null ||
+    typeof value === "number" ||
+    typeof value === "boolean"
+  ) {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value
+      .slice(0, 64)
+      .map((entry) =>
+        sanitizeDiagnosticValue(entry, key, depth + 1, seen),
+      );
+  }
+  if (value && typeof value === "object") {
+    if (seen.has(value)) return "[circular]";
+    seen.add(value);
+    const output = {};
+    for (const [childKey, childValue] of Object.entries(value).slice(0, 64)) {
+      output[childKey] = sanitizeDiagnosticValue(
+        childValue,
+        childKey,
+        depth + 1,
+        seen,
+      );
+    }
+    return output;
+  }
+  return String(value).slice(0, 256);
 }
 
 function flushDiagnosticLog() {
@@ -206,7 +301,17 @@ function flushDiagnosticLog() {
   diagnosticBufferedBytes = 0;
   diagnosticWriteQueue = diagnosticWriteQueue
     .catch(() => undefined)
-    .then(() => fs.promises.appendFile(targetPath, payload, "utf8"))
+    .then(async () => {
+      rotateDiagnosticLogIfNeeded(
+        targetPath,
+        Buffer.byteLength(payload, "utf8"),
+      );
+      if (!diagnosticLogPath) return;
+      await fs.promises.appendFile(targetPath, payload, {
+        encoding: "utf8",
+        mode: 0o600,
+      });
+    })
     .catch(() => undefined);
   return diagnosticWriteQueue;
 }
@@ -222,20 +327,24 @@ function scheduleDiagnosticFlush() {
 
 function diagnostic(event, detail = {}) {
   if (!diagnosticLogPath) return;
-  const safeDetail =
+  const safeDetail = sanitizeDiagnosticValue(
     detail && typeof detail === "object"
-      ? Object.fromEntries(
-          Object.entries(detail).filter(
-            ([key]) => !/sdp|candidate|secret|password|token/i.test(key),
-          ),
-        )
-      : { detail: String(detail) };
+      ? detail
+      : { detail: String(detail) },
+  );
   try {
-    const entry = `${JSON.stringify({
+    let entry = `${JSON.stringify({
       at: new Date().toISOString(),
-      event,
+      event: String(event).slice(0, 80),
       ...safeDetail,
     })}\n`;
+    if (Buffer.byteLength(entry, "utf8") > DIAGNOSTIC_MAX_ENTRY_BYTES) {
+      entry = `${JSON.stringify({
+        at: new Date().toISOString(),
+        event: String(event).slice(0, 80),
+        discarded: "diagnostic entry exceeded hard size limit",
+      })}\n`;
+    }
     diagnosticBuffer.push(entry);
     diagnosticBufferedBytes += Buffer.byteLength(entry, "utf8");
     if (diagnosticBufferedBytes >= DIAGNOSTIC_FLUSH_BYTES) {
@@ -268,6 +377,68 @@ function persistentEmbyDeviceId() {
   return created;
 }
 
+function channelOwnerStoragePath() {
+  return path.join(app.getPath("userData"), "channel-owner.v1.bin");
+}
+
+function loadSecureChannelOwnership() {
+  if (!safeStorage.isEncryptionAvailable()) return undefined;
+  try {
+    const encrypted = fs.readFileSync(channelOwnerStoragePath());
+    const parsed = JSON.parse(safeStorage.decryptString(encrypted));
+    if (
+      !/^[23456789A-HJ-NP-Z]{8}$/u.test(String(parsed?.room || "")) ||
+      !/^[A-Za-z0-9_-]{43}$/u.test(String(parsed?.ownerToken || ""))
+    ) {
+      return undefined;
+    }
+    return {
+      room: parsed.room,
+      ownerToken: parsed.ownerToken,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function saveSecureChannelOwnership(value) {
+  if (
+    !safeStorage.isEncryptionAvailable() ||
+    !/^[23456789A-HJ-NP-Z]{8}$/u.test(String(value?.room || "")) ||
+    !/^[A-Za-z0-9_-]{43}$/u.test(String(value?.ownerToken || ""))
+  ) {
+    return false;
+  }
+  const targetPath = channelOwnerStoragePath();
+  const temporaryPath = `${targetPath}.${randomUUID()}.tmp`;
+  try {
+    const encrypted = safeStorage.encryptString(
+      JSON.stringify({
+        room: value.room,
+        ownerToken: value.ownerToken,
+      }),
+    );
+    fs.writeFileSync(temporaryPath, encrypted, {
+      mode: 0o600,
+      flag: "wx",
+    });
+    fs.renameSync(temporaryPath, targetPath);
+    try {
+      fs.chmodSync(targetPath, 0o600);
+    } catch {
+      // Windows protects safeStorage ciphertext with the current OS account.
+    }
+    return true;
+  } catch {
+    try {
+      fs.rmSync(temporaryPath, { force: true });
+    } catch {
+      // Best effort cleanup.
+    }
+    return false;
+  }
+}
+
 function assertMainRenderer(event) {
   if (
     !mainWindow ||
@@ -276,6 +447,32 @@ function assertMainRenderer(event) {
   ) {
     throw new Error("主窗口当前不可用");
   }
+}
+
+function grantMediaPermissionIntent(kind, uses = 1) {
+  mediaPermissionIntent = {
+    kind,
+    remaining: Math.max(1, Math.min(8, Number(uses) || 1)),
+    expiresAt: Date.now() + 60_000,
+  };
+}
+
+function hasMediaPermissionIntent(kind) {
+  return Boolean(
+    mediaPermissionIntent &&
+      mediaPermissionIntent.kind === kind &&
+      mediaPermissionIntent.remaining > 0 &&
+      Date.now() <= mediaPermissionIntent.expiresAt,
+  );
+}
+
+function consumeMediaPermissionIntent(kind) {
+  if (!hasMediaPermissionIntent(kind)) return false;
+  mediaPermissionIntent.remaining -= 1;
+  if (mediaPermissionIntent.remaining <= 0) {
+    mediaPermissionIntent = undefined;
+  }
+  return true;
 }
 
 function isMainRenderer(webContents) {
@@ -681,14 +878,18 @@ async function findSelectedSource(options = {}) {
     thumbnailSize: { width: 160, height: 90 },
     fetchWindowIcons: false,
   });
-  const original =
+  const exactOriginal =
     sources.find((source) => source.id === selectedSource.id) ||
     sources.find(
       (source) =>
         sourceHandle(source.id) &&
         sourceHandle(source.id) === selectedSource.windowHandle,
-    ) ||
-    sources.find((source) => source.name === selectedSource.name);
+    );
+  const original =
+    exactOriginal ||
+    (!selectedSource.processId
+      ? sources.find((source) => source.name === selectedSource.name)
+      : undefined);
   if (!selectedSource.processId) return original;
   const originalActivity = sourceVisualActivity(original);
   // Healthy captures avoid spawning the window-inspection helper on every
@@ -705,12 +906,58 @@ async function findSelectedSource(options = {}) {
   const processByHandle = await inspectWindowProcesses(
     sources.map((source) => source.id),
   );
-  const sameProcess = sources.filter(
-    (source) =>
-      Number(processByHandle.get(sourceHandle(source.id))?.processId) ===
-      Number(selectedSource.processId),
-  );
-  if (!sameProcess.length) return original;
+  const normalizedTitle = (value) =>
+    String(value || "")
+      .toLocaleLowerCase("zh-CN")
+      .replace(
+        /\b(fullscreen|full screen|picture-in-picture|pip)\b/giu,
+        "",
+      )
+      .replace(/[^\p{L}\p{N}]+/gu, "");
+  const selectedTitle = normalizedTitle(selectedSource.name);
+  const sameIdentity = sources.filter((source) => {
+    const detail = processByHandle.get(sourceHandle(source.id));
+    if (
+      Number(detail?.processId) !== Number(selectedSource.processId)
+    ) {
+      return false;
+    }
+    if (
+      selectedSource.executableName &&
+      detail?.executableName &&
+      String(detail.executableName).toLowerCase() !==
+        String(selectedSource.executableName).toLowerCase()
+    ) {
+      return false;
+    }
+    const classMatches =
+      Boolean(selectedSource.className) &&
+      Boolean(detail?.className) &&
+      detail.className === selectedSource.className;
+    const candidateTitle = normalizedTitle(source.name);
+    const titleMatches =
+      selectedTitle.length >= 3 &&
+      candidateTitle.length >= 3 &&
+      (
+        selectedTitle === candidateTitle ||
+        selectedTitle.includes(candidateTitle) ||
+        candidateTitle.includes(selectedTitle)
+      );
+    const ownerMatches =
+      Boolean(detail?.ownerHandle) &&
+      [
+        selectedSource.windowHandle,
+        selectedSource.ownerHandle,
+      ].includes(detail.ownerHandle);
+    // A replacement needs the exact process plus at least two stable window
+    // identity signals. Visual activity alone can never redirect capture.
+    return (
+      (classMatches && titleMatches) ||
+      (classMatches && ownerMatches) ||
+      (titleMatches && ownerMatches)
+    );
+  });
+  if (!sameIdentity.length) return original;
   const windowScore = (source) => {
     const detail = processByHandle.get(sourceHandle(source.id));
     const area =
@@ -724,7 +971,7 @@ async function findSelectedSource(options = {}) {
       Math.min(4, area / 1_000_000)
     );
   };
-  const replacement = [...sameProcess].sort(
+  const replacement = [...sameIdentity].sort(
     (left, right) => windowScore(right) - windowScore(left),
   )[0];
   if (!original) {
@@ -737,24 +984,10 @@ async function findSelectedSource(options = {}) {
     return replacement;
   }
   const replacementActivity = sourceVisualActivity(replacement);
-  const originalWindow = processByHandle.get(sourceHandle(original.id));
-  const replacementWindow = processByHandle.get(
-    sourceHandle(replacement.id),
-  );
   if (
     replacement.id !== original.id &&
-    (
-      (
-        originalActivity < 0.01 &&
-        replacementActivity >= Math.max(0.03, originalActivity + 0.03)
-      ) ||
-      (
-        replacementWindow?.foreground === true &&
-        originalWindow?.foreground !== true &&
-        replacementWindow?.visible !== false &&
-        replacementWindow?.minimized !== true
-      )
-    )
+    originalActivity < 0.01 &&
+    replacementActivity >= Math.max(0.03, originalActivity + 0.03)
   ) {
     diagnostic("display-source-followed-process", {
       processId: selectedSource.processId,
@@ -920,8 +1153,9 @@ async function inspectAndRepairPortableFirewallRules(executable) {
     "powershell.exe",
   );
   const quotePowerShell = (value) => `'${String(value).replaceAll("'", "''")}'`;
-  const ruleNames = ["Synced P2P UDP v2", "Synced P2P TCP v2"];
-  // Query both rules in one structured NetSecurity invocation. Starting
+  const ruleNames = ["Synced P2P UDP v3"];
+  // Query the single private-profile UDP app rule in one structured
+  // NetSecurity invocation. Starting
   // PowerShell is materially more expensive than the rule lookup itself.
   const query = [
     `$requiredNames = @(${ruleNames.map(quotePowerShell).join(", ")})`,
@@ -929,9 +1163,11 @@ async function inspectAndRepairPortableFirewallRules(executable) {
     "  $matched = $false",
     "  $rules = @(Get-NetFirewallRule -DisplayName $requiredName -ErrorAction SilentlyContinue)",
     "  foreach ($rule in $rules) {",
+    "    if ($rule.Enabled -ne 'True' -or $rule.Direction -ne 'Inbound' -or $rule.Action -ne 'Allow' -or $rule.Profile -ne 'Private') { continue }",
     "    $apps = @($rule | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue)",
+    "    $ports = @($rule | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue)",
     "    foreach ($appFilter in $apps) {",
-    `      if ($appFilter.Program -ieq ${quotePowerShell(executable)}) { $matched = $true; break }`,
+    `      if ($appFilter.Program -ieq ${quotePowerShell(executable)} -and @($ports | Where-Object { $_.Protocol -eq 'UDP' -or $_.Protocol -eq 17 }).Count -gt 0) { $matched = $true; break }`,
     "    }",
     "    if ($matched) { break }",
     "  }",
@@ -976,19 +1212,18 @@ async function inspectAndRepairPortableFirewallRules(executable) {
     "Synced P2P TCP",
     "Synced P2P UDP v2",
     "Synced P2P TCP v2",
+    "Synced P2P UDP v3",
   ]) {
     commands.push(
       `& ${quotePowerShell(netsh)} @('advfirewall','firewall','delete','rule',${quotePowerShell(`name=${legacyRuleName}`)}) | Out-Null`,
     );
   }
-  for (const protocolName of ["UDP", "TCP"]) {
-    const ruleName = `Synced P2P ${protocolName} v2`;
-    commands.push(
-      `& ${quotePowerShell(netsh)} @('advfirewall','firewall','delete','rule',${quotePowerShell(`name=${ruleName}`)}) | Out-Null`,
-      `& ${quotePowerShell(netsh)} @('advfirewall','firewall','add','rule',${quotePowerShell(`name=${ruleName}`)},'dir=in','action=allow',${quotePowerShell(`program=${executable}`)},'enable=yes','profile=private,public',${quotePowerShell(`protocol=${protocolName}`)},'edge=no') | Out-Null`,
-      "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
-    );
-  }
+  const ruleName = "Synced P2P UDP v3";
+  commands.push(
+    `& ${quotePowerShell(netsh)} @('advfirewall','firewall','delete','rule',${quotePowerShell(`name=${ruleName}`)}) | Out-Null`,
+    `& ${quotePowerShell(netsh)} @('advfirewall','firewall','add','rule',${quotePowerShell(`name=${ruleName}`)},'dir=in','action=allow',${quotePowerShell(`program=${executable}`)},'enable=yes','profile=private','protocol=UDP','edge=no') | Out-Null`,
+    "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+  );
   const elevatedScript = commands.join("\r\n");
   const encodedScript = Buffer.from(elevatedScript, "utf16le").toString("base64");
   const outerScript = [
@@ -1554,6 +1789,37 @@ async function startProcessAudioCapture() {
 
 app.whenReady().then(() => {
   initialiseDiagnosticLog();
+  ipcMain.on("channel-owner:load", (event) => {
+    event.returnValue = isMainRenderer(event.sender)
+      ? loadSecureChannelOwnership()
+      : undefined;
+  });
+  ipcMain.on("channel-owner:save", (event, value) => {
+    event.returnValue = isMainRenderer(event.sender)
+      ? saveSecureChannelOwnership(value)
+      : false;
+  });
+  ipcMain.handle("permission:request-media", async (event, kind) => {
+    assertMainRenderer(event);
+    if (kind !== "microphone") return false;
+    if (microphonePermissionSessionActive) return true;
+    const userActivated = await event.sender
+      .executeJavaScript(
+        "Boolean(navigator.userActivation?.isActive)",
+        true,
+      )
+      .catch(() => false);
+    if (!userActivated) return false;
+    grantMediaPermissionIntent("microphone", 4);
+    return true;
+  });
+  ipcMain.on("permission:release-media", (event, kind) => {
+    if (!isMainRenderer(event.sender) || kind !== "microphone") return;
+    microphonePermissionSessionActive = false;
+    if (mediaPermissionIntent?.kind === "microphone") {
+      mediaPermissionIntent = undefined;
+    }
+  });
   screen.on("display-added", updateOverlayBounds);
   screen.on("display-removed", updateOverlayBounds);
   screen.on("display-metrics-changed", updateOverlayBounds);
@@ -1639,12 +1905,14 @@ app.whenReady().then(() => {
       if (
         !mainWindow ||
         mainWindow.isDestroyed() ||
-        request.frame !== mainWindow.webContents.mainFrame
+        request.frame !== mainWindow.webContents.mainFrame ||
+        (!captureActive && !hasMediaPermissionIntent("display"))
       ) {
         diagnostic("display-source-rejected", { reason: "untrusted-renderer" });
         callback({});
         return;
       }
+      consumeMediaPermissionIntent("display");
       const source = await findSelectedSource();
       if (!source) {
         diagnostic("display-source-missing", {
@@ -1654,11 +1922,11 @@ app.whenReady().then(() => {
         callback({});
         return;
       }
-    selectedSource = {
+      selectedSource = {
+        ...selectedSource,
         id: source.id,
         name: source.name,
         windowHandle: sourceHandle(source.id),
-        processId: selectedSource?.processId,
       };
       diagnostic("display-source-granted", {
         name: source.name,
@@ -1674,18 +1942,61 @@ app.whenReady().then(() => {
     }
   });
 
-  session.defaultSession.setPermissionCheckHandler((webContents, permission) => {
-    return (
-      isMainRenderer(webContents) &&
-      ["media", "display-capture", "fullscreen"].includes(permission)
-    );
+  session.defaultSession.setPermissionCheckHandler((webContents, permission, _origin, details) => {
+    if (!isMainRenderer(webContents)) return false;
+    if (permission === "fullscreen") return true;
+    if (permission === "display-capture") {
+      return captureActive || hasMediaPermissionIntent("display");
+    }
+    if (permission === "media") {
+      const mediaTypes = Array.isArray(details?.mediaTypes)
+        ? details.mediaTypes
+        : [];
+      if (mediaTypes.includes("audio")) {
+        if (hasMediaPermissionIntent("microphone")) {
+          microphonePermissionSessionActive = true;
+        }
+        return (
+          microphonePermissionSessionActive ||
+          hasMediaPermissionIntent("microphone")
+        );
+      }
+      return hasMediaPermissionIntent("display");
+    }
+    return false;
   });
 
-  session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
-    callback(
-      isMainRenderer(webContents) &&
-        ["media", "display-capture", "fullscreen"].includes(permission),
-    );
+  session.defaultSession.setPermissionRequestHandler((webContents, permission, callback, details) => {
+    if (!isMainRenderer(webContents)) {
+      callback(false);
+      return;
+    }
+    if (permission === "fullscreen") {
+      callback(true);
+      return;
+    }
+    if (permission === "display-capture") {
+      callback(
+        captureActive || consumeMediaPermissionIntent("display"),
+      );
+      return;
+    }
+    if (permission === "media") {
+      const mediaTypes = Array.isArray(details?.mediaTypes)
+        ? details.mediaTypes
+        : [];
+      if (mediaTypes.includes("audio")) {
+        const granted =
+          microphonePermissionSessionActive ||
+          consumeMediaPermissionIntent("microphone");
+        microphonePermissionSessionActive = granted;
+        callback(granted);
+      } else {
+        callback(consumeMediaPermissionIntent("display"));
+      }
+      return;
+    }
+    callback(false);
   });
 
   ipcMain.handle("capture:list-sources", async (event, options) => {
@@ -1789,6 +2100,7 @@ app.whenReady().then(() => {
         name: String(processInfo.processName || "音乐应用"),
         processId: requestedProcessId,
       };
+      grantMediaPermissionIntent("display", 8);
       diagnostic("capture-process-selected", {
         name: selectedSource.name,
         processId: requestedProcessId,
@@ -1816,17 +2128,21 @@ app.whenReady().then(() => {
       });
       throw new Error("窗口已经关闭，请重新选择");
     }
-      selectedSource = {
-        id: source.id,
-        name: source.name,
-        windowHandle: sourceHandle(source.id),
-        processId:
-          Number(
-            (
-              await inspectWindowProcesses([source.id])
-            ).get(sourceHandle(source.id))?.processId,
-          ) || undefined,
-      };
+    const selectedProcessInfo = (
+      await inspectWindowProcesses([source.id])
+    ).get(sourceHandle(source.id));
+    selectedSource = {
+      id: source.id,
+      name: source.name,
+      windowHandle: sourceHandle(source.id),
+      processId:
+        Number(selectedProcessInfo?.processId) || undefined,
+      processName: selectedProcessInfo?.processName,
+      executableName: selectedProcessInfo?.executableName,
+      className: selectedProcessInfo?.className,
+      ownerHandle: selectedProcessInfo?.ownerHandle,
+    };
+    grantMediaPermissionIntent("display", 8);
     diagnostic("capture-source-selected", {
         name: source.name,
         windowHandle: selectedSource.windowHandle,

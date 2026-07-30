@@ -54,31 +54,6 @@ export function isVerifiedEmergencyTrackSettings(
   );
 }
 
-async function constrainEmergencyTrack(
-  track: MediaStreamTrack,
-  requestedFrameRate = EMERGENCY_VIDEO_FPS,
-): Promise<boolean> {
-  try {
-    await track.applyConstraints({
-      width: {
-        ideal: EMERGENCY_VIDEO_WIDTH,
-        max: EMERGENCY_VIDEO_WIDTH,
-      },
-      height: {
-        ideal: EMERGENCY_VIDEO_HEIGHT,
-        max: EMERGENCY_VIDEO_HEIGHT,
-      },
-      frameRate: {
-        ideal: Math.min(EMERGENCY_VIDEO_FPS, requestedFrameRate),
-        max: Math.min(EMERGENCY_VIDEO_FPS, requestedFrameRate),
-      },
-    });
-  } catch {
-    return false;
-  }
-  return isVerifiedEmergencyTrackSettings(track.getSettings());
-}
-
 export interface SfuAccess {
   url: string;
   room: string;
@@ -90,6 +65,41 @@ export interface SfuPublishPreset {
   maxBitrate: number;
   frameRate: number;
   contentMode?: "detail" | "motion" | "balanced";
+}
+
+async function preparePrimaryScreenTrack(
+  track: MediaStreamTrack,
+  preset: SfuPublishPreset,
+): Promise<MediaTrackSettings> {
+  track.contentHint =
+    preset.contentMode === "motion" ? "motion" : "detail";
+  const settings = track.getSettings();
+  const sourceWidth = Math.max(1, Number(settings.width) || 2_560);
+  const sourceHeight = Math.max(1, Number(settings.height) || 1_440);
+  const sourceScale = Math.min(
+    1,
+    2_560 / sourceWidth,
+    1_440 / sourceHeight,
+  );
+  const cappedWidth = Math.max(1, Math.round(sourceWidth * sourceScale));
+  const cappedHeight = Math.max(1, Math.round(sourceHeight * sourceScale));
+  await track.applyConstraints({
+    width: { ideal: cappedWidth, max: 2_560 },
+    height: { ideal: cappedHeight, max: 1_440 },
+    frameRate: {
+      ideal: Math.min(30, preset.frameRate),
+      max: Math.min(30, preset.frameRate),
+    },
+  });
+  const actual = track.getSettings();
+  if (
+    (Number(actual.width) > 2_560) ||
+    (Number(actual.height) > 1_440) ||
+    (Number(actual.frameRate) > Math.min(30, preset.frameRate) + 0.5)
+  ) {
+    throw new Error("capture driver did not apply SFU screen constraints");
+  }
+  return actual;
 }
 
 export interface SfuScreenReceiverStats {
@@ -455,7 +465,8 @@ export class SfuSession {
   private pendingAccess?: SfuAccess;
   private publishedScreenTracks: MediaStreamTrack[] = [];
   private publishedScreenPublications: LocalTrackPublication[] = [];
-  private publishedScreenRoles: Array<"primary" | "emergency" | "audio"> = [];
+  private publishedScreenRoles: Array<"primary" | "audio"> = [];
+  private screenPublishPreset?: SfuPublishPreset;
   private localMediaTrack?: LocalDataTrack;
   private localControlTrack?: LocalDataTrack;
   private hostMediaChannel?: SfuRtcDataChannel;
@@ -649,29 +660,26 @@ export class SfuSession {
     const room = this.requireConnectedRoom();
     const publicationGeneration = ++this.publicationGeneration;
     await this.clearPublishedState();
+    this.screenPublishPreset = { ...preset };
     if (!this.isCurrentPublication(room, publicationGeneration)) {
       throw new DOMException("SFU publication was replaced", "AbortError");
     }
     const streamName = "synced-screen";
     const publicationSpecs: Array<{
       sourceTrack: MediaStreamTrack;
-      role: "primary" | "emergency" | "audio";
+      role: "primary" | "audio";
       name: string;
     }> = [];
     for (const sourceTrack of stream.getTracks()) {
       if (sourceTrack.kind === "video") {
-        publicationSpecs.push(
-          {
-            sourceTrack,
-            role: "primary",
-            name: SCREEN_VIDEO_TRACK,
-          },
-          {
-            sourceTrack,
-            role: "emergency",
-            name: SCREEN_VIDEO_EMERGENCY_TRACK,
-          },
-        );
+        // One simulcast publication owns all screen layers. A permanent
+        // cloned 480p publication made the capture driver encode a fourth
+        // stream even when no weak viewer existed.
+        publicationSpecs.push({
+          sourceTrack,
+          role: "primary",
+          name: SCREEN_VIDEO_TRACK,
+        });
       } else {
         publicationSpecs.push({
           sourceTrack,
@@ -684,47 +692,23 @@ export class SfuSession {
       const { sourceTrack, role } = spec;
       const track = sourceTrack.clone();
       if (role === "primary") {
-        track.contentHint =
-          preset.contentMode === "motion" ? "motion" : "detail";
-        const settings = sourceTrack.getSettings();
-        const sourceWidth = Math.max(1, settings.width || 2_560);
-        const sourceHeight = Math.max(1, settings.height || 1_440);
-        const sourceScale = Math.min(
-          1,
-          2_560 / sourceWidth,
-          1_440 / sourceHeight,
-        );
-        const cappedWidth = Math.max(1, Math.round(sourceWidth * sourceScale));
-        const cappedHeight = Math.max(
-          1,
-          Math.round(sourceHeight * sourceScale),
-        );
-        await track
-          .applyConstraints({
-            width: { ideal: cappedWidth, max: 2_560 },
-            height: { ideal: cappedHeight, max: 1_440 },
-            frameRate: {
-              ideal: Math.min(30, preset.frameRate),
-              max: Math.min(30, preset.frameRate),
-            },
-          })
-          .catch(() => undefined);
-      } else if (role === "emergency") {
-        track.contentHint =
-          preset.contentMode === "motion" ? "motion" : "detail";
-        if (!(await constrainEmergencyTrack(track, preset.frameRate))) {
+        try {
+          await preparePrimaryScreenTrack(track, preset);
+        } catch (error) {
           const actual = track.getSettings();
           track.stop();
           this.options.onDiagnostic?.(
-            "sfu-emergency-track-rejected",
+            "sfu-primary-track-rejected",
             {
-              reason: "capture-driver-did-not-apply-480p-constraints",
+              reason:
+                error instanceof Error ? error.message : String(error),
               width: actual.width,
               height: actual.height,
               frameRate: actual.frameRate,
             },
           );
-          continue;
+          await this.invalidatePublication(publicationGeneration);
+          throw error;
         }
       }
       const sourceHeight =
@@ -734,8 +718,8 @@ export class SfuSession {
       const explicitLayers =
         sourceHeight > 1_080
           ? [
+              new VideoPreset(854, 480, 2_200_000, 24),
               new VideoPreset(1_280, 720, 5_000_000, 30),
-              new VideoPreset(1_920, 1_080, 10_000_000, 30),
             ]
           : sourceHeight > 720
             ? [
@@ -766,18 +750,7 @@ export class SfuSession {
                     ? ("maintain-resolution" as const)
                     : ("balanced" as const),
             }
-          : role === "emergency"
-            ? {
-                videoCodec: "h264" as const,
-                simulcast: false,
-                screenShareSimulcastLayers: [],
-                screenShareEncoding: {
-                  maxBitrate: 2_200_000,
-                  maxFramerate: Math.min(24, preset.frameRate),
-                },
-                degradationPreference: "maintain-framerate" as const,
-              }
-            : {
+          : {
               forceStereo: true,
               dtx: false,
               red: true,
@@ -827,11 +800,8 @@ export class SfuSession {
       frameRate: Math.min(30, preset.frameRate),
       simulcastLayers: [
         "1440p",
-        "1080p",
         "720p",
-        ...(this.publishedScreenRoles.includes("emergency")
-          ? ["480p-emergency-verified"]
-          : ["primary-low-fallback"]),
+        "480p-dynacast-low",
       ],
       contentMode: preset.contentMode || "balanced",
     });
@@ -1270,27 +1240,11 @@ export class SfuSession {
 
   private screenPublicationDesired(
     publication: RemoteTrackPublication,
-    preference: SfuScreenSubscriptionPreference,
+    _preference: SfuScreenSubscriptionPreference,
   ): boolean {
     if (publication.source === Track.Source.ScreenShareAudio) return true;
     if (publication.source !== Track.Source.ScreenShare) return false;
-    const emergency =
-      publication.trackName === SCREEN_VIDEO_EMERGENCY_TRACK;
-    const participant = this.room?.remoteParticipants.get(
-      this.watchingBroadcasterId,
-    );
-    const emergencyAvailable = participant
-      ? [...participant.trackPublications.values()].some(
-          (candidate) =>
-            candidate.kind === Track.Kind.Video &&
-            candidate.source === Track.Source.ScreenShare &&
-            candidate.trackName === SCREEN_VIDEO_EMERGENCY_TRACK,
-        )
-      : false;
-    return (
-      emergency ===
-      (this.screenWantsEmergency(preference) && emergencyAvailable)
-    );
+    return publication.trackName === SCREEN_VIDEO_TRACK;
   }
 
   private screenWantsEmergency(
@@ -1447,7 +1401,17 @@ export class SfuSession {
       this.room?.remoteParticipants
         .get(watchedIdentity)
         ?.trackPublications.forEach((publication) => {
-          publication.setSubscribed(false);
+          if (
+            (publication.source === Track.Source.ScreenShare &&
+              [
+                SCREEN_VIDEO_TRACK,
+                SCREEN_VIDEO_EMERGENCY_TRACK,
+              ].includes(publication.trackName)) ||
+            (publication.source === Track.Source.ScreenShareAudio &&
+              publication.trackName === SCREEN_AUDIO_TRACK)
+          ) {
+            publication.setSubscribed(false);
+          }
         });
     }
     this.viewerMediaChannel?.close();
@@ -1472,6 +1436,7 @@ export class SfuSession {
     this.localControlTrack = undefined;
     const room = this.room;
     const publications = this.publishedScreenPublications.splice(0);
+    this.screenPublishPreset = undefined;
     this.publishedScreenRoles.splice(0);
     this.publishedScreenTracks.splice(0).forEach((track) => track.stop());
     await Promise.all([
@@ -1576,26 +1541,34 @@ export class SfuSession {
   async replacePublishedScreenTrack(
     sourceTrack: MediaStreamTrack,
   ): Promise<boolean> {
-    const room = this.requireConnectedRoom();
+    this.requireConnectedRoom();
     const indexes = this.publishedScreenPublications
       .map((publication, index) =>
         publication.track?.kind === sourceTrack.kind ? index : -1,
       )
       .filter((index) => index >= 0);
     if (!indexes.length) return false;
-    const rejectedEmergencyIndexes: number[] = [];
+    const preset = this.screenPublishPreset;
     await Promise.all(
       indexes.map(async (index) => {
         const publication = this.publishedScreenPublications[index];
         const localTrack = publication?.track;
         if (!localTrack) return;
         const replacement = sourceTrack.clone();
-        if (this.publishedScreenRoles[index] === "emergency") {
-          if (!(await constrainEmergencyTrack(replacement))) {
+        if (
+          this.publishedScreenRoles[index] === "primary" &&
+          sourceTrack.kind === "video"
+        ) {
+          if (!preset) {
             replacement.stop();
-            rejectedEmergencyIndexes.push(index);
-            return;
+            throw new Error("SFU screen publication preset is unavailable");
           }
+          await preparePrimaryScreenTrack(replacement, preset).catch(
+            (error) => {
+              replacement.stop();
+              throw error;
+            },
+          );
         }
         try {
           await withTimeout(
@@ -1612,31 +1585,42 @@ export class SfuSession {
         const previous = this.publishedScreenTracks[index];
         this.publishedScreenTracks[index] = replacement;
         if (previous && previous !== replacement) previous.stop();
+        if (
+          this.publishedScreenRoles[index] === "primary" &&
+          sourceTrack.kind === "video"
+        ) {
+          const sender = publication.videoTrack?.sender;
+          const parameters = sender?.getParameters();
+          if (sender && parameters?.encodings?.length && preset) {
+            parameters.encodings = parameters.encodings.map(
+              (encoding, encodingIndex, encodings) => ({
+                ...encoding,
+                maxFramerate: Math.min(30, preset.frameRate),
+                ...(encodingIndex === encodings.length - 1
+                  ? { maxBitrate: Math.max(500_000, preset.maxBitrate) }
+                  : {}),
+              }),
+            );
+            await sender.setParameters(parameters);
+          }
+          const outbound = await publication.videoTrack
+            ?.getSenderStats()
+            .catch(() => []);
+          this.options.onDiagnostic?.("sfu-screen-track-verified", {
+            settings: replacement.getSettings(),
+            contentHint: replacement.contentHint,
+            encodings: parameters?.encodings?.map((encoding) => ({
+              rid: encoding.rid,
+              maxBitrate: encoding.maxBitrate,
+              maxFramerate: encoding.maxFramerate,
+              scaleResolutionDownBy: encoding.scaleResolutionDownBy,
+              active: encoding.active,
+            })),
+            outbound,
+          });
+        }
       }),
     );
-    for (const index of rejectedEmergencyIndexes.sort(
-      (left, right) => right - left,
-    )) {
-      const publication = this.publishedScreenPublications[index];
-      const previous = this.publishedScreenTracks[index];
-      if (publication) {
-        await this.discardScreenPublication(
-          room,
-          publication,
-          "invalid emergency track cleanup timed out",
-        );
-      }
-      previous?.stop();
-      this.publishedScreenTracks.splice(index, 1);
-      this.publishedScreenPublications.splice(index, 1);
-      this.publishedScreenRoles.splice(index, 1);
-    }
-    if (rejectedEmergencyIndexes.length) {
-      this.options.onDiagnostic?.("sfu-emergency-track-rejected", {
-        reason: "replacement-track-did-not-apply-480p-constraints",
-        publications: rejectedEmergencyIndexes.length,
-      });
-    }
     this.options.onDiagnostic?.("sfu-screen-track-replaced", {
       kind: sourceTrack.kind,
       trackId: sourceTrack.id,

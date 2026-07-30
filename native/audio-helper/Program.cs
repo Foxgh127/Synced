@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.Marshalling;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using NAudio.CoreAudioApi;
@@ -36,6 +37,8 @@ internal sealed class WindowProcessPayload
     public uint? ProcessId { get; init; }
     public string? ProcessName { get; init; }
     public string? ExecutableName { get; init; }
+    public string? ClassName { get; init; }
+    public string? OwnerHandle { get; init; }
 }
 
 internal sealed class WindowProcessBatchPayload
@@ -176,6 +179,16 @@ internal static class Program
 
     [DllImport("user32.dll")]
     private static extern nint GetForegroundWindow();
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetClassName(
+        nint windowHandle,
+        StringBuilder className,
+        int maximumCount
+    );
+
+    [DllImport("user32.dll")]
+    private static extern nint GetWindow(nint windowHandle, uint command);
 
     private static async Task<int> Main(string[] args)
     {
@@ -445,6 +458,27 @@ internal static class Program
 
             string? processName = null;
             string? executableName = null;
+            string? className = null;
+            string? ownerHandle = null;
+            var classNameBuffer = new StringBuilder(256);
+            if (
+                GetClassName(
+                    windowHandle,
+                    classNameBuffer,
+                    classNameBuffer.Capacity
+                ) > 0
+            )
+            {
+                className = classNameBuffer.ToString();
+            }
+            var ownerWindow = GetWindow(windowHandle, 4);
+            if (ownerWindow != nint.Zero)
+            {
+                ownerHandle = ownerWindow.ToString(
+                    "X",
+                    CultureInfo.InvariantCulture
+                );
+            }
             try
             {
                 using var process = Process.GetProcessById(
@@ -486,6 +520,8 @@ internal static class Program
                     ProcessId = processId,
                     ProcessName = processName,
                     ExecutableName = executableName,
+                    ClassName = className,
+                    OwnerHandle = ownerHandle,
                 }
             );
         }

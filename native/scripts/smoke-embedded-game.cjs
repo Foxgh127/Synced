@@ -24,8 +24,8 @@ async function main() {
     pathToFileURL(path.join(root, "server", "index.mjs")).href
   );
   const signalServer = createSignalServer();
-  const signalAddress = await signalServer.listen(0, "127.0.0.1");
-  const signalUrl = `ws://127.0.0.1:${signalAddress.port}/signal`;
+  await signalServer.listen(8_787, "127.0.0.1");
+  const signalUrl = "ws://localhost:8787/signal";
   await app.whenReady();
   const mainWindow = await waitFor(() =>
     BrowserWindow.getAllWindows().find(

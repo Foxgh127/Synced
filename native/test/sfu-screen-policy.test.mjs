@@ -165,6 +165,26 @@ test("one weak viewer degrades within two seconds without changing peers", async
     },
     3_000,
   );
+  viewers[2].observe(
+    {
+      connectionState: "connected",
+      packetLossRatio: 0,
+      currentRoundTripTime: 0.15,
+      baselineRoundTripTime: 0.15,
+      availableBandwidthBps: 25_000_000,
+    },
+    4_000,
+  );
+  viewers[2].observe(
+    {
+      connectionState: "connected",
+      packetLossRatio: 0,
+      currentRoundTripTime: 0.15,
+      baselineRoundTripTime: 0.15,
+      availableBandwidthBps: 25_000_000,
+    },
+    5_000,
+  );
   const recovered = viewers[2].observe(
     {
       connectionState: "connected",
@@ -173,7 +193,7 @@ test("one weak viewer degrades within two seconds without changing peers", async
       baselineRoundTripTime: 0.15,
       availableBandwidthBps: 25_000_000,
     },
-    23_000,
+    25_000,
   );
   assert.equal(recovered.direction, "up");
   assert.equal(viewers[2].requestedHeight, undefined);

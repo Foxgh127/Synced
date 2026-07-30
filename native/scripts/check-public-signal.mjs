@@ -62,7 +62,7 @@ function turnUsernames(iceServers) {
 
 function connect(label) {
   return new Promise((resolve, reject) => {
-    const socket = new WebSocket(url);
+    const socket = new WebSocket(url, { origin: "file://" });
     const queue = [];
     const waiters = [];
     const recentTypes = [];

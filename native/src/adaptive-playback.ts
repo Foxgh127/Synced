@@ -38,6 +38,7 @@ export interface AdaptiveQualityDecision {
 
 export interface AdaptivePlaybackOptions {
   contentMode?: ScreenContentMode;
+  sourceWidth?: number;
   sourceFrameRate?: number;
   minimumUpgradeStableMs?: number;
   maximumUpgradeStableMs?: number;
@@ -55,6 +56,7 @@ const POST_UPGRADE_HOLD_MS = 20_000;
 const NORMAL_DEGRADE_SCORE = 3;
 const DEGRADE_COOLDOWN_MS = 1_500;
 const UPGRADE_BANDWIDTH_HEADROOM = 1.5;
+const MINIMUM_CONFIDENT_STABLE_SAMPLES = 3;
 
 function monotonicNow(): number {
   return typeof performance !== "undefined" &&
@@ -64,41 +66,55 @@ function monotonicNow(): number {
 }
 
 function boundedFrameRate(value: number | undefined, fallback = 30): number {
-  return Math.max(1, Math.min(120, Math.round(value || fallback)));
+  return Math.max(1, Math.min(30, Math.round(value || fallback)));
 }
 
-function targetBitrate(height: number, frameRate: number): number {
-  const pixelsAt30 = Math.max(1, height) ** 2 * (16 / 9) * 30;
+function targetBitrate(
+  width: number,
+  height: number,
+  frameRate: number,
+): number {
   const reference =
     height >= 1_440
-      ? 13_500_000
+      ? { bitrate: 13_500_000, width: 2_560, height: 1_440 }
       : height >= 1_080
-        ? 7_000_000
+        ? { bitrate: 7_000_000, width: 1_920, height: 1_080 }
         : height >= 720
-          ? 3_200_000
-          : 1_500_000;
-  const referencePixels = Math.max(1, height) ** 2 * (16 / 9) * 30;
+          ? { bitrate: 3_200_000, width: 1_280, height: 720 }
+          : { bitrate: 1_500_000, width: 854, height: 480 };
+  const actualPixels = Math.max(1, width) * Math.max(1, height);
+  const referencePixels = reference.width * reference.height;
   return Math.round(
-    reference *
-      Math.max(0.55, Math.min(2, pixelsAt30 / referencePixels)) *
+    reference.bitrate *
+      Math.max(0.4, Math.min(4, actualPixels / referencePixels)) *
       Math.max(0.5, Math.min(2, frameRate / 30)),
   );
 }
 
 function createRung(
+  sourceWidth: number,
   sourceHeight: number,
   height: number | undefined,
   frameRate: number,
 ): QualityRung {
   const effectiveHeight = height || sourceHeight;
+  const effectiveWidth = Math.max(
+    1,
+    Math.round(sourceWidth * (effectiveHeight / sourceHeight)),
+  );
   return {
     height,
     frameRate,
-    targetBitrateBps: targetBitrate(effectiveHeight, frameRate),
+    targetBitrateBps: targetBitrate(
+      effectiveWidth,
+      effectiveHeight,
+      frameRate,
+    ),
   };
 }
 
 function buildQualityLadder(
+  sourceWidth: number,
   sourceHeight: number,
   ceilingHeight: number,
   sourceFrameRate: number,
@@ -152,12 +168,24 @@ function buildQualityLadder(
       continue;
     }
     ladder.push(
-      createRung(source, height, boundedFrameRate(candidateFrameRate)),
+      createRung(
+        sourceWidth,
+        source,
+        height,
+        boundedFrameRate(candidateFrameRate),
+      ),
     );
   }
   return ladder.length
     ? ladder
-    : [createRung(source, originalHeight, Math.min(sourceRate, 30))];
+    : [
+        createRung(
+          sourceWidth,
+          source,
+          originalHeight,
+          Math.min(sourceRate, 30),
+        ),
+      ];
 }
 
 function classifyPressure(sample: AdaptiveNetworkSample): {
@@ -165,6 +193,7 @@ function classifyPressure(sample: AdaptiveNetworkSample): {
   poor: boolean;
   severe: boolean;
   stable: boolean;
+  telemetryConfident: boolean;
   reason?: string;
 } {
   const loss = sample.packetLossRatio;
@@ -224,8 +253,39 @@ function classifyPressure(sample: AdaptiveNetworkSample): {
     renderLimited ||
     encoderLimited ||
     networkLimited;
-  const stable =
+  const availableMetrics = [
+    loss,
+    jitter,
+    freeze,
+    dropped,
+    decodeLoad,
+    renderLoad,
+    sample.availableBandwidthBps,
+    sample.currentRoundTripTime,
+    sample.bufferDebtSeconds,
+    sample.transportProgressAgeMs,
+  ].filter((value) => value !== undefined && Number.isFinite(value)).length;
+  const availableHealthMetrics = [
+    loss,
+    jitter,
+    freeze,
+    dropped,
+    decodeLoad,
+    renderLoad,
+    sample.bufferDebtSeconds,
+    sample.transportProgressAgeMs,
+  ].filter((value) => value !== undefined && Number.isFinite(value)).length;
+  // A connected state by itself is not media telemetry. Require at least two
+  // independently populated stats, including an actual loss, playback, or
+  // media-progress health signal, before a sample can advance an upgrade
+  // window. Bandwidth plus RTT alone cannot manufacture a healthy sample when
+  // all loss/decode/render measurements are absent.
+  const telemetryConfident =
     sample.connectionState === "connected" &&
+    availableMetrics >= 2 &&
+    availableHealthMetrics >= 1;
+  const stable =
+    telemetryConfident &&
     (loss === undefined || loss <= 0.01) &&
     (jitter === undefined || jitter <= 0.04) &&
     (freeze === undefined || freeze <= 0.04) &&
@@ -242,6 +302,7 @@ function classifyPressure(sample: AdaptiveNetworkSample): {
       poor,
       severe,
       stable,
+      telemetryConfident,
       reason: "媒体传输已停止推进",
     };
   }
@@ -251,6 +312,7 @@ function classifyPressure(sample: AdaptiveNetworkSample): {
       poor,
       severe,
       stable,
+      telemetryConfident,
       reason: "接收设备解码压力过高",
     };
   }
@@ -260,6 +322,7 @@ function classifyPressure(sample: AdaptiveNetworkSample): {
       poor,
       severe,
       stable,
+      telemetryConfident,
       reason: "接收设备渲染压力过高",
     };
   }
@@ -269,6 +332,7 @@ function classifyPressure(sample: AdaptiveNetworkSample): {
       poor,
       severe,
       stable,
+      telemetryConfident,
       reason: "放映端编码器持续过载",
     };
   }
@@ -278,6 +342,7 @@ function classifyPressure(sample: AdaptiveNetworkSample): {
       poor,
       severe,
       stable,
+      telemetryConfident,
       reason: severe ? "网络出现明显波动" : "持续丢包、抖动或带宽不足",
     };
   }
@@ -286,6 +351,10 @@ function classifyPressure(sample: AdaptiveNetworkSample): {
     poor,
     severe,
     stable,
+    telemetryConfident,
+    ...(!telemetryConfident
+      ? { reason: "媒体统计样本不足，暂不升档" }
+      : {}),
   };
 }
 
@@ -302,6 +371,7 @@ export class AdaptivePlaybackController {
   private level = 0;
   private poorScore = 0;
   private stableSince: number | undefined;
+  private confidentStableSamples = 0;
   private lastChangeAt = Number.NEGATIVE_INFINITY;
   private lastUpgradeAt = Number.NEGATIVE_INFINITY;
   private upgradeFailures = 0;
@@ -333,6 +403,12 @@ export class AdaptivePlaybackController {
       ),
     );
     this.ladder = buildQualityLadder(
+      Math.max(
+        1,
+        Math.round(
+          options.sourceWidth || this.sourceHeight * (16 / 9),
+        ),
+      ),
       this.sourceHeight,
       ceilingHeight,
       boundedFrameRate(options.sourceFrameRate),
@@ -395,6 +471,7 @@ export class AdaptivePlaybackController {
   resetSamples(): void {
     this.poorScore = 0;
     this.stableSince = undefined;
+    this.confidentStableSamples = 0;
   }
 
   forceDegrade(
@@ -440,12 +517,20 @@ export class AdaptivePlaybackController {
     if (classification.poor) {
       this.poorScore += classification.severe ? NORMAL_DEGRADE_SCORE : 1;
       this.stableSince = undefined;
+      this.confidentStableSamples = 0;
     } else if (classification.stable) {
       this.poorScore = Math.max(0, this.poorScore - 1);
-      this.stableSince ??= now;
+      this.confidentStableSamples += 1;
+      if (
+        this.confidentStableSamples >=
+        MINIMUM_CONFIDENT_STABLE_SAMPLES
+      ) {
+        this.stableSince ??= now;
+      }
     } else {
       this.poorScore = Math.max(0, this.poorScore - 0.5);
       this.stableSince = undefined;
+      this.confidentStableSamples = 0;
     }
 
     const postUpgradeHold =
@@ -453,8 +538,7 @@ export class AdaptivePlaybackController {
     if (
       this.poorScore >= NORMAL_DEGRADE_SCORE &&
       this.level < this.ladder.length - 1 &&
-      now - this.lastChangeAt >= DEGRADE_COOLDOWN_MS &&
-      (!postUpgradeHold || classification.severe)
+      now - this.lastChangeAt >= DEGRADE_COOLDOWN_MS
     ) {
       if (postUpgradeHold) {
         this.upgradeFailures = Math.min(3, this.upgradeFailures + 1);

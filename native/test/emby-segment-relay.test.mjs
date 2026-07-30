@@ -573,6 +573,9 @@ test("ABR never appends across a manifest timeline hole and resumes when the mis
     },
     applySubtitle() {},
     markEnded() {},
+    validateRecoveryAppend(_mimeType, init, media) {
+      return init.byteLength > 0 && media.byteLength > 0;
+    },
   };
   const client = new EmbyAbrSegmentClient({
     player,
@@ -774,6 +777,9 @@ test("three relay failures request media fallback and three healthy probes annou
     appendFragment() {},
     applySubtitle() {},
     markEnded() {},
+    validateRecoveryAppend(_mimeType, init, media) {
+      return init.byteLength > 0 && media.byteLength > 0;
+    },
   };
   client = new EmbyAbrSegmentClient({
     player,
@@ -796,11 +802,20 @@ test("three relay failures request media fallback and three healthy probes annou
           headers: { etag: '"fallback-ready"' },
         });
       }
-      if (
-        options.method === "HEAD" &&
-        pathname.endsWith("/segments/1.m4s")
-      ) {
-        return new Response(null, { status: 200 });
+      if (pathname.endsWith("/init.mp4")) {
+        return new Response(Uint8Array.of(0, 0, 0, 1), {
+          status: 200,
+          headers: { "content-type": "video/mp4" },
+        });
+      }
+      if (pathname.endsWith("/segments/1.m4s")) {
+        return new Response(Uint8Array.of(1), {
+          status: 206,
+          headers: {
+            "content-type": "video/iso.segment",
+            "content-range": "bytes 0-0/1",
+          },
+        });
       }
       return new Response(null, { status: 404 });
     },
