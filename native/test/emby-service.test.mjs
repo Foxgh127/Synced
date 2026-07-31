@@ -436,6 +436,13 @@ test("discovers the official /emby API base and paginates resumable items", asyn
               PlayedPercentage: 33.3,
             },
           },
+          {
+            Id: "episode-62",
+            ParentId: "season-2",
+            Name: "父级海报",
+            Type: "Episode",
+            ParentPrimaryImageTag: "season-poster-tag",
+          },
         ],
       });
     } else if (url.pathname === "/emby/Sessions/Logout") {
@@ -472,6 +479,8 @@ test("discovers the official /emby API base and paginates resumable items", asyn
     assert.equal(itemQuery.get("SortBy"), "DatePlayed,DateCreated");
     assert.equal(itemQuery.get("EnableUserData"), "true");
     assert.equal(result.items[0].imageItemId, "series-1");
+    assert.equal(result.items[1].imageItemId, "season-2");
+    assert.equal(result.items[1].imageTag, "season-poster-tag");
     assert.equal(result.items[0].playbackPositionTicks, 6_000_000_000);
     assert.equal(result.items[0].playedPercentage, 33.3);
   } finally {

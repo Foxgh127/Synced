@@ -38,7 +38,7 @@ function healthyPolicy(overrides = {}) {
   };
 }
 
-test("spatial enhancement activates only for useful Emby viewer scaling", async () => {
+test("4K enhancement activates only for useful Emby viewer scaling", async () => {
   const { evaluateVideoEnhancementPolicy } = await loadModule();
   const active = evaluateVideoEnhancementPolicy(healthyPolicy());
   assert.equal(active.active, true);
@@ -56,7 +56,7 @@ test("spatial enhancement activates only for useful Emby viewer scaling", async 
     evaluateVideoEnhancementPolicy(
       healthyPolicy({ outputWidth: 1_920, outputHeight: 1_080 }),
     ).reason,
-    "output-too-small",
+    "scale-too-small",
   );
   assert.equal(
     evaluateVideoEnhancementPolicy(
@@ -68,13 +68,19 @@ test("spatial enhancement activates only for useful Emby viewer scaling", async 
     evaluateVideoEnhancementPolicy(healthyPolicy({ hdr: true })).reason,
     "hdr-unsupported",
   );
+  assert.equal(
+    evaluateVideoEnhancementPolicy(
+      healthyPolicy({ hdr: true, hdrBackendSupported: true }),
+    ).reason,
+    "active",
+  );
 });
 
 test("GPU, decoder, and cooldown pressure terminate enhancement", async () => {
   const { evaluateVideoEnhancementPolicy } = await loadModule();
   assert.equal(
     evaluateVideoEnhancementPolicy(
-      healthyPolicy({ renderP95Ms: 14.01 }),
+      healthyPolicy({ renderP95Ms: 22.01 }),
     ).reason,
     "render-budget",
   );
@@ -96,6 +102,66 @@ test("GPU, decoder, and cooldown pressure terminate enhancement", async () => {
     ).reason,
     "cooldown",
   );
+});
+
+test("4K targets preserve the viewport aspect ratio and even dimensions", async () => {
+  const { target4kDimensions } = await loadModule();
+  assert.deepEqual(target4kDimensions(16, 9), {
+    width: 3_840,
+    height: 2_160,
+  });
+  assert.deepEqual(target4kDimensions(4, 3), {
+    width: 2_880,
+    height: 2_160,
+  });
+  const ultraWide = target4kDimensions(21, 9);
+  assert.equal(ultraWide.width, 3_840);
+  assert.equal(ultraWide.width % 2, 0);
+  assert.equal(ultraWide.height % 2, 0);
+  assert.ok(Math.abs(ultraWide.width / ultraWide.height - 21 / 9) < 0.002);
+});
+
+test("RTX hardware detection is reflected in negotiated capabilities", async () => {
+  const {
+    detectVideoEnhancementCapabilities,
+    rememberVideoEnhancementHardwareInfo,
+  } = await loadModule();
+  rememberVideoEnhancementHardwareInfo({
+    deviceName: "NVIDIA GeForce RTX 5060 Laptop GPU",
+    driverVersion: "32.0.16.1074",
+    driverRelease: 610,
+    activeGpuIsNvidia: true,
+    rtxGpu: true,
+    hardwareVideoDecode: true,
+    videoDecodeStatus: "enabled",
+    rtxVideoSupported: true,
+    rtxVideoDriverState: "enabled",
+    rtxVideoDriverQuality: 4,
+    onBatteryPower: false,
+  });
+  assert.deepEqual(detectVideoEnhancementCapabilities().backends, [
+    "rtx-video",
+  ]);
+});
+
+test("unconfirmed NVIDIA driver VSR never suppresses deterministic 4K fallback", async () => {
+  const {
+    detectVideoEnhancementCapabilities,
+    rememberVideoEnhancementHardwareInfo,
+  } = await loadModule();
+  rememberVideoEnhancementHardwareInfo({
+    deviceName: "NVIDIA GeForce RTX 5060 Laptop GPU",
+    driverVersion: "32.0.16.1074",
+    driverRelease: 610,
+    activeGpuIsNvidia: true,
+    rtxGpu: true,
+    hardwareVideoDecode: true,
+    videoDecodeStatus: "enabled",
+    rtxVideoSupported: true,
+    rtxVideoDriverState: "unknown",
+    onBatteryPower: false,
+  });
+  assert.deepEqual(detectVideoEnhancementCapabilities().backends, []);
 });
 
 test("p95 calculation is deterministic and rejects invalid samples", async () => {

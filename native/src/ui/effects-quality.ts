@@ -17,10 +17,10 @@ export interface AppearancePreferences {
 }
 
 const DEFAULTS: AppearancePreferences = {
-  effects: "auto",
-  motion: "system",
+  effects: "full",
+  motion: "full",
   transparency: "auto",
-  ambient: "auto",
+  ambient: "on",
   highContrast: false,
 };
 const STORAGE_KEY = "synced:appearance-v3";
@@ -60,22 +60,7 @@ function readPreferences(): AppearancePreferences {
   try {
     const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
     return {
-      effects:
-        parsed.effects === "full" ||
-        parsed.effects === "balanced" ||
-        parsed.effects === "minimal"
-          ? parsed.effects
-          : "auto",
-      motion:
-        parsed.motion === "full" || parsed.motion === "reduced"
-          ? parsed.motion
-          : "system",
-      transparency:
-        parsed.transparency === "reduced" ? "reduced" : "auto",
-      ambient:
-        parsed.ambient === "on" || parsed.ambient === "off"
-          ? parsed.ambient
-          : "auto",
+      ...DEFAULTS,
       highContrast: parsed.highContrast === true,
     };
   } catch {
@@ -122,6 +107,10 @@ export class EffectsQualityController extends EventTarget {
 
   async start(): Promise<void> {
     document.documentElement.dataset.uiVersion = UI_VERSION;
+    // Apply the full visual profile synchronously so the home star field and
+    // first view transition cannot miss their initialization window while
+    // resource telemetry is still starting.
+    this.apply();
     this.budget.addEventListener(
       "change",
       (event) => {
@@ -180,9 +169,8 @@ export class EffectsQualityController extends EventTarget {
       this.gpuTier,
     );
     const reduceMotion =
-      this.preferences.motion === "reduced" ||
-      (this.preferences.motion === "system" &&
-        this.reducedMotion.matches);
+      this.reducedMotion.matches ||
+      this.preferences.motion === "reduced";
     const reduceTransparency =
       this.preferences.transparency === "reduced" ||
       this.reducedTransparency.matches ||

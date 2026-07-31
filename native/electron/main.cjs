@@ -5,6 +5,7 @@ const {
   desktopCapturer,
   ipcMain,
   MessageChannelMain,
+  powerMonitor,
   powerSaveBlocker,
   protocol,
   safeStorage,
@@ -21,6 +22,7 @@ const { randomUUID } = require("crypto");
 const { AudioPacketDecoder } = require("./audio-packet.cjs");
 const { EmbyAccountManager } = require("./emby-account-manager.cjs");
 const { EmbyService } = require("./emby-service.cjs");
+const { readNvidiaVsrState } = require("./nvidia-video-state.cjs");
 
 let mainWindow;
 let selectedSource;
@@ -330,6 +332,13 @@ if (!smokeTest && !e2eTest && !app.requestSingleInstanceLock()) {
 }
 
 app.commandLine.appendSwitch("autoplay-policy", "no-user-gesture-required");
+// Chromium's Windows video presentation path can call NVIDIA's D3D11 video
+// processor super-resolution extension directly. Prefer the discrete adapter
+// so RTX Video is not silently bypassed by the integrated GPU on hybrid
+// laptops. Chromium still turns the expensive VP enhancement off on battery.
+if (process.platform === "win32") {
+  app.commandLine.appendSwitch("force-high-performance-gpu");
+}
 // A portable desktop application is allowed to reveal its physical LAN
 // candidate to the invited peers. mDNS host names are frequently not
 // resolvable between Android WebView and Windows on consumer routers.
@@ -344,6 +353,127 @@ app.commandLine.appendSwitch(
   "force-webrtc-ip-handling-policy",
   "default",
 );
+
+let videoEnhancementHardwarePromise;
+
+function nvidiaDriverRelease(driverVersion) {
+  const parts = String(driverVersion || "")
+    .split(".")
+    .map((part) => Number.parseInt(part, 10))
+    .filter(Number.isFinite);
+  if (parts.length >= 4) {
+    const branch = parts.at(-2) % 10;
+    const build = parts.at(-1);
+    return branch * 100 + Math.floor(build / 100);
+  }
+  if (parts.length >= 2 && parts[0] >= 100) {
+    return parts[0];
+  }
+  return undefined;
+}
+
+function isNvidiaGpu(device) {
+  const vendorId =
+    typeof device?.vendorId === "string"
+      ? Number.parseInt(device.vendorId.replace(/^0x/i, ""), 16)
+      : Number(device?.vendorId);
+  return (
+    vendorId === 0x10de ||
+    /nvidia/i.test(
+      `${device?.vendorString || ""} ${device?.deviceString || ""}`,
+    )
+  );
+}
+
+function isRtxGpu(device) {
+  return /\b(?:geforce\s+)?(?:nvidia\s+)?rtx(?:\s+a)?\s*\d{3,4}\b/i.test(
+    `${device?.vendorString || ""} ${device?.deviceString || ""}`,
+  );
+}
+
+async function videoEnhancementHardwareInfo() {
+  if (!videoEnhancementHardwarePromise) {
+    videoEnhancementHardwarePromise = app
+      .getGPUInfo("complete")
+      .then((gpuInfo) => {
+        const devices = Array.isArray(gpuInfo?.gpuDevice)
+          ? gpuInfo.gpuDevice
+          : [];
+        const activeDevice =
+          devices.find((device) => device?.active === true) || devices[0];
+        const nvidiaDevice =
+          devices.find(
+            (device) => device?.active === true && isNvidiaGpu(device),
+          ) || devices.find(isNvidiaGpu);
+        const driverVersion = String(
+          nvidiaDevice?.driverVersion || activeDevice?.driverVersion || "",
+        );
+        const driverRelease = nvidiaDriverRelease(driverVersion);
+        const gpuFeatureStatus = app.getGPUFeatureStatus();
+        const videoDecodeStatus = String(
+          gpuFeatureStatus?.video_decode || "unknown",
+        );
+        const activeGpuIsNvidia = Boolean(
+          activeDevice && isNvidiaGpu(activeDevice),
+        );
+        const rtxGpu = Boolean(nvidiaDevice && isRtxGpu(nvidiaDevice));
+        const driverSupported =
+          driverRelease !== undefined && driverRelease >= 530;
+        return {
+          deviceName: String(
+            nvidiaDevice?.deviceString ||
+              activeDevice?.deviceString ||
+              "未知 GPU",
+          ),
+          driverVersion,
+          driverRelease,
+          activeGpuIsNvidia,
+          rtxGpu,
+          hardwareVideoDecode: videoDecodeStatus === "enabled",
+          videoDecodeStatus,
+          // Electron 43's bundled Chromium contains the Windows D3D11
+          // ToggleNvidiaVpSuperResolution path. Driver 530+ is Chromium's
+          // minimum allow-list for the video-processor implementation.
+          rtxVideoSupported:
+            process.platform === "win32" &&
+            rtxGpu &&
+            activeGpuIsNvidia &&
+            driverSupported &&
+            videoDecodeStatus === "enabled",
+        };
+      })
+      .catch((error) => {
+        videoEnhancementHardwarePromise = undefined;
+        return {
+          deviceName: "GPU 检测失败",
+          driverVersion: "",
+          driverRelease: undefined,
+          activeGpuIsNvidia: false,
+          rtxGpu: false,
+          hardwareVideoDecode: false,
+          videoDecodeStatus: "unknown",
+          rtxVideoSupported: false,
+          error: error instanceof Error ? error.message : String(error),
+        };
+      });
+  }
+  const hardware = await videoEnhancementHardwarePromise;
+  const nvidiaVsr =
+    process.platform === "win32" && hardware.rtxVideoSupported
+      ? readNvidiaVsrState()
+      : { state: "unknown" };
+  return {
+    ...hardware,
+    // NVIDIA does not expose the Control Panel VSR switch through public
+    // NVAPI. Only claim the native driver path when NVIDIA App has recently
+    // confirmed it; unknown or disabled states use our deterministic 4K GPU
+    // reconstruction instead of showing an "active" label for a driver no-op.
+    rtxVideoDriverState: nvidiaVsr.state,
+    rtxVideoDriverQuality: nvidiaVsr.quality,
+    onBatteryPower:
+      process.platform === "win32" && powerMonitor.isOnBatteryPower(),
+  };
+}
 
 function initialiseDiagnosticLog() {
   try {
@@ -866,7 +996,9 @@ function createWindow() {
         return {
           desktopBridge: Boolean(window.roomDesktop),
           roleButtons: document.querySelectorAll("[data-desktop-role]").length,
-          title: document.title
+          title: document.title,
+          videoEnhancement:
+            await window.roomDesktop?.getVideoEnhancementInfo?.()
         };
       })()`);
       const smokeView = process.env.SYNCED_SMOKE_VIEW;
@@ -2004,6 +2136,17 @@ app.whenReady().then(() => {
   screen.on("display-added", updateOverlayBounds);
   screen.on("display-removed", updateOverlayBounds);
   screen.on("display-metrics-changed", updateOverlayBounds);
+  const broadcastVideoEnhancementHardware = () => {
+    void videoEnhancementHardwareInfo().then((info) => {
+      if (!mainWindow || mainWindow.isDestroyed()) return;
+      mainWindow.webContents.send(
+        "system:video-enhancement-info-changed",
+        info,
+      );
+    });
+  };
+  powerMonitor.on("on-ac", broadcastVideoEnhancementHardware);
+  powerMonitor.on("on-battery", broadcastVideoEnhancementHardware);
   const embyServiceOptions = {
     version: app.getVersion(),
     deviceId: persistentEmbyDeviceId(),
@@ -2420,6 +2563,10 @@ app.whenReady().then(() => {
         depthPerComponent > 8 ||
         /BT2020|PQ|HLG|SCRGB/i.test(colorSpace),
     };
+  });
+  ipcMain.handle("system:get-video-enhancement-info", async (event) => {
+    assertMainRenderer(event);
+    return videoEnhancementHardwareInfo();
   });
   ipcMain.handle("system:open-display-settings", (event) => {
     assertMainRenderer(event);

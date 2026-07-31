@@ -16,6 +16,7 @@ import {
   resolveSfuScreenSubscription,
   type SfuScreenSubscriptionPreference,
 } from "./sfu-screen-policy";
+import { safeVideoEncodingTarget } from "./capture-resolution";
 
 export type { SfuScreenSubscriptionPreference } from "./sfu-screen-policy";
 
@@ -31,7 +32,7 @@ const SFU_DATA_OUTSTANDING_BYTES = 8 * 1024 * 1024;
 const SCREEN_VIDEO_TRACK = "synced-screen-video";
 const SCREEN_VIDEO_EMERGENCY_TRACK = "synced-screen-video-emergency";
 const SCREEN_AUDIO_TRACK = "synced-screen-audio";
-const EMERGENCY_VIDEO_WIDTH = 854;
+const EMERGENCY_VIDEO_WIDTH = 848;
 const EMERGENCY_VIDEO_HEIGHT = 480;
 const EMERGENCY_VIDEO_FPS = 24;
 
@@ -45,9 +46,11 @@ export function isVerifiedEmergencyTrackSettings(
     Number.isFinite(width) &&
     width > 0 &&
     width <= EMERGENCY_VIDEO_WIDTH &&
+    width % 16 === 0 &&
     Number.isFinite(height) &&
     height > 0 &&
     height <= EMERGENCY_VIDEO_HEIGHT &&
+    height % 2 === 0 &&
     Number.isFinite(frameRate) &&
     frameRate > 0 &&
     frameRate <= EMERGENCY_VIDEO_FPS + 0.5
@@ -68,6 +71,32 @@ export interface SfuPublishPreset {
   contentMode?: "detail" | "motion" | "balanced";
 }
 
+export function safeSfuScreenDimensions(
+  sourceWidthInput: number,
+  sourceHeightInput: number,
+): { width: number; height: number } {
+  const sourceWidth = Math.max(16, Math.round(sourceWidthInput || 2_560));
+  const sourceHeight = Math.max(2, Math.round(sourceHeightInput || 1_440));
+  const sourceScale = Math.min(
+    1,
+    2_560 / sourceWidth,
+    1_440 / sourceHeight,
+  );
+  const requestedHeight = Math.max(
+    2,
+    Math.floor(sourceHeight * sourceScale),
+  );
+  const safeTarget = safeVideoEncodingTarget(
+    sourceWidth,
+    sourceHeight,
+    requestedHeight,
+  );
+  return {
+    width: safeTarget?.width ?? Math.min(2_560, sourceWidth),
+    height: safeTarget?.height ?? Math.min(1_440, sourceHeight),
+  };
+}
+
 async function preparePrimaryScreenTrack(
   track: MediaStreamTrack,
   preset: SfuPublishPreset,
@@ -77,28 +106,43 @@ async function preparePrimaryScreenTrack(
   const settings = track.getSettings();
   const sourceWidth = Math.max(1, Number(settings.width) || 2_560);
   const sourceHeight = Math.max(1, Number(settings.height) || 1_440);
-  const sourceScale = Math.min(
-    1,
-    2_560 / sourceWidth,
-    1_440 / sourceHeight,
+  const safeDimensions = safeSfuScreenDimensions(
+    sourceWidth,
+    sourceHeight,
   );
-  const cappedWidth = Math.max(1, Math.round(sourceWidth * sourceScale));
-  const cappedHeight = Math.max(1, Math.round(sourceHeight * sourceScale));
   await track.applyConstraints({
-    width: { ideal: cappedWidth, max: 2_560 },
-    height: { ideal: cappedHeight, max: 1_440 },
+    width: {
+      ideal: safeDimensions.width,
+      max: safeDimensions.width,
+    },
+    height: {
+      ideal: safeDimensions.height,
+      max: safeDimensions.height,
+    },
     frameRate: {
       ideal: Math.min(30, preset.frameRate),
       max: Math.min(30, preset.frameRate),
     },
   });
   const actual = track.getSettings();
+  const actualWidth = Number(actual.width);
+  const actualHeight = Number(actual.height);
+  const verifiedTarget = safeVideoEncodingTarget(
+    actualWidth,
+    actualHeight,
+    actualHeight,
+  );
   if (
-    (Number(actual.width) > 2_560) ||
-    (Number(actual.height) > 1_440) ||
-    (Number(actual.frameRate) > Math.min(30, preset.frameRate) + 0.5)
+    actualWidth > 2_560 ||
+    actualHeight > 1_440 ||
+    Number(actual.frameRate) > Math.min(30, preset.frameRate) + 0.5 ||
+    !verifiedTarget ||
+    verifiedTarget.width !== actualWidth ||
+    verifiedTarget.height !== actualHeight
   ) {
-    throw new Error("capture driver did not apply SFU screen constraints");
+    throw new Error(
+      "capture driver did not apply decoder-safe SFU screen constraints",
+    );
   }
   return actual;
 }
@@ -724,15 +768,32 @@ export class SfuSession {
       const candidateLayers =
         sourceHeight > 1_080
           ? [
-              new VideoPreset(854, 480, 2_200_000, 24),
+              new VideoPreset(
+                EMERGENCY_VIDEO_WIDTH,
+                EMERGENCY_VIDEO_HEIGHT,
+                2_200_000,
+                24,
+              ),
               new VideoPreset(1_280, 720, 5_000_000, 30),
             ]
           : sourceHeight > 720
             ? [
-                new VideoPreset(854, 480, 2_200_000, 24),
+                new VideoPreset(
+                  EMERGENCY_VIDEO_WIDTH,
+                  EMERGENCY_VIDEO_HEIGHT,
+                  2_200_000,
+                  24,
+                ),
                 new VideoPreset(1_280, 720, 5_000_000, 30),
               ]
-            : [new VideoPreset(854, 480, 2_200_000, 24)];
+            : [
+                new VideoPreset(
+                  EMERGENCY_VIDEO_WIDTH,
+                  EMERGENCY_VIDEO_HEIGHT,
+                  2_200_000,
+                  24,
+                ),
+              ];
       const explicitLayers = candidateLayers.slice(
         0,
         Math.max(0, maxLayers - 1),

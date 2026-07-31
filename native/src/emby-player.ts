@@ -1775,7 +1775,7 @@ export class EmbyMsePlayer extends EventTarget {
       return;
     }
     this.video.srcObject = null;
-    this.video.controls = this.host;
+    this.video.controls = false;
     if (!this.host) this.startViewerProgress();
     this.video.hidden = false;
     this.mediaSource = new MediaSource();

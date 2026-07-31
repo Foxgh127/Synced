@@ -7,6 +7,7 @@ import {
 } from "./adaptive-playback";
 import {
   captureWindowGeometryChanged,
+  decoderEdgeGuardPixels,
   normalizeCaptureWindowGeometry,
   physicalCaptureTarget,
   safeVideoEncodingTarget,
@@ -113,7 +114,9 @@ import {
 } from "./ui/floating-surface";
 import { hydrateIcons } from "./ui/icons";
 import { animateElement } from "./ui/motion-controller";
+import { bindLocalPointerLight } from "./ui/pointer-light";
 import { PresenceController } from "./ui/presence-controller";
+import { bindStarField } from "./ui/star-field";
 import { VirtualGrid } from "./ui/virtual-grid";
 import {
   isVerifiedEmergencyTrackSettings,
@@ -838,7 +841,7 @@ export async function openChannelSession(
             <span id="session-live-dot" class="live-dot idle"></span>
             <div>
               <strong id="session-channel-name">${escapeHtml(channelName)}</strong>
-              <small>频道 ${escapeHtml(room)} · 任意 Windows 成员可放映</small>
+              <small>频道 ${escapeHtml(room)}</small>
             </div>
           </div>
           <div class="channel-header-actions">
@@ -869,7 +872,9 @@ export async function openChannelSession(
                 : ""
             }
             <button id="session-companion" class="btn btn-ghost btn-icon" type="button"
-                    aria-label="打开聊天与成员" title="聊天与成员">
+                    aria-label="收起聊天与成员" title="聊天与成员"
+                    aria-controls="room-companion-panel" aria-expanded="true"
+                    aria-pressed="true">
               <i data-lucide="users"></i>
             </button>
             <button id="session-invite" class="btn btn-secondary" type="button"
@@ -890,10 +895,8 @@ export async function openChannelSession(
           <audio id="channel-movie-audio" autoplay playsinline hidden></audio>
           <div id="stage-danmaku" class="danmaku-layer" aria-hidden="true"></div>
           <div id="receiver-stream-badge" class="receiver-stream-badge" hidden aria-live="polite"></div>
-          <div id="channel-empty" class="channel-empty channel-lobby">
-            <div class="lobby-light-field" data-decorative-motion aria-hidden="true">
-              <i></i><i></i><i></i>
-            </div>
+          <div id="channel-empty" class="channel-empty channel-lobby interactive-card">
+            <canvas class="lobby-light-field star-field-canvas" data-decorative-motion aria-hidden="true"></canvas>
             <span class="eyebrow">频道大厅</span>
             <h2>${escapeHtml(channelName)}</h2>
             <button id="lobby-copy-room" class="lobby-room-code tnum" type="button"
@@ -973,7 +976,8 @@ export async function openChannelSession(
               <button class="btn btn-ghost btn-icon btn-icon-sm" id="dock-mute"
                       type="button" aria-label="静音切换" aria-pressed="false"
                       title="影片静音" data-tooltip="影片静音">
-                <i data-lucide="volume-2"></i>
+                <i class="dock-volume-audible" data-lucide="volume-2"></i>
+                <i class="dock-volume-muted" data-lucide="volume-x"></i>
               </button>
               <input class="slider" type="range" min="0" max="1" step="0.05"
                      id="dock-volume" aria-label="影片音量" value="${movieVolume}">
@@ -988,7 +992,7 @@ export async function openChannelSession(
                     aria-pressed="${danmakuEnabled}"
                     title="${danmakuEnabled ? "弹幕已开启，点击关闭" : "弹幕已关闭，点击开启"}"
                     data-tooltip="${danmakuEnabled ? "弹幕：已开启" : "弹幕：已关闭"}">
-              <i data-lucide="list"></i>
+              <i data-lucide="message-square-text"></i>
             </button>
             <button class="btn btn-ghost btn-icon btn-icon-sm" id="dock-chat"
                       type="button" title="打开聊天" data-tooltip="聊天"
@@ -1032,7 +1036,7 @@ export async function openChannelSession(
             </button>
             <button class="dock-menu-item" id="dock-enhancement" type="button" role="menuitemcheckbox"
                     aria-checked="${videoEnhancementPreference !== "off"}">
-              <i data-lucide="sparkles"></i><span>视频增强</span><small>${videoEnhancementPreference === "off" ? "已关闭" : "自动"}</small>
+              <i data-lucide="sparkles"></i><span>4K 视频增强</span><small>${videoEnhancementPreference === "off" ? "已关闭" : "自动"}</small>
             </button>
             <button class="dock-menu-item" id="dock-pip"
                     type="button" role="menuitemcheckbox" aria-label="小窗模式已关闭，点击开启"
@@ -1097,12 +1101,16 @@ export async function openChannelSession(
         </button>
       </div>
       <p class="invite-channel-name">${escapeHtml(channelName)}</p>
-      <button id="copy-room" class="invite-code tnum" type="button" aria-label="复制频道码 ${escapeHtml(room)}">
-        <span>${escapeHtml(room.slice(0, 4))}<i aria-hidden="true">·</i>${escapeHtml(room.slice(4))}</span>
-        <small><i data-lucide="copy"></i>点击复制频道码</small>
-      </button>
-      ${desktop ? `<img id="invite-qr" alt="加入 ${escapeHtml(channelName)} 的二维码" width="220" height="220" />` : ""}
-      <p class="invite-help">${desktop ? "朋友扫码、打开邀请链接或输入频道码即可加入。" : "复制邀请或使用系统分享发送给朋友。"}</p>
+      <div class="invite-content">
+        <div class="invite-copy-column">
+          <button id="copy-room" class="invite-code tnum" type="button" aria-label="复制频道码 ${escapeHtml(room)}">
+            <span>${escapeHtml(room.slice(0, 4))}<i aria-hidden="true">·</i>${escapeHtml(room.slice(4))}</span>
+            <small><i data-lucide="copy"></i>点击复制频道码</small>
+          </button>
+          <p class="invite-help">${desktop ? "朋友扫码、打开邀请链接或输入频道码即可加入。" : "复制邀请或使用系统分享发送给朋友。"}</p>
+        </div>
+        ${desktop ? `<div class="invite-qr-shell"><img id="invite-qr" alt="加入 ${escapeHtml(channelName)} 的二维码" width="200" height="200" /></div>` : ""}
+      </div>
       <div class="dialog-actions invite-actions">
         <button id="copy-invite" class="btn btn-secondary" type="button">
           <i data-lucide="copy"></i>复制邀请
@@ -1187,8 +1195,8 @@ export async function openChannelSession(
         desktop
           ? `<label class="highlight-correction video-enhancement-setting">
               <span>
-                <strong>GPU 清晰增强</strong>
-                <small id="video-enhancement-status">仅在远端 Emby 低于 1080p、输出接近 2K/4K 且 GPU 有余量时自动开启。</small>
+                <strong>GPU 4K 超分</strong>
+                <small id="video-enhancement-status">远端 Emby 低画质会优先交给 NVIDIA RTX Video，并以 4K GPU 重建作为兼容回退。</small>
               </span>
               <input id="video-enhancement" type="checkbox" ${videoEnhancementPreference === "auto" ? "checked" : ""} />
             </label>`
@@ -1566,6 +1574,12 @@ export async function openChannelSession(
   `;
 
   hydrateIcons(root);
+  bindLocalPointerLight(root, sessionUiAbortController.signal);
+  const lobbyStarCanvas =
+    document.querySelector<HTMLCanvasElement>(".lobby-light-field");
+  if (lobbyStarCanvas) {
+    bindStarField(lobbyStarCanvas, sessionUiAbortController.signal);
+  }
   const video = document.querySelector<HTMLVideoElement>("#channel-video");
   const movieAudio =
     document.querySelector<HTMLAudioElement>("#channel-movie-audio");
@@ -1739,6 +1753,7 @@ export async function openChannelSession(
   const danmakuSurface = stageDanmakuElement;
   const stageDanmaku = new DanmakuOverlay(danmakuSurface);
   let videoEnhancement: VideoEnhancementController | undefined;
+  let removeVideoEnhancementHardwareListener: (() => void) | undefined;
   let videoEnhancementAdaptivePressure:
     | "healthy"
     | "decoder-limited"
@@ -1762,26 +1777,77 @@ export async function openChannelSession(
     });
     videoEnhancement.setPreference(videoEnhancementPreference);
     const capabilities = detectEmbyMediaCapabilities();
-    const supported = capabilities.videoEnhancementBackends.includes(
-      "webgl2-spatial",
-    );
+    const supported =
+      capabilities.videoEnhancementBackends.some(
+        (backend) =>
+          backend === "webgl2-spatial" || backend === "rtx-video",
+      ) ||
+      Boolean(window.roomDesktop?.getVideoEnhancementInfo);
     if (videoEnhancementInput) {
       videoEnhancementInput.disabled = !supported;
       videoEnhancementInput.title = supported
-        ? "自动使用通用 WebGL2 空间增强"
-        : "当前图形驱动不支持 WebGL2 增强后端";
+        ? "NVIDIA RTX Video 原生超分优先，4K 边缘自适应 GPU 重建回退"
+        : "当前图形驱动没有可用的视频增强后端";
     }
+    const applyVideoEnhancementHardwareInfo = (
+      info: VideoEnhancementHardwareInfo,
+    ) => {
+      videoEnhancement?.setHardwareInfo(info);
+    };
+    void window.roomDesktop
+      ?.getVideoEnhancementInfo()
+      .then(applyVideoEnhancementHardwareInfo)
+      .catch((error) => {
+        reportPlaybackDiagnostic("video-enhancement-hardware-failed", {
+          message: readableError(error, "GPU 检测失败"),
+        });
+      });
+    removeVideoEnhancementHardwareListener =
+      window.roomDesktop?.onVideoEnhancementInfoChanged(
+        applyVideoEnhancementHardwareInfo,
+      );
     videoEnhancement.addEventListener("statechange", (event) => {
       const state = (event as CustomEvent<VideoEnhancementState>).detail;
+      const enhancementMenuItem =
+        document.querySelector<HTMLElement>("#dock-enhancement");
+      const enhancementMenuState =
+        enhancementMenuItem?.querySelector<HTMLElement>("small");
+      if (enhancementMenuState) {
+        enhancementMenuState.textContent = state.active
+          ? state.backend === "rtx-video"
+            ? "RTX AI"
+            : "4K GPU"
+          : videoEnhancementPreference === "off"
+            ? "已关闭"
+            : "自动";
+      }
+      enhancementMenuItem?.toggleAttribute(
+        "data-enhancement-active",
+        state.active,
+      );
       if (!videoEnhancementStatus) return;
       if (state.active) {
-        videoEnhancementStatus.textContent =
-          `WebGL2 空间增强已开启 · ${state.sourceWidth}×${state.sourceHeight}` +
-          ` → ${state.outputWidth}×${state.outputHeight}`;
+        if (state.backend === "rtx-video") {
+          const atTarget =
+            state.outputWidth >= state.targetWidth &&
+            state.outputHeight >= state.targetHeight;
+          videoEnhancementStatus.textContent =
+            `NVIDIA RTX Video AI 超分已开启 · ${state.sourceWidth}×${state.sourceHeight}` +
+            ` → ${state.outputWidth}×${state.outputHeight}` +
+            (atTarget
+              ? " · 4K 输出"
+              : ` · 4K 全屏目标 ${state.targetWidth}×${state.targetHeight}`);
+        } else {
+          videoEnhancementStatus.textContent =
+            `4K 边缘自适应 GPU 重建已开启 · ${state.sourceWidth}×${state.sourceHeight}` +
+            ` → ${state.outputWidth}×${state.outputHeight}`;
+        }
         videoEnhancementStatus.dataset.tone = "active";
+        videoEnhancementStatus.dataset.backend = state.backend;
         return;
       }
       delete videoEnhancementStatus.dataset.tone;
+      delete videoEnhancementStatus.dataset.backend;
       if (
         state.reason === "render-budget" ||
         state.reason === "dropped-frames" ||
@@ -1789,18 +1855,18 @@ export async function openChannelSession(
         state.reason === "cooldown"
       ) {
         videoEnhancementStatus.textContent =
-          "检测到 GPU、渲染或解码压力，已自动暂停增强；稳定 30 秒后重试。";
+          "检测到电池供电、GPU、渲染或解码压力，已自动暂停；稳定 30 秒后重试。";
       } else if (state.reason === "hdr-unsupported") {
         videoEnhancementStatus.textContent =
           "HDR 视频保持原生色彩路径，不经过当前 SDR 空间增强后端。";
       } else if (state.reason === "backend-unavailable") {
         videoEnhancementStatus.textContent =
-          "当前图形驱动不支持通用 WebGL2 空间增强。";
+          "未检测到可用的 RTX Video 或 WebGL2 4K 重建后端。";
       } else if (state.reason === "preference-off") {
-        videoEnhancementStatus.textContent = "GPU 清晰增强已手动关闭。";
+        videoEnhancementStatus.textContent = "GPU 4K 超分已手动关闭。";
       } else {
         videoEnhancementStatus.textContent =
-          "仅在远端 Emby 360p–1080p、输出接近 2K/4K 且 GPU 有余量时自动开启。";
+          "远端 Emby 240p–1080p 会自动增强；RTX 按显示分辨率重建，兼容路径内部重建至 4K。";
       }
     });
   }
@@ -2661,12 +2727,35 @@ export async function openChannelSession(
     return normalized;
   }
 
+  function syncDecoderEdgeGuard(): void {
+    if (!video) return;
+    const screenShare =
+      broadcastCapabilities?.mode === "screen" ||
+      localBroadcastMode === "screen";
+    const inlineGuard = screenShare
+      ? decoderEdgeGuardPixels(video.videoWidth)
+      : 0;
+    video.classList.toggle("decoder-edge-guard", inlineGuard > 0);
+    if (inlineGuard > 0) {
+      const guardPercent = (inlineGuard / video.videoWidth) * 100;
+      video.style.setProperty(
+        "--decoder-edge-guard-inline",
+        `${guardPercent.toFixed(6)}%`,
+      );
+      video.dataset.decoderEdgeGuard = String(inlineGuard);
+    } else {
+      video.style.removeProperty("--decoder-edge-guard-inline");
+      delete video.dataset.decoderEdgeGuard;
+    }
+  }
+
   function setBroadcastCapabilities(
     value: BroadcastCapabilities | undefined,
     resetViewerPreference = false,
   ): void {
     const previousMode = broadcastCapabilities?.mode;
     broadcastCapabilities = normalizeBroadcastCapabilities(value);
+    syncDecoderEdgeGuard();
     if (previousMode !== broadcastCapabilities?.mode) {
       viewerBandwidthWarningShown = false;
       inboundSnapshot = undefined;
@@ -3406,6 +3495,7 @@ export async function openChannelSession(
       video.controls = false;
       video.load();
       video.hidden = true;
+      syncDecoderEdgeGuard();
     }
     if (emptyState) emptyState.hidden = false;
     if (bufferingState) bufferingState.hidden = true;
@@ -3437,6 +3527,7 @@ export async function openChannelSession(
         video.load();
       }
       video.hidden = true;
+      syncDecoderEdgeGuard();
     }
     if (emptyState) emptyState.hidden = true;
     if (bufferingState) bufferingState.hidden = false;
@@ -3475,6 +3566,7 @@ export async function openChannelSession(
     video.muted = true;
     video.hidden = false;
     void video.play();
+    syncDecoderEdgeGuard();
     if (emptyState) emptyState.hidden = true;
     if (bufferingState) bufferingState.hidden = true;
     if (fullscreenButton) fullscreenButton.disabled = false;
@@ -4815,6 +4907,7 @@ export async function openChannelSession(
         video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA ||
         video.videoWidth > 0
       ) {
+        syncDecoderEdgeGuard();
         confirmRemoteFirstFrame();
       }
     };
@@ -10388,7 +10481,7 @@ export async function openChannelSession(
       popupPoster.alt = item.name ? `${item.name} 海报` : "影片海报";
       if (popupPlaceholder) popupPlaceholder.hidden = false;
       dialog.style.removeProperty("--emby-detail-accent");
-      if (item.imageTag && window.roomDesktop) {
+      if (item.id && window.roomDesktop) {
         void window.roomDesktop.embyImageData({
           itemId: item.imageItemId || item.id,
           tag: item.imageTag,
@@ -10571,7 +10664,7 @@ export async function openChannelSession(
     element.addEventListener("click", () => {
       void showEmbyItemPopup(item);
     });
-    if (!item.imageTag || !window.roomDesktop) return;
+    if (!item.id || !window.roomDesktop) return;
     const image =
       element.querySelector<HTMLImageElement>("[data-emby-image]");
     const placeholder =
@@ -10593,6 +10686,7 @@ export async function openChannelSession(
         image.addEventListener(
           "load",
           () => {
+            image.dataset.imageState = "ready";
             image.hidden = false;
             if (placeholder) placeholder.hidden = true;
           },
@@ -10601,11 +10695,14 @@ export async function openChannelSession(
         image.addEventListener(
           "error",
           () => {
+            image.dataset.imageState = "error";
             image.hidden = true;
             if (placeholder) placeholder.hidden = false;
           },
           { once: true },
         );
+        image.dataset.imageState = "loading";
+        image.hidden = false;
         image.src = dataUrl;
       })
       .catch(() => {
@@ -12194,6 +12291,8 @@ export async function openChannelSession(
         : movieVolume <= 0;
       muteButton.setAttribute("aria-pressed", String(muted));
       muteButton.setAttribute("aria-label", muted ? "取消静音" : "静音");
+      muteButton.title = muted ? "取消影片静音" : "影片静音";
+      muteButton.dataset.tooltip = muted ? "取消影片静音" : "影片静音";
     }
   }
 
@@ -12316,24 +12415,42 @@ export async function openChannelSession(
     );
   }
 
+  function syncCompanionToggleButtons(collapsed: boolean): void {
+    const expanded = !collapsed;
+    const label = expanded ? "收起聊天与成员" : "展开聊天与成员";
+    const headerToggle =
+      document.querySelector<HTMLButtonElement>("#session-companion");
+    headerToggle?.setAttribute("aria-expanded", String(expanded));
+    headerToggle?.setAttribute("aria-pressed", String(expanded));
+    headerToggle?.setAttribute("aria-label", label);
+    headerToggle?.classList.toggle("is-on", expanded);
+  }
+
   function focusCompanion(target: "chat" | "members"): void {
+    const inlinePanel = nativeAndroid || window.innerWidth <= 899;
     const targetElement = document.getElementById(
       target === "chat" ? "chat-panel" : "member-panel",
     );
+    if (inlinePanel) {
+      targetElement?.scrollIntoView({
+        behavior:
+          matchMedia("(prefers-reduced-motion: reduce)").matches ||
+          document.documentElement.dataset.motion === "reduced"
+            ? "auto"
+            : "smooth",
+        block: "start",
+      });
+      targetElement?.focus({ preventScroll: true });
+      if (target === "chat") {
+        queueMicrotask(() =>
+          document.getElementById("chat-input")?.focus(),
+        );
+      }
+      return;
+    }
     document.body.classList.remove("panel-collapsed");
     document.body.classList.add("panel-open");
-    document.dispatchEvent(
-      new CustomEvent<"chat" | "members">("synced:companion-tab", {
-        detail: target,
-      }),
-    );
-    const toggle = document.getElementById("panel-toggle");
-    toggle?.setAttribute("aria-expanded", "true");
-    toggle?.setAttribute("aria-label", "收起频道陪伴面板");
-    toggle?.setAttribute("title", "收起频道陪伴面板");
-    if (toggle instanceof HTMLElement) {
-      toggle.dataset.tooltip = "收起频道陪伴面板";
-    }
+    syncCompanionToggleButtons(false);
     targetElement?.focus({ preventScroll: true });
     if (target === "chat") {
       document.getElementById("chat-input")?.focus();
@@ -12633,14 +12750,6 @@ export async function openChannelSession(
         event.preventDefault();
         closeDialog(openDialogElement);
         return;
-      }
-      if (
-        (nativeAndroid || overlayPanelQuery.matches) &&
-        document.body.classList.contains("panel-open")
-      ) {
-        event.preventDefault();
-        applyPanelState(true);
-        document.getElementById("session-companion")?.focus();
       }
       return;
     }
@@ -13540,6 +13649,8 @@ export async function openChannelSession(
     leaving = true;
     resourceBudgetMonitor.destroy();
     signalMessageScheduler.close();
+    removeVideoEnhancementHardwareListener?.();
+    removeVideoEnhancementHardwareListener = undefined;
     videoEnhancement?.destroy();
     videoEnhancement = undefined;
     ambientLight?.destroy();
@@ -13677,8 +13788,6 @@ export async function openChannelSession(
       "is-lobby",
       "panel-collapsed",
       "panel-open",
-      "panel-overlay",
-      "panel-mobile-sheet",
       "panel-inline",
     );
     await options.onLeave();
@@ -13765,202 +13874,63 @@ export async function openChannelSession(
     saveSessionNickname();
   });
   document.addEventListener("keydown", handleGlobalKey);
-  const panelToggle =
-    document.querySelector<HTMLButtonElement>("#panel-toggle");
-  const companionScrim =
-    document.querySelector<HTMLButtonElement>("#companion-scrim");
-  const companionPanel =
-    document.querySelector<HTMLElement>(".room-sidebar.companion-panel");
-  const companionSheetHandle =
-    document.querySelector<HTMLElement>("#companion-sheet-handle");
-  const overlayPanelQuery = window.matchMedia("(max-width: 1199px)");
-  const mobileSheetQuery = window.matchMedia("(max-width: 599px)");
-  const splitCompanionQuery = window.matchMedia(
-    "(min-width: 768px) and (min-aspect-ratio: 4 / 3)",
-  );
-  let sheetPointerId: number | undefined;
-  let sheetDragStartY = 0;
-  let sheetDragLatestY = 0;
-  let sheetDragStartedAt = 0;
-  let sheetDragFrame = 0;
-  const resetSheetDrag = (): void => {
-    if (sheetDragFrame) {
-      cancelAnimationFrame(sheetDragFrame);
-      sheetDragFrame = 0;
-    }
-    sheetPointerId = undefined;
-    sheetDragLatestY = 0;
-    companionPanel?.classList.remove("is-sheet-dragging");
-    companionPanel?.style.removeProperty("--sheet-drag-y");
-  };
-  const usesSplitCompanion = (): boolean =>
-    splitCompanionQuery.matches;
-  const usesOverlayCompanion = (): boolean =>
-    !usesSplitCompanion() &&
-    (nativeAndroid || overlayPanelQuery.matches);
-  const usesMobileSheet = (): boolean =>
-    !usesSplitCompanion() &&
-    (nativeAndroid || mobileSheetQuery.matches);
+  const mobilePanelQuery = window.matchMedia("(max-width: 899px)");
+  const usesInlineCompanion = (): boolean =>
+    nativeAndroid || mobilePanelQuery.matches;
   const applyPanelState = (
     collapsed: boolean,
     persist = true,
   ): void => {
-    resetSheetDrag();
-    if (!collapsed) {
-      setDockChatComposerOpen(false);
+    if (usesInlineCompanion()) {
+      document.body.classList.remove(
+        "panel-collapsed",
+      );
+      document.body.classList.add("panel-open", "panel-inline");
+      syncCompanionToggleButtons(false);
+      return;
     }
-    document.body.classList.toggle(
-      "panel-overlay",
-      usesOverlayCompanion(),
-    );
-    document.body.classList.toggle(
-      "panel-mobile-sheet",
-      usesMobileSheet(),
-    );
-    document.body.classList.toggle(
+    document.body.classList.remove(
       "panel-inline",
-      !usesOverlayCompanion(),
     );
-    if (panelToggle) panelToggle.hidden = false;
     document.body.classList.toggle("panel-collapsed", collapsed);
     document.body.classList.toggle("panel-open", !collapsed);
-    if (companionScrim) {
-      companionScrim.hidden = collapsed || !usesOverlayCompanion();
-    }
+    if (!collapsed) setDockChatComposerOpen(false);
     if (persist) {
       localStorage.setItem("synced:panel-collapsed", String(collapsed));
     }
-    panelToggle?.setAttribute(
-      "aria-label",
-      collapsed ? "展开频道陪伴面板" : "收起频道陪伴面板",
-    );
-    panelToggle?.setAttribute(
-      "title",
-      collapsed ? "展开频道陪伴面板" : "收起频道陪伴面板",
-    );
-    if (panelToggle) {
-      panelToggle.dataset.tooltip = collapsed
-        ? "展开频道陪伴面板"
-        : "收起频道陪伴面板";
-    }
-    panelToggle?.setAttribute("aria-expanded", String(!collapsed));
+    syncCompanionToggleButtons(collapsed);
   };
   const savedPanelState =
     localStorage.getItem("synced:panel-collapsed");
   applyPanelState(
     savedPanelState === null
-      ? usesOverlayCompanion()
+      ? window.innerWidth <= 1_199
       : savedPanelState === "true",
     false,
   );
-  panelToggle?.addEventListener("click", () => {
-    const collapsed =
-      !document.body.classList.contains("panel-collapsed");
-    applyPanelState(collapsed);
-  });
-  companionScrim?.addEventListener("click", () => {
-    applyPanelState(true);
-    document.getElementById("session-companion")?.focus();
-  });
-  overlayPanelQuery.addEventListener(
+  mobilePanelQuery.addEventListener(
     "change",
     () => {
       const saved = localStorage.getItem("synced:panel-collapsed");
       applyPanelState(
-        saved === null ? usesOverlayCompanion() : saved === "true",
+        saved === null ? false : saved === "true",
         false,
       );
     },
     { signal: sessionUiAbortController.signal },
   );
-  mobileSheetQuery.addEventListener(
-    "change",
-    () =>
-      applyPanelState(
-        document.body.classList.contains("panel-collapsed"),
-        false,
-    ),
-    { signal: sessionUiAbortController.signal },
-  );
-  splitCompanionQuery.addEventListener(
-    "change",
-    () => {
-      const saved = localStorage.getItem("synced:panel-collapsed");
-      applyPanelState(
-        saved === null ? usesOverlayCompanion() : saved === "true",
-        false,
-      );
-    },
-    { signal: sessionUiAbortController.signal },
-  );
-  companionSheetHandle?.addEventListener(
-    "pointerdown",
-    (event) => {
-      if (
-        !usesMobileSheet() ||
-        document.body.classList.contains("panel-collapsed") ||
-        !companionPanel
-      ) {
-        return;
-      }
-      event.preventDefault();
-      sheetPointerId = event.pointerId;
-      sheetDragStartY = event.clientY;
-      sheetDragLatestY = 0;
-      sheetDragStartedAt = performance.now();
-      companionPanel.classList.add("is-sheet-dragging");
-      companionSheetHandle.setPointerCapture?.(event.pointerId);
-    },
-    { signal: sessionUiAbortController.signal },
-  );
-  companionSheetHandle?.addEventListener(
-    "pointermove",
-    (event) => {
-      if (event.pointerId !== sheetPointerId || !companionPanel) return;
-      sheetDragLatestY = Math.max(0, event.clientY - sheetDragStartY);
-      if (sheetDragFrame) return;
-      sheetDragFrame = requestAnimationFrame(() => {
-        sheetDragFrame = 0;
-        companionPanel.style.setProperty(
-          "--sheet-drag-y",
-          `${Math.round(sheetDragLatestY)}px`,
-        );
-      });
-    },
-    { signal: sessionUiAbortController.signal },
-  );
-  const finishSheetDrag = (event: PointerEvent): void => {
-    if (event.pointerId !== sheetPointerId || !companionPanel) return;
-    const elapsed = Math.max(1, performance.now() - sheetDragStartedAt);
-    const velocity = sheetDragLatestY / elapsed;
-    const shouldClose =
-      sheetDragLatestY > Math.min(180, companionPanel.clientHeight * 0.24) ||
-      velocity > 0.68;
-    resetSheetDrag();
-    if (shouldClose) {
-      applyPanelState(true);
-      document.getElementById("session-companion")?.focus();
-    }
-  };
-  companionSheetHandle?.addEventListener(
-    "pointerup",
-    finishSheetDrag,
-    { signal: sessionUiAbortController.signal },
-  );
-  companionSheetHandle?.addEventListener(
-    "pointercancel",
-    (event) => {
-      if (event.pointerId === sheetPointerId) resetSheetDrag();
-    },
-    { signal: sessionUiAbortController.signal },
-  );
-  window.addEventListener("resize", resetSheetDrag, {
-    passive: true,
-    signal: sessionUiAbortController.signal,
-  });
   document
     .querySelector("#session-companion")
-    ?.addEventListener("click", () => focusCompanion("chat"));
+    ?.addEventListener("click", () => {
+      if (usesInlineCompanion()) {
+        focusCompanion("chat");
+        return;
+      }
+      const collapse =
+        !document.body.classList.contains("panel-collapsed");
+      applyPanelState(collapse);
+      if (!collapse) focusCompanion("chat");
+    });
   document
     .querySelector("#dock-play")
     ?.addEventListener("click", handlePlayPause);
@@ -15074,6 +15044,7 @@ export async function openChannelSession(
   );
   video?.addEventListener("resize", () => {
     syncPlayerAspect();
+    syncDecoderEdgeGuard();
     if (broadcasterId === selfId) scheduleCaptureCapabilitiesUpdate();
     if (isImmersivePlayback()) void resolveFullscreenFit();
   });
@@ -15120,12 +15091,6 @@ export async function openChannelSession(
       }
       if (closeTopmostFloatingSurface()) {
         return;
-      } else if (
-        usesOverlayCompanion() &&
-        document.body.classList.contains("panel-open")
-      ) {
-        applyPanelState(true);
-        document.getElementById("session-companion")?.focus();
       } else if (document.body.classList.contains("immersive-player")) {
         finishImmersiveUi();
         void exitImmersivePlayer().finally(() => {

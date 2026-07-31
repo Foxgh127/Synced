@@ -1,5 +1,5 @@
 .field,
-label:has(> input),
+label:has(> input:not([type="checkbox"]):not([type="radio"])),
 label:has(> select),
 label:has(> textarea) {
   display: grid;
@@ -10,8 +10,8 @@ label:has(> textarea) {
 }
 
 :is(input, select, textarea).field,
-.field :is(input, select, textarea),
-label > :is(input, select, textarea) {
+.field :is(input:not([type="checkbox"]):not([type="radio"]), select, textarea),
+label > :is(input:not([type="checkbox"]):not([type="radio"]), select, textarea) {
   width: 100%;
   min-width: 0;
   min-height: var(--control-min);
@@ -22,7 +22,7 @@ label > :is(input, select, textarea) {
   transition: border-color var(--dur-micro) var(--ease-out), background-color var(--dur-micro) var(--ease-out);
 }
 
-:is(input, select, textarea) {
+:is(input:not([type="checkbox"]):not([type="radio"]), select, textarea) {
   padding: 0 var(--s-5);
 }
 
@@ -32,22 +32,27 @@ textarea {
   resize: vertical;
 }
 
-:is(input, select, textarea):hover:not(:disabled) {
+:is(input:not([type="checkbox"]):not([type="radio"]), select, textarea):hover:not(:disabled) {
   border-color: var(--stroke-strong);
 }
 
-:is(input, select, textarea):focus-visible {
+:is(input:not([type="checkbox"]):not([type="radio"]), select, textarea):focus-visible {
   border-color: var(--accent);
   outline: none;
   box-shadow: var(--shadow-f6f16fb327);
 }
 
-:is(input, select, textarea)[aria-invalid="true"] {
+:is(input:not([type="checkbox"]):not([type="radio"]), select, textarea)[aria-invalid="true"] {
   border-color: var(--danger);
 }
 
 :is(input, select, textarea):disabled {
   opacity: 0.46;
+}
+
+:is(input[type="checkbox"], input[type="radio"]):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
 }
 
 .field-help,

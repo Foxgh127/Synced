@@ -11,6 +11,30 @@
   height: var(--control-min);
 }
 
+#dock-danmaku {
+  position: relative;
+  border-color: transparent;
+  transition: color var(--dur-micro) var(--ease-out), background-color var(--dur-micro) var(--ease-out), border-color var(--dur-micro) var(--ease-out), transform var(--dur-micro) var(--ease-spring);
+}
+
+#dock-danmaku[aria-pressed="true"] {
+  border-color: var(--accent-border);
+  background: var(--accent-bg);
+  color: var(--accent-text);
+}
+
+#dock-mute .dock-volume-muted {
+  display: none;
+}
+
+#dock-mute[aria-pressed="true"] .dock-volume-audible {
+  display: none;
+}
+
+#dock-mute[aria-pressed="true"] .dock-volume-muted {
+  display: block;
+}
+
 .dock[data-presence="entering"] {
   animation: dock-enter var(--dur-control) var(--ease-out) both;
 }

@@ -60,8 +60,8 @@ export const RESOLUTION_OPTIONS: ResolutionOption[] = [
   {
     key: "smooth",
     label: "流畅",
-    description: "最高 854×480",
-    width: 854,
+    description: "最高 848×480",
+    width: 848,
     height: 480,
   },
 ];

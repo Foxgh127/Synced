@@ -3,6 +3,7 @@
   border-right: 1px solid var(--stroke-subtle);
   background: var(--palette-b602bd4935);
   backdrop-filter: none;
+  overscroll-behavior: none;
 }
 
 .channel-rail :is(.rail-add, .profile-orb.profile-action) {
@@ -41,6 +42,28 @@
   border-top: 1px solid var(--stroke-subtle);
 }
 
+@media (min-width: 901px) {
+  .app-frame {
+    height: 100dvh;
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  .app-frame > .channel-rail {
+    height: 100dvh;
+    align-self: start;
+    overflow: hidden;
+  }
+
+  .app-frame > :is(.home-main, .setup-main, .join-main) {
+    height: 100dvh;
+    min-height: 0;
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior-y: contain;
+  }
+}
+
 @keyframes companion-enter {
   from { opacity: 0; transform: translateX(20px); }
   to { opacity: 1; transform: none; }
@@ -72,5 +95,25 @@
     border: 1px solid var(--stroke-glass);
     border-radius: var(--radius-dbe909a849);
     padding-bottom: env(safe-area-inset-bottom);
+  }
+}
+
+@media (max-width: 900px) {
+  .app-frame {
+    height: 100dvh;
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  .app-frame > :is(.home-main, .setup-main, .join-main) {
+    height: 100dvh;
+    min-height: 0;
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior-y: contain;
+  }
+
+  .app-frame > .channel-rail {
+    overflow: hidden;
   }
 }

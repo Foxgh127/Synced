@@ -157,6 +157,17 @@ contextBridge.exposeInMainWorld("roomDesktop", {
   writeClipboard: (text) => ipcRenderer.invoke("clipboard:write", text),
   readClipboard: () => ipcRenderer.invoke("clipboard:read"),
   getDisplayInfo: () => ipcRenderer.invoke("system:get-display-info"),
+  getVideoEnhancementInfo: () =>
+    ipcRenderer.invoke("system:get-video-enhancement-info"),
+  onVideoEnhancementInfoChanged: (callback) => {
+    const listener = (_event, info) => callback(info);
+    ipcRenderer.on("system:video-enhancement-info-changed", listener);
+    return () =>
+      ipcRenderer.removeListener(
+        "system:video-enhancement-info-changed",
+        listener,
+      );
+  },
   openDisplaySettings: () => ipcRenderer.invoke("system:open-display-settings"),
   embyLogin: (input) => ipcRenderer.invoke("emby:login", input),
   embyLogout: () => ipcRenderer.invoke("emby:logout"),

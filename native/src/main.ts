@@ -37,9 +37,12 @@ import {
   animateElement,
   cancelElementMotion,
 } from "./ui/motion-controller";
+import { bindLocalPointerLight } from "./ui/pointer-light";
 import { scanQrCode } from "./ui/qr-scanner";
 import { probeSignalHealth } from "./ui/signal-health";
+import { bindStarField } from "./ui/star-field";
 import { transitionView } from "./ui/view-transition";
+import { rememberVideoEnhancementHardwareInfo } from "./video-enhancement";
 
 migrateStorageIdentity(localStorage);
 
@@ -66,6 +69,12 @@ document.documentElement.dataset.input = matchMedia(
 
 const DEFAULT_SIGNAL_URL = HOME_SIGNAL_URL;
 const isDesktop = Boolean(window.roomDesktop);
+if (isDesktop) {
+  void window.roomDesktop
+    ?.getVideoEnhancementInfo()
+    .then(rememberVideoEnhancementHardwareInfo)
+    .catch(() => undefined);
+}
 const signalUrlPolicy = { allowInsecure: !isNativeAndroid() } as const;
 let viewAbortController = new AbortController();
 let settingsController: SettingsController;
@@ -391,32 +400,6 @@ function formatLastJoined(timestamp: number): string {
   }).format(timestamp);
 }
 
-function recentRailMarkup(disabled = false): string {
-  const recent = getRecentChannels();
-  if (!recent.length) {
-    return `<p class="recent-empty" aria-label="暂无最近频道">—</p>`;
-  }
-  return recent
-    .slice(0, 5)
-    .map(
-      (channel) => `
-        <button
-          class="recent-channel rail-recent"
-          data-recent-room="${escapeHtml(channel.room)}"
-          data-recent-name="${escapeHtml(channel.name)}"
-          data-recent-signal="${escapeHtml(channel.signalUrl)}"
-          data-recent-navigation-disabled="${disabled ? "true" : "false"}"
-          aria-label="进入频道 ${escapeHtml(channel.name)}"
-          aria-disabled="${disabled ? "true" : "false"}"
-          title="${escapeHtml(channel.name)} · ${channel.room}"
-        >
-          <span>${escapeHtml(channelInitial(channel.name))}</span>
-        </button>
-      `,
-    )
-    .join("");
-}
-
 function recentHomeMarkup(): string {
   const recent = getRecentChannels();
   if (!recent.length) {
@@ -459,37 +442,13 @@ function recentHomeMarkup(): string {
     .join("");
 }
 
-function continueChannelMarkup(): string {
-  const channel = getRecentChannels()[0];
-  if (!channel) return "";
-  return `
-    <section class="continue-card">
-      <div class="continue-card-copy">
-        <span class="eyebrow">CONTINUE</span>
-        <strong>${escapeHtml(channel.name)}</strong>
-        <small><span class="mono">${escapeHtml(channel.room.slice(0, 4))} · ${escapeHtml(channel.room.slice(4))}</span> · ${formatLastJoined(channel.lastJoinedAt)}</small>
-      </div>
-      <button class="btn btn-primary btn-lg" type="button"
-        data-recent-room="${escapeHtml(channel.room)}"
-        data-recent-name="${escapeHtml(channel.name)}"
-        data-recent-signal="${escapeHtml(channel.signalUrl)}"
-        data-recent-navigation-disabled="false">
-        <i data-lucide="play"></i><span>继续进入</span>
-      </button>
-    </section>
-  `;
-}
-
-function railMarkup(disabled = false): string {
+function railMarkup(): string {
   return `
     <aside class="channel-rail" aria-label="主导航">
       <div class="rail-logo rail-identity" role="img" aria-label="同频">
         <img src="./brand-mark-dark.svg" width="26" height="26" alt="" aria-hidden="true" />
       </div>
       <div class="rail-divider"></div>
-      <div class="recent-list" aria-label="最近加入的频道">
-        ${recentRailMarkup(disabled)}
-      </div>
       <button class="rail-add" data-join-button aria-label="加入新频道" data-tooltip="加入频道"><i data-lucide="plus"></i></button>
       <div class="rail-spacer"></div>
       <button class="profile-orb profile-action" type="button"
@@ -498,6 +457,27 @@ function railMarkup(disabled = false): string {
         ${escapeHtml(channelInitial(getNickname()))}
       </button>
     </aside>
+  `;
+}
+
+function homeProfileMarkup(): string {
+  const nickname = getNickname();
+  return `
+    <div class="home-profile-dock" aria-label="个人资料">
+      <button class="home-profile-rename profile-action" type="button"
+        data-profile-button aria-label="修改昵称，当前昵称 ${escapeHtml(nickname)}"
+        aria-haspopup="menu" aria-expanded="false" title="修改昵称">
+        <span class="home-profile-avatar" data-profile-initial>${escapeHtml(channelInitial(nickname))}</span>
+        <span class="home-profile-copy">
+          <strong data-profile-name>${escapeHtml(nickname)}</strong>
+          <small>点击改名</small>
+        </span>
+      </button>
+      <button class="home-profile-settings" type="button"
+        data-home-settings aria-label="打开设置" title="设置" data-tooltip="设置">
+        <i data-lucide="settings"></i>
+      </button>
+    </div>
   `;
 }
 
@@ -516,6 +496,8 @@ function bindProfilePopover(): void {
     "[data-profile-button]",
   );
   if (!trigger || document.querySelector("[data-profile-popover]")) return;
+  const directSettings =
+    document.querySelector<HTMLButtonElement>("[data-home-settings]");
   const popover = document.createElement("div");
   popover.className = "profile-popover";
   popover.dataset.profilePopover = "";
@@ -530,9 +512,13 @@ function bindProfilePopover(): void {
       <button class="btn btn-secondary" type="button" data-profile-save>
         <i data-lucide="check"></i><span>保存昵称</span>
       </button>
-      <button class="btn btn-ghost" type="button" data-open-settings>
-        <i data-lucide="settings"></i><span>设置</span>
-      </button>
+      ${
+        directSettings
+          ? ""
+          : `<button class="btn btn-ghost" type="button" data-open-settings>
+               <i data-lucide="settings"></i><span>设置</span>
+             </button>`
+      }
     </div>
   `;
   document.body.append(popover);
@@ -544,6 +530,15 @@ function bindProfilePopover(): void {
   trigger.addEventListener("click", () => void floating.toggle(), {
     signal: viewAbortController.signal,
   });
+  directSettings?.addEventListener(
+    "click",
+    () => {
+      void floating.close().then(() =>
+        settingsController.open(directSettings),
+      );
+    },
+    { signal: viewAbortController.signal },
+  );
   popover
     .querySelector("[data-profile-save]")
     ?.addEventListener(
@@ -553,10 +548,18 @@ function bindProfilePopover(): void {
           popover.querySelector<HTMLInputElement>("[data-profile-nickname]");
         if (!input) return;
         input.value = saveNickname(input.value);
-        trigger.textContent = channelInitial(input.value);
+        const initial =
+          trigger.querySelector<HTMLElement>("[data-profile-initial]");
+        const name = trigger.querySelector<HTMLElement>("[data-profile-name]");
+        if (initial) initial.textContent = channelInitial(input.value);
+        if (name) name.textContent = input.value;
+        if (!initial && !name) trigger.textContent = channelInitial(input.value);
+        trigger.title = directSettings ? "修改昵称" : input.value;
         trigger.setAttribute(
           "aria-label",
-          `个人资料与设置，当前昵称 ${input.value}`,
+          directSettings
+            ? `修改昵称，当前昵称 ${input.value}`
+            : `个人资料与设置，当前昵称 ${input.value}`,
         );
         toast("昵称已保存");
         void floating.close();
@@ -803,182 +806,27 @@ function bindRecentChannelInteractions(): void {
 
 /* ─── Star field ─────────────────────────────────────────────────── */
 let starCanvas: HTMLCanvasElement | null = null;
-let starAnimId = 0;
 let starController: AbortController | undefined;
 
 function startStarField(): void {
   stopStarField();
-  if (
-    isNativeAndroid() ||
-    matchMedia("(prefers-reduced-motion: reduce)").matches ||
-    document.documentElement.dataset.motion === "reduced" ||
-    document.documentElement.dataset.effectsQuality !== "full"
-  ) {
-    return;
-  }
   const canvas = document.createElement("canvas");
   canvas.id = "star-canvas";
+  canvas.className = "star-field-canvas";
   canvas.dataset.decorativeMotion = "";
   canvas.setAttribute("aria-hidden", "true");
   document.body.prepend(canvas);
   starCanvas = canvas;
   const controller = new AbortController();
   starController = controller;
-
-  type Star = { x: number; y: number; r: number; a: number; da: number; speed: number };
-  const stars: Star[] = [];
-  const starColor =
-    getComputedStyle(document.documentElement)
-      .getPropertyValue("--n-000")
-      .trim();
-  const count = window.innerWidth >= 1440 ? 72 : 48;
-  let width = window.innerWidth;
-  let height = window.innerHeight;
-
-  const resize = (): void => {
-    width = window.innerWidth;
-    height = window.innerHeight;
-    const ratio = Math.min(window.devicePixelRatio || 1, 1.75);
-    canvas.width = Math.max(1, Math.round(width * ratio));
-    canvas.height = Math.max(1, Math.round(height * ratio));
-    canvas.style.width = `${width}px`;
-    canvas.style.height = `${height}px`;
-    canvas.getContext("2d")?.setTransform(ratio, 0, 0, ratio, 0, 0);
-  };
-  resize();
-  window.addEventListener("resize", resize, {
-    passive: true,
-    signal: controller.signal,
-  });
-
-  for (let i = 0; i < count; i++) {
-    stars.push({
-      x: Math.random() * width,
-      y: Math.random() * height,
-      r: Math.random() * 0.8 + 0.25,
-      a: Math.random() * 0.45 + 0.08,
-      da: (Math.random() - 0.5) * 0.0016,
-      speed: Math.random() * 0.018 + 0.004,
-    });
-  }
-
-  const draw = (): void => {
-    if (
-      controller.signal.aborted ||
-      document.hidden ||
-      document.documentElement.dataset.effectsQuality !== "full" ||
-      document.documentElement.dataset.motion === "reduced"
-    ) {
-      starAnimId = 0;
-      return;
-    }
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    ctx.clearRect(0, 0, width, height);
-    ctx.fillStyle = starColor;
-    for (const s of stars) {
-      s.a = Math.max(0.06, Math.min(0.52, s.a + s.da));
-      if (s.a <= 0.06 || s.a >= 0.52) s.da *= -1;
-      s.y -= s.speed;
-      if (s.y < -2) {
-        s.y = height + 2;
-        s.x = Math.random() * width;
-      }
-      ctx.beginPath();
-      ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2);
-      ctx.globalAlpha = s.a;
-      ctx.fill();
-    }
-    ctx.globalAlpha = 1;
-    starAnimId = requestAnimationFrame(draw);
-  };
-  draw();
-  document.addEventListener(
-    "visibilitychange",
-    () => {
-      if (!document.hidden && !starAnimId) draw();
-    },
-    { signal: controller.signal },
-  );
-  effectsQuality.addEventListener(
-    "change",
-    () => {
-      if (
-        document.documentElement.dataset.effectsQuality === "full" &&
-        document.documentElement.dataset.motion !== "reduced" &&
-        !document.hidden &&
-        !starAnimId
-      ) {
-        draw();
-      }
-    },
-    { signal: controller.signal },
-  );
+  bindStarField(canvas, controller.signal);
 }
 
 function stopStarField(): void {
-  if (starAnimId) { cancelAnimationFrame(starAnimId); starAnimId = 0; }
   starController?.abort();
   starController = undefined;
   starCanvas?.remove();
   starCanvas = null;
-}
-
-function bindLocalPointerLight(signal: AbortSignal): void {
-  if (
-    !matchMedia("(hover: hover) and (pointer: fine)").matches ||
-    document.documentElement.dataset.motion === "reduced"
-  ) {
-    return;
-  }
-  let raf = 0;
-  let pending:
-    | { card: HTMLElement; x: number; y: number }
-    | undefined;
-  document
-    .querySelectorAll<HTMLElement>(".interactive-card")
-    .forEach((card) => {
-      card.addEventListener(
-        "pointermove",
-        (event) => {
-          const bounds = card.getBoundingClientRect();
-          pending = {
-            card,
-            x: event.clientX - bounds.left,
-            y: event.clientY - bounds.top,
-          };
-          if (raf) return;
-          raf = requestAnimationFrame(() => {
-            raf = 0;
-            if (!pending) return;
-            pending.card.style.setProperty(
-              "--pointer-x",
-              `${pending.x}px`,
-            );
-            pending.card.style.setProperty(
-              "--pointer-y",
-              `${pending.y}px`,
-            );
-            pending.card.style.setProperty("--pointer-opacity", "1");
-          });
-        },
-        { passive: true, signal },
-      );
-      card.addEventListener(
-        "pointerleave",
-        () => {
-          card.style.setProperty("--pointer-opacity", "0");
-        },
-        { signal },
-      );
-    });
-  signal.addEventListener(
-    "abort",
-    () => {
-      if (raf) cancelAnimationFrame(raf);
-    },
-    { once: true },
-  );
 }
 
 function logoMarkup(label: string): string {
@@ -1027,8 +875,7 @@ function renderDesktopHome(): void {
   stopStarField();
   appRoot.innerHTML = `
     <a class="skip-link" href="#main-content">跳到主要内容</a>
-    <div class="app-frame">
-      ${railMarkup()}
+    <div class="app-frame home-frame">
       <main class="home-main" id="main-content" tabindex="-1">
         <header class="home-topbar">
           ${logoMarkup("朋友放映室")}
@@ -1044,9 +891,7 @@ function renderDesktopHome(): void {
           <div class="hero-copy">
             <span class="eyebrow">PRIVATE WATCH PARTY</span>
             <h1>今晚，和朋友<br /><em>同频看点好的。</em></h1>
-            <p>创建或加入一个最多 8 人的私人频道。屏幕分享优先使用服务器 SFU，异常时自动切换安全兜底线路。</p>
           </div>
-          ${continueChannelMarkup()}
           <div class="home-actions" aria-label="频道操作">
             <button id="choose-host" class="home-action-card interactive-card create-action" type="button">
               <span class="action-icon"><i data-lucide="plus"></i></span>
@@ -1069,23 +914,19 @@ function renderDesktopHome(): void {
           </div>
           <section class="recent-home-section" aria-labelledby="recent-heading">
             <div class="section-heading">
-              <div><span class="eyebrow">RECENT</span><h2 id="recent-heading">最近进入</h2></div>
-              <small>历史只保存在这台设备</small>
+              <div><span class="eyebrow">QUICK JOIN</span><h2 id="recent-heading">快捷加入</h2></div>
+              <small>仅保存在当前设备</small>
             </div>
             <div class="recent-home-grid">${recentHomeMarkup()}</div>
           </section>
         </section>
-        <footer class="home-footer">
-          <span>最多 8 人 · SFU 优先，异常自动兜底</span>
-          <span>服务器不保存影片、声音或聊天历史</span>
-          <span>隐私与媒体线路可在频道内随时查看</span>
-        </footer>
       </main>
+      ${homeProfileMarkup()}
     </div>
   `;
   bindRailNavigation();
   hydrateIcons(appRoot);
-  bindLocalPointerLight(viewAbortController.signal);
+  bindLocalPointerLight(appRoot, viewAbortController.signal);
   startStarField();
   void refreshSignalHealthBadges(viewAbortController.signal);
   document.querySelector("#choose-host")?.addEventListener("click", () =>
@@ -1493,13 +1334,6 @@ async function renderViewer(options: ViewerOptions = {}): Promise<void> {
 
 settingsController = new SettingsController({
   notify: toast,
-  onOpenDesignLab: () => {
-    resetViewLifecycle();
-    stopStarField();
-    renderDesignLab(appRoot, () =>
-      navigate(renderDesktopHome, "home"),
-    );
-  },
 });
 if (isNativeAndroid()) {
   void App.addListener("backButton", () => {
@@ -1520,7 +1354,7 @@ if (isNativeAndroid()) {
 document.addEventListener("synced:open-settings", (event) => {
   const detail = (
     event as CustomEvent<
-      "appearance" | "playback" | "voice" | "network" | "emby" | "advanced" | "about"
+      "appearance" | "network" | "emby" | "about"
     >
   ).detail;
   void settingsController.open(

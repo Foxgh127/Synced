@@ -1,17 +1,10 @@
 import { HOME_SIGNAL_URL, normalizeSignalUrl } from "../config";
 import { isNativeAndroid } from "../immersive";
-import {
-  effectsQuality,
-  type AmbientPreference,
-  type EffectsPreference,
-  type MotionPreference,
-  type TransparencyPreference,
-} from "./effects-quality";
+import { effectsQuality } from "./effects-quality";
 import { dialogController } from "./dialog-controller";
 import { hydrateIcons } from "./icons";
 
 interface SettingsControllerOptions {
-  onOpenDesignLab: () => void;
   notify: (
     message: string,
     type?: "info" | "warn" | "danger" | boolean,
@@ -19,13 +12,10 @@ interface SettingsControllerOptions {
 }
 
 const CATEGORIES = [
-  ["appearance", "外观"],
-  ["playback", "播放"],
-  ["voice", "连麦"],
-  ["network", "网络"],
-  ["emby", "Emby"],
-  ["advanced", "高级"],
-  ["about", "关于"],
+  ["appearance", "常用", "sliders-horizontal"],
+  ["network", "网络", "wifi"],
+  ["emby", "Emby", "library"],
+  ["about", "关于", "circle-help"],
 ] as const;
 
 function selectOptions(
@@ -100,151 +90,112 @@ export class SettingsController {
     dialog.setAttribute("aria-labelledby", "settings-title");
     dialog.innerHTML = `
       <div class="settings-layout">
+        <header class="dialog-header settings-header">
+          <div>
+            <span class="eyebrow">PREFERENCES</span>
+            <h2 id="settings-title">设置</h2>
+          </div>
+          <button class="btn btn-ghost btn-icon" type="button"
+            data-dialog-close aria-label="关闭设置"><i data-lucide="x"></i></button>
+        </header>
         <nav class="settings-nav" aria-label="设置分类" role="tablist">
           ${CATEGORIES.map(
-            ([key, label], index) => `
+            ([key, label, icon], index) => `
               <button class="btn btn-ghost" type="button" role="tab"
                 id="settings-tab-${key}" data-settings-tab="${key}"
                 aria-selected="${index === 0}"
-                aria-controls="settings-panel-${key}">${label}</button>`,
+                aria-controls="settings-panel-${key}">
+                <i data-lucide="${icon}"></i><span>${label}</span>
+              </button>`,
           ).join("")}
         </nav>
         <main class="settings-content">
-          <header class="dialog-header">
-            <div>
-              <span class="eyebrow">PREFERENCES</span>
-              <h2 id="settings-title">设置</h2>
-            </div>
-            <button class="btn btn-ghost btn-icon" type="button"
-              data-dialog-close aria-label="关闭设置"><i data-lucide="x"></i></button>
-          </header>
           <section class="settings-section" id="settings-panel-appearance"
             role="tabpanel" aria-labelledby="settings-tab-appearance">
-            <div class="setting-row">
-              <span><strong>动态效果</strong><small>系统会结合温度、电量和设备性能自动降级。</small></span>
-              <select id="setting-effects" aria-label="动态效果">
-                ${selectOptions(
-                  [
-                    ["auto", "自动"],
-                    ["full", "完整"],
-                    ["balanced", "平衡"],
-                    ["minimal", "精简"],
-                  ],
-                  appearance.effects,
-                )}
-              </select>
+            <header class="settings-panel-heading">
+              <h3>常用设置</h3>
+              <p>只保留观看和连麦时真正需要调整的项目。</p>
+            </header>
+            <div class="settings-group">
+              <h4>显示与弹幕</h4>
+              <div class="setting-row">
+                <span><strong>界面缩放</strong><small>调整桌面界面的整体阅读尺寸。</small></span>
+                <select id="setting-scale" aria-label="界面缩放">
+                  ${selectOptions(
+                    [
+                      ["0.9", "90%"],
+                      ["1", "100%"],
+                      ["1.1", "110%"],
+                      ["1.25", "125%"],
+                    ],
+                    localStorage.getItem("synced:ui-scale") || "1",
+                  )}
+                </select>
+              </div>
+              <div class="setting-row">
+                <span><strong>弹幕强度</strong><small>控制同时出现的弹幕数量。</small></span>
+                <select id="setting-danmaku-density" aria-label="弹幕强度">
+                  ${selectOptions(
+                    [
+                      ["low", "低"],
+                      ["balanced", "平衡"],
+                      ["high", "高"],
+                    ],
+                    localStorage.getItem("synced:danmaku-density") ||
+                      "balanced",
+                  )}
+                </select>
+              </div>
+              <label class="setting-row">
+                <span><strong>高对比度</strong><small>增强文字、边缘和焦点状态。</small></span>
+                <input id="setting-high-contrast" type="checkbox" ${appearance.highContrast ? "checked" : ""} />
+              </label>
             </div>
-            <div class="setting-row">
-              <span><strong>沉浸光感</strong><small>仅在视频容器外低频采样，不覆盖画面。</small></span>
-              <select id="setting-ambient" aria-label="沉浸光感">
-                ${selectOptions(
-                  [
-                    ["auto", "自动"],
-                    ["on", "开启"],
-                    ["off", "关闭"],
-                  ],
-                  appearance.ambient,
-                )}
-              </select>
+            <div class="settings-group">
+              <h4>播放</h4>
+              <div class="setting-row">
+                <span><strong>默认全屏显示</strong><small>选择画面在全屏中的铺放方式。</small></span>
+                <select data-storage-setting="synced:fullscreen-fit">
+                  ${selectOptions(
+                    [
+                      ["smart", "智能铺满"],
+                      ["contain", "完整画面"],
+                      ["cover", "铺满屏幕"],
+                    ],
+                    localStorage.getItem("synced:fullscreen-fit") ||
+                      (isNativeAndroid() ? "contain" : "smart"),
+                  )}
+                </select>
+              </div>
+              <div class="setting-row">
+                <span><strong>GPU 4K 超分</strong><small>NVIDIA RTX Video 优先；其他显卡使用 4K 边缘自适应重建。</small></span>
+                <select data-storage-setting="synced:video-enhancement">
+                  ${selectOptions(
+                    [
+                      ["auto", "开启"],
+                      ["off", "关闭"],
+                    ],
+                    localStorage.getItem("synced:video-enhancement") || "auto",
+                  )}
+                </select>
+              </div>
             </div>
-            <div class="setting-row">
-              <span><strong>透明材质</strong><small>降低透明度后所有玻璃面板使用实体表面。</small></span>
-              <select id="setting-transparency" aria-label="透明材质">
-                ${selectOptions(
-                  [
-                    ["auto", "自动"],
-                    ["reduced", "降低透明度"],
-                  ],
-                  appearance.transparency,
-                )}
-              </select>
-            </div>
-            <div class="setting-row">
-              <span><strong>动效</strong><small>减少动态仍保留短淡化和必要状态反馈。</small></span>
-              <select id="setting-motion" aria-label="动效">
-                ${selectOptions(
-                  [
-                    ["system", "跟随系统"],
-                    ["full", "完整"],
-                    ["reduced", "减少"],
-                  ],
-                  appearance.motion,
-                )}
-              </select>
-            </div>
-            <div class="setting-row">
-              <span><strong>界面缩放</strong><small>调整桌面界面的整体阅读尺寸。</small></span>
-              <select id="setting-scale" aria-label="界面缩放">
-                ${selectOptions(
-                  [
-                    ["0.9", "90%"],
-                    ["1", "100%"],
-                    ["1.1", "110%"],
-                    ["1.25", "125%"],
-                  ],
-                  localStorage.getItem("synced:ui-scale") || "1",
-                )}
-              </select>
-            </div>
-            <div class="setting-row">
-              <span><strong>弹幕强度</strong><small>控制同时出现的弹幕密度，不影响聊天历史。</small></span>
-              <select id="setting-danmaku-density" aria-label="弹幕强度">
-                ${selectOptions(
-                  [
-                    ["low", "低"],
-                    ["balanced", "平衡"],
-                    ["high", "高"],
-                  ],
-                  localStorage.getItem("synced:danmaku-density") ||
-                    "balanced",
-                )}
-              </select>
-            </div>
-            <label class="setting-row">
-              <span><strong>高对比度</strong><small>增强文字、边缘和焦点状态的区分。</small></span>
-              <input id="setting-high-contrast" type="checkbox" ${appearance.highContrast ? "checked" : ""} />
-            </label>
-          </section>
-          <section class="settings-section" id="settings-panel-playback"
-            role="tabpanel" aria-labelledby="settings-tab-playback" hidden>
-            <div class="setting-row"><span><strong>默认全屏显示</strong><small>智能铺满会稳定检测黑边并保留字幕安全区。</small></span>
-              <select data-storage-setting="synced:fullscreen-fit">
-                ${selectOptions(
-                  [
-                    ["smart", "智能铺满"],
-                    ["contain", "完整画面"],
-                    ["cover", "铺满屏幕"],
-                  ],
-                  localStorage.getItem("synced:fullscreen-fit") ||
-                    (isNativeAndroid() ? "contain" : "smart"),
-                )}
-              </select>
-            </div>
-            <div class="setting-row"><span><strong>GPU 清晰增强</strong><small>仅在资源预算允许且低分辨率内容需要放大时启用。</small></span>
-              <select data-storage-setting="synced:video-enhancement">
-                ${selectOptions(
-                  [
-                    ["auto", "自动"],
-                    ["off", "关闭"],
-                  ],
-                  localStorage.getItem("synced:video-enhancement") || "auto",
-                )}
-              </select>
-            </div>
-          </section>
-          <section class="settings-section" id="settings-panel-voice"
-            role="tabpanel" aria-labelledby="settings-tab-voice" hidden>
-            <div class="setting-row"><span><strong>默认降噪</strong><small>强力模式会在资源紧张时自动降级。</small></span>
-              <select data-storage-setting="synced:voice-noise-mode">
-                ${selectOptions(
-                  [
-                    ["natural", "自然降噪"],
-                    ["clear", "清晰人声"],
-                    ["strong", "强力消噪"],
-                  ],
-                  localStorage.getItem("synced:voice-noise-mode") || "clear",
-                )}
-              </select>
+            <div class="settings-group">
+              <h4>连麦</h4>
+              <div class="setting-row">
+                <span><strong>默认降噪</strong><small>选择加入连麦时的人声处理强度。</small></span>
+                <select data-storage-setting="synced:voice-noise-mode">
+                  ${selectOptions(
+                    [
+                      ["natural", "自然降噪"],
+                      ["clear", "清晰人声"],
+                      ["strong", "强力消噪"],
+                    ],
+                    localStorage.getItem("synced:voice-noise-mode") ||
+                      "clear",
+                  )}
+                </select>
+              </div>
             </div>
           </section>
           <section class="settings-section" id="settings-panel-network"
@@ -301,21 +252,19 @@ export class SettingsController {
                 : `<p>Emby 高清放映及安全账户存储仅在 Windows 客户端提供。</p>`
             }
           </section>
-          <section class="settings-section" id="settings-panel-advanced"
-            role="tabpanel" aria-labelledby="settings-tab-advanced" hidden>
-            <div class="setting-row">
-              <span><strong>Design Lab</strong><small>查看所有材质、组件状态、焦点和降级模式。</small></span>
-              <button id="open-design-lab" class="btn btn-secondary" type="button">打开</button>
-            </div>
-            <div class="setting-row">
-              <span><strong>UI 版本</strong><small>当前启用 Synced Luminous Theater UI 3.0。</small></span>
-              <output class="mono">luminous-3</output>
-            </div>
-          </section>
           <section class="settings-section" id="settings-panel-about"
             role="tabpanel" aria-labelledby="settings-tab-about" hidden>
-            <h3>同频 Native ${escapeHtml(__APP_VERSION__)}</h3>
-            <p>深黑内容层承载影片，空间卡片承载信息，玻璃材质只承载控制。</p>
+            <div class="settings-about">
+              <img src="./brand-mark.svg" width="56" height="56" alt="" aria-hidden="true" />
+              <div>
+                <h3>同频</h3>
+                <p>和朋友同步观看屏幕、影片，并共享弹幕与连麦。</p>
+              </div>
+            </div>
+            <div class="settings-about-meta">
+              <span>版本</span>
+              <strong class="mono">${escapeHtml(__APP_VERSION__)}</strong>
+            </div>
           </section>
         </main>
       </div>
@@ -371,28 +320,6 @@ export class SettingsController {
         );
       });
 
-    const bindAppearance = <T extends string>(
-      selector: string,
-      key: "effects" | "ambient" | "transparency" | "motion",
-    ): void => {
-      dialog
-        .querySelector<HTMLSelectElement>(selector)
-        ?.addEventListener(
-          "change",
-          (event) => {
-            const value = (event.currentTarget as HTMLSelectElement).value as T;
-            effectsQuality.update({ [key]: value });
-          },
-          { signal },
-        );
-    };
-    bindAppearance<EffectsPreference>("#setting-effects", "effects");
-    bindAppearance<AmbientPreference>("#setting-ambient", "ambient");
-    bindAppearance<TransparencyPreference>(
-      "#setting-transparency",
-      "transparency",
-    );
-    bindAppearance<MotionPreference>("#setting-motion", "motion");
     dialog
       .querySelector<HTMLInputElement>("#setting-high-contrast")
       ?.addEventListener(
@@ -484,17 +411,6 @@ export class SettingsController {
       ?.addEventListener(
         "click",
         (event) => void this.handleEmbyAccountAction(event),
-        { signal },
-      );
-    dialog
-      .querySelector<HTMLButtonElement>("#open-design-lab")
-      ?.addEventListener(
-        "click",
-        () => {
-          void dialogController.close(dialog).then(() =>
-            this.options.onOpenDesignLab(),
-          );
-        },
         { signal },
       );
   }

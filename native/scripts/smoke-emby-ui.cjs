@@ -67,7 +67,11 @@ function makeFixture(target) {
 
 async function createMockEmby(source) {
   const token = "ui-host-only-secret";
+  const cover = Buffer.from(
+    `<svg xmlns="http://www.w3.org/2000/svg" width="240" height="360" viewBox="0 0 240 360"><rect width="240" height="360" rx="20" fill="#171b2c"/><circle cx="120" cy="132" r="54" fill="#7c6cff"/><path d="m105 100 53 32-53 32z" fill="#ffffff"/><text x="120" y="248" fill="#ffffff" font-size="22" text-anchor="middle">EMBY UI</text></svg>`,
+  );
   const audit = {
+    imageRequests: 0,
     mediaRequests: 0,
     playbackReports: 0,
     logout: 0,
@@ -156,6 +160,19 @@ async function createMockEmby(source) {
           },
         ],
       });
+      return;
+    }
+    if (url.pathname === "/Items/movie-ui/Images/Primary") {
+      if (request.headers["x-emby-token"] !== token) {
+        response.writeHead(401).end();
+        return;
+      }
+      audit.imageRequests += 1;
+      response.writeHead(200, {
+        "content-type": "image/svg+xml",
+        "content-length": cover.length,
+      });
+      response.end(cover);
       return;
     }
     if (url.pathname === "/Videos/movie-ui/stream") {
@@ -510,7 +527,19 @@ async function main() {
     await click(window, "document.querySelector('#emby-login-submit')");
     await waitFor(
       window,
-      "Boolean(document.querySelector('[data-emby-item]'))",
+      `(() => {
+        const image = document.querySelector("[data-emby-image]");
+        const placeholder = image
+          ?.closest(".emby-poster")
+          ?.querySelector(".emby-poster-placeholder");
+        return Boolean(
+          document.querySelector("[data-emby-item]") &&
+          image?.dataset.imageState === "ready" &&
+          !image.hidden &&
+          image.naturalWidth > 0 &&
+          placeholder?.hidden
+        );
+      })()`,
     );
     const passwordAfterLogin = await window.webContents.executeJavaScript(
       "document.querySelector('#emby-password').value",
@@ -529,6 +558,7 @@ async function main() {
           !document.querySelector("#emby-selection-panel") &&
           Boolean(document.querySelector("#emby-selection-panel-popup")) &&
           Boolean(document.querySelector("#emby-start-from-popup")) &&
+          document.querySelector(".emby-popup-poster-img")?.naturalWidth > 0 &&
           !/正在读取|正在请求/.test(
             document.querySelector("#emby-stream-method")?.textContent || ""
           ) &&
@@ -544,6 +574,14 @@ async function main() {
       const popup = document.querySelector("#emby-item-popup");
       const options = document.querySelector(".emby-popup-options");
       const popupRect = popup?.getBoundingClientRect();
+      const mediaSource = document.querySelector("#emby-media-source");
+      const mediaSourceStyle = mediaSource
+        ? getComputedStyle(mediaSource)
+        : undefined;
+      const mediaSourceLabel = mediaSource?.closest("label");
+      const overview = document.querySelector(".emby-popup-overview");
+      const resumeInput = document.querySelector("#emby-resume-playback");
+      const resumeStyle = getComputedStyle(resumeInput);
       return {
         clientWidth: popup?.clientWidth || 0,
         scrollWidth: popup?.scrollWidth || 0,
@@ -552,13 +590,29 @@ async function main() {
         controlsInside: [...options.querySelectorAll("select")].every((select) => {
           const rect = select.getBoundingClientRect();
           return rect.left >= popupRect.left && rect.right <= popupRect.right;
-        })
+        }),
+        controlsStyled:
+          mediaSourceStyle?.appearance === "none" &&
+          Number.parseFloat(mediaSourceStyle?.borderRadius || "0") >= 8 &&
+          (mediaSource?.getBoundingClientRect().height || 0) >= 44 &&
+          getComputedStyle(mediaSourceLabel, "::after").content !== "none",
+        overviewWidth: Math.round(overview?.getBoundingClientRect().width || 0),
+        overviewLineHeight: Number.parseFloat(
+          getComputedStyle(overview).lineHeight || "0"
+        ),
+        resumeWidth: resumeStyle.width,
+        resumeHeight: resumeStyle.height,
       };
     })()`);
     if (
       popupLayout.scrollWidth > popupLayout.clientWidth + 1 ||
       popupLayout.optionsScrollWidth > popupLayout.optionsClientWidth + 1 ||
-      !popupLayout.controlsInside
+      !popupLayout.controlsInside ||
+      !popupLayout.controlsStyled ||
+      popupLayout.overviewWidth < 300 ||
+      popupLayout.overviewLineHeight < 20 ||
+      popupLayout.resumeWidth !== "20px" ||
+      popupLayout.resumeHeight !== "20px"
     ) {
       throw new Error(
         `Emby popup overflowed horizontally: ${JSON.stringify(popupLayout)}`,
@@ -592,6 +646,7 @@ async function main() {
           currentTime: video.currentTime,
           readyState: video.readyState,
           paused: video.paused,
+          nativeControls: video.controls,
           legacyStageBadges:
             Boolean(document.querySelector("#local-stage-badge")) ||
             Boolean(document.querySelector("#audio-route-badge")),
@@ -617,6 +672,9 @@ async function main() {
     if (playback.legacyStageBadges) {
       throw new Error("obsolete LIVE/audio stage badges are still rendered");
     }
+    if (playback.nativeControls) {
+      throw new Error("native video controls duplicated the custom playback dock");
+    }
     if (!/Emby/i.test(playback.mediaStatus || "")) {
       throw new Error(`missing compact Emby HUD status: ${playback.mediaStatus}`);
     }
@@ -627,16 +685,40 @@ async function main() {
     }
     const keyboardMute = await window.webContents.executeJavaScript(`(() => {
       const video = document.querySelector("#channel-video");
+      const button = document.querySelector("#dock-mute");
       document.body.dispatchEvent(
         new KeyboardEvent("keydown", { code: "KeyM", bubbles: true })
       );
       const muted = video?.muted === true;
+      const mutedVisual =
+        button?.getAttribute("aria-pressed") === "true" &&
+        getComputedStyle(
+          button?.querySelector(".dock-volume-muted")
+        ).display !== "none" &&
+        getComputedStyle(
+          button?.querySelector(".dock-volume-audible")
+        ).display === "none";
       document.body.dispatchEvent(
         new KeyboardEvent("keydown", { code: "KeyM", bubbles: true })
       );
-      return { muted, restored: video?.muted === false };
+      const restored =
+        video?.muted === false &&
+        button?.getAttribute("aria-pressed") === "false";
+      const audibleVisual =
+        getComputedStyle(
+          button?.querySelector(".dock-volume-audible")
+        ).display !== "none" &&
+        getComputedStyle(
+          button?.querySelector(".dock-volume-muted")
+        ).display === "none";
+      return { muted, mutedVisual, restored, audibleVisual };
     })()`);
-    if (!keyboardMute.muted || !keyboardMute.restored) {
+    if (
+      !keyboardMute.muted ||
+      !keyboardMute.mutedVisual ||
+      !keyboardMute.restored ||
+      !keyboardMute.audibleVisual
+    ) {
       throw new Error(
         `Emby host M shortcut did not toggle local audio: ${JSON.stringify(
           keyboardMute,
@@ -644,6 +726,62 @@ async function main() {
       );
     }
     playback.keyboardMute = keyboardMute;
+
+    phase = "verify picture settings modal";
+    await click(
+      window,
+      `document.querySelector("#dock-quality")`,
+    );
+    await waitFor(
+      window,
+      `document.querySelector("#picture-dialog")?.dataset.presence === "present"`,
+    );
+    const pictureDialogVisuals =
+      await window.webContents.executeJavaScript(`(() => {
+        const dialog = document.querySelector("#picture-dialog");
+        const correction = document.querySelector("#highlight-correction");
+        const enhancement = document.querySelector("#video-enhancement");
+        const correctionRect = correction?.getBoundingClientRect();
+        const enhancementRect = enhancement?.getBoundingClientRect();
+        return {
+          backdropOpacity: Number.parseFloat(
+            getComputedStyle(dialog, "::backdrop").opacity || "0"
+          ),
+          correctionWidth: Math.round(correctionRect?.width || 0),
+          correctionHeight: Math.round(correctionRect?.height || 0),
+          enhancementWidth: Math.round(enhancementRect?.width || 0),
+          enhancementHeight: Math.round(enhancementRect?.height || 0),
+          correctionLayout: getComputedStyle(
+            correction?.closest(".highlight-correction")
+          ).display,
+          modalOpen: document.body.dataset.modalOpen === "true"
+        };
+      })()`);
+    if (
+      pictureDialogVisuals.backdropOpacity < 0.99 ||
+      pictureDialogVisuals.correctionWidth !== 46 ||
+      pictureDialogVisuals.correctionHeight !== 26 ||
+      pictureDialogVisuals.enhancementWidth !== 46 ||
+      pictureDialogVisuals.enhancementHeight !== 26 ||
+      pictureDialogVisuals.correctionLayout !== "flex" ||
+      !pictureDialogVisuals.modalOpen
+    ) {
+      throw new Error(
+        `picture settings modal regressed: ${JSON.stringify(
+          pictureDialogVisuals,
+        )}`,
+      );
+    }
+    await click(
+      window,
+      `document.querySelector("[data-close-picture]")`,
+    );
+    await waitFor(
+      window,
+      `document.querySelector("#picture-dialog")?.open === false &&
+       document.body.dataset.modalOpen !== "true"`,
+    );
+    playback.pictureDialogVisuals = pictureDialogVisuals;
 
     // Reproduce the host-side regression reported by users: pausing and then
     // seeking used to restart the replacement MediaSource from zero. Keep the

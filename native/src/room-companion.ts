@@ -5,6 +5,7 @@ import { dialogController } from "./ui/dialog-controller";
 import { FloatingSurface } from "./ui/floating-surface";
 import { hydrateIcons } from "./ui/icons";
 import { animateElement } from "./ui/motion-controller";
+import { PresenceController } from "./ui/presence-controller";
 import {
   VoiceMesh,
   type VoiceDevices,
@@ -61,35 +62,15 @@ function emojiPickerMarkup(): string {
 
 export function roomSidebarMarkup(): string {
   return `
-    <button id="companion-scrim" class="companion-scrim" type="button"
-            tabindex="-1" aria-label="关闭频道陪伴面板" hidden></button>
-    <aside class="room-sidebar companion-panel material-regular" aria-label="频道陪伴面板">
-      <header class="companion-header">
-        <div id="companion-sheet-handle" class="companion-sheet-handle" aria-hidden="true">
-          <span></span>
+    <aside id="room-companion-panel" class="room-sidebar companion-panel" aria-label="频道成员与弹幕">
+      <section class="chat-card" id="chat-panel" tabindex="-1">
+        <div class="panel-heading compact-heading">
+          <div>
+            <span class="panel-kicker">实时弹幕</span>
+            <h2>弹幕聊天</h2>
+          </div>
+          <span id="danmaku-surface-state" class="danmaku-surface-state" hidden>光影交织，共此时光</span>
         </div>
-        <div class="companion-tabs" role="tablist" aria-label="频道陪伴内容">
-          <button id="companion-chat-tab" class="companion-tab is-active" type="button"
-                  role="tab" aria-selected="true" aria-controls="chat-panel"
-                  data-selected="true" data-companion-tab="chat">
-            聊天
-          </button>
-          <button id="companion-members-tab" class="companion-tab" type="button"
-                  role="tab" aria-selected="false" aria-controls="member-panel"
-                  data-selected="false" data-companion-tab="members">
-            成员 <span id="member-count" class="member-count-badge tnum">1 / ${MAX_ROOM_PARTICIPANTS}</span>
-          </button>
-        </div>
-        <button class="btn btn-ghost btn-icon panel-toggle" id="panel-toggle"
-                type="button" aria-label="收起频道陪伴面板" aria-expanded="true"
-                title="收起频道陪伴面板" data-tooltip="收起频道陪伴面板">
-          <i data-lucide="x"></i>
-        </button>
-      </header>
-      <div class="companion-content">
-      <section class="chat-card companion-tab-panel" id="chat-panel" role="tabpanel"
-               aria-labelledby="companion-chat-tab" tabindex="-1">
-        <span id="danmaku-surface-state" class="danmaku-surface-state" hidden>光影交织，共此时光</span>
         <div class="chat-log-shell">
           <div id="chat-log" class="chat-log" role="log" aria-live="polite"></div>
           <button id="chat-jump-latest" class="chat-jump-latest chat-unread-badge" type="button" hidden>
@@ -111,13 +92,22 @@ export function roomSidebarMarkup(): string {
           <button type="submit" class="chat-send-btn" aria-label="发送弹幕"><i data-lucide="send"></i><span>发送</span></button>
         </form>
       </section>
-      <section class="voice-card companion-tab-panel" id="member-panel" role="tabpanel"
-               aria-labelledby="companion-members-tab" tabindex="-1" hidden>
+      <section class="voice-card" id="member-panel" tabindex="-1">
+        <div class="voice-card-header">
+          <div class="voice-card-title">
+            <span class="voice-status-dot" id="voice-status-dot" aria-hidden="true"></span>
+            <h2>连麦频道</h2>
+          </div>
+          <div class="voice-card-meta">
+            <span id="member-count" class="member-count-badge tnum">1 / ${MAX_ROOM_PARTICIPANTS}</span>
+            <button id="voice-settings-toggle" class="voice-settings-btn" type="button"
+                    aria-label="打开连麦设备设置" aria-expanded="false"
+                    aria-controls="voice-device-panel" title="连麦设置">
+              <i data-lucide="settings"></i>
+            </button>
+          </div>
+        </div>
         <div id="participant-list" class="participant-list"></div>
-      </section>
-      </div>
-      <footer class="voice-control-bar" aria-label="连麦控制">
-        <span class="voice-status-dot" id="voice-status-dot" aria-hidden="true"></span>
         <div class="voice-join-area">
           <button id="voice-button" class="voice-join-btn" type="button">
             <span class="voice-join-icon">
@@ -127,11 +117,6 @@ export function roomSidebarMarkup(): string {
           </button>
           <button id="mute-button" class="mute-btn" type="button" disabled aria-label="静音">
             <i data-lucide="mic-off"></i>
-          </button>
-          <button id="voice-settings-toggle" class="voice-settings-btn" type="button"
-                  aria-label="打开连麦设备设置" aria-expanded="false"
-                  aria-controls="voice-device-panel" title="设备">
-            <i data-lucide="settings"></i><span>设备</span>
           </button>
         </div>
         <div id="voice-device-panel" class="voice-device-panel material-regular" hidden
@@ -168,10 +153,8 @@ export function roomSidebarMarkup(): string {
             </button>
           </div>
         </div>
-      </footer>
+      </section>
       <div id="voice-audio" hidden></div>
-      <!-- #voice-quality is read by smoke tests to verify noise-suppression state; keep hidden -->
-      <p id="voice-quality" class="voice-quality" hidden aria-hidden="true"></p>
     </aside>
   `;
 }
@@ -185,7 +168,7 @@ export class RoomCompanion {
   private readonly voice: VoiceMesh;
   private readonly uiAbortController = new AbortController();
   private emojiSurface?: FloatingSurface;
-  private deviceSurface?: FloatingSurface;
+  private deviceSettingsPresence?: PresenceController;
   private microphoneTestAbort?: AbortController;
   private destroyed = false;
   private deviceRefreshSequence = 0;
@@ -452,7 +435,7 @@ export class RoomCompanion {
     this.destroyed = true;
     this.uiAbortController.abort();
     this.emojiSurface?.destroy();
-    this.deviceSurface?.destroy();
+    this.deviceSettingsPresence?.cancel();
     this.microphoneTestAbort?.abort();
     this.voice.removeEventListener(
       "statechange",
@@ -555,68 +538,6 @@ export class RoomCompanion {
         },
         listenerOptions,
       );
-    const tabButtons = [
-      ...document.querySelectorAll<HTMLButtonElement>("[data-companion-tab]"),
-    ];
-    const setCompanionTab = (tab: "chat" | "members"): void => {
-      for (const button of tabButtons) {
-        const selected = button.dataset.companionTab === tab;
-        button.classList.toggle("is-active", selected);
-        button.setAttribute("aria-selected", String(selected));
-        button.dataset.selected = String(selected);
-        button.tabIndex = selected ? 0 : -1;
-      }
-      const chatPanel = document.querySelector<HTMLElement>("#chat-panel");
-      const memberPanel =
-        document.querySelector<HTMLElement>("#member-panel");
-      if (chatPanel) chatPanel.hidden = tab !== "chat";
-      if (memberPanel) memberPanel.hidden = tab !== "members";
-      if (tab === "chat") {
-        queueMicrotask(() => {
-          if (chatLog && this.isChatNearBottom(chatLog)) {
-            chatLog.scrollTop = chatLog.scrollHeight;
-            this.clearChatUnread();
-          }
-        });
-      }
-    };
-    for (const button of tabButtons) {
-      button.addEventListener(
-        "click",
-        () =>
-          setCompanionTab(
-            button.dataset.companionTab === "members"
-              ? "members"
-              : "chat",
-          ),
-        listenerOptions,
-      );
-      button.addEventListener(
-        "keydown",
-        (event) => {
-          if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
-            return;
-          }
-          event.preventDefault();
-          const next =
-            event.key === "ArrowRight" || event.key === "End"
-              ? tabButtons.at(-1)
-              : tabButtons[0];
-          next?.click();
-          next?.focus();
-        },
-        listenerOptions,
-      );
-    }
-    document.addEventListener(
-      "synced:companion-tab",
-      (event) => {
-        const tab = (event as CustomEvent<"chat" | "members">).detail;
-        setCompanionTab(tab === "members" ? "members" : "chat");
-      },
-      listenerOptions,
-    );
-
     const emojiToggle =
       document.querySelector<HTMLButtonElement>("#chat-emoji-toggle");
     const emojiPanel =
@@ -662,13 +583,87 @@ export class RoomCompanion {
     const devicePanel =
       document.querySelector<HTMLElement>("#voice-device-panel");
     if (deviceButton && devicePanel) {
-      this.deviceSurface = new FloatingSurface(deviceButton, devicePanel, {
-        placement: "top-end",
-        closeOnOutside: true,
+      this.deviceSettingsPresence = new PresenceController(devicePanel, {
+        enter: [
+          {
+            opacity: 0,
+            transform: "translateY(-10px) scale(0.975)",
+          },
+          {
+            opacity: 1,
+            transform: "translateY(0) scale(1.012)",
+            offset: 0.72,
+          },
+          { opacity: 1, transform: "none" },
+        ],
+        exit: [
+          { opacity: 1, transform: "none" },
+          {
+            opacity: 0,
+            transform: "translateY(-6px) scale(0.985)",
+          },
+        ],
       });
+      let deviceSettingsOperation = 0;
+      const setDevicePanelOpen = async (open: boolean): Promise<void> => {
+        const operation = ++deviceSettingsOperation;
+        deviceButton.classList.toggle("active", open);
+        deviceButton.setAttribute("aria-expanded", String(open));
+        deviceButton.setAttribute(
+          "aria-label",
+          open ? "关闭连麦设备设置" : "打开连麦设备设置",
+        );
+        if (open) {
+          devicePanel.classList.add("voice-settings-visible");
+          void this.refreshVoiceDevices();
+          const shown = await this.deviceSettingsPresence?.show(
+            this.uiAbortController.signal,
+          );
+          if (
+            !shown ||
+            operation !== deviceSettingsOperation ||
+            this.destroyed
+          ) {
+            return;
+          }
+          devicePanel
+            .querySelector<HTMLElement>("select, input, button")
+            ?.focus();
+          return;
+        }
+        const hidden = await this.deviceSettingsPresence?.hide(
+          this.uiAbortController.signal,
+        );
+        if (
+          !hidden ||
+          operation !== deviceSettingsOperation ||
+          this.destroyed
+        ) {
+          return;
+        }
+        devicePanel.classList.remove("voice-settings-visible");
+      };
       deviceButton.addEventListener(
         "click",
-        () => void this.deviceSurface?.toggle(),
+        () => {
+          void setDevicePanelOpen(
+            deviceButton.getAttribute("aria-expanded") !== "true",
+          );
+        },
+        listenerOptions,
+      );
+      document.addEventListener(
+        "keydown",
+        (event) => {
+          if (
+            event.key !== "Escape" ||
+            deviceButton.getAttribute("aria-expanded") !== "true"
+          ) {
+            return;
+          }
+          void setDevicePanelOpen(false);
+          deviceButton.focus();
+        },
         listenerOptions,
       );
     }
@@ -1394,7 +1389,8 @@ export class RoomCompanion {
   private renderVoiceState(state: VoiceState): void {
     const button = document.querySelector<HTMLButtonElement>("#voice-button");
     const mute = document.querySelector<HTMLButtonElement>("#mute-button");
-    const quality = document.querySelector<HTMLElement>("#voice-quality");
+    const companionPanel =
+      document.querySelector<HTMLElement>("#room-companion-panel");
     const input = document.querySelector<HTMLSelectElement>(
       "#voice-input-device",
     );
@@ -1436,7 +1432,7 @@ export class RoomCompanion {
             : "关闭自己的麦克风",
       );
     }
-    if (quality) {
+    if (companionPanel) {
       const transportLabel =
         state.transport === "sfu"
           ? "语音 SFU"
@@ -1451,8 +1447,7 @@ export class RoomCompanion {
                 ? "清晰人声 · 语音隔离 + 动态人声增强"
                 : "自然降噪 · 系统保真处理"
             : "直通保护 · 降噪处理器正在恢复";
-      quality.hidden = !state.active;
-      quality.textContent = state.active
+      companionPanel.dataset.voiceQuality = state.active
         ? state.listeningOnly
           ? `正在收听共享伴奏 · 无需麦克风权限 · ${transportLabel} · ${state.connectedPeers ? `已连通 ${state.connectedPeers} 位好友` : "正在建立音频连接"}`
           : `${state.connectedPeers ? `已连通 ${state.connectedPeers} 位好友` : "等待好友加入连麦"} · ${

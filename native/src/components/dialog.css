@@ -18,6 +18,10 @@ dialog::backdrop {
   opacity: 0;
 }
 
+dialog[open]::backdrop {
+  opacity: 1;
+}
+
 dialog[open] {
   opacity: 1;
   transform: none;

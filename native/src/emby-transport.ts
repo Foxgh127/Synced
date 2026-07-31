@@ -2021,7 +2021,7 @@ export function detectEmbyMediaCapabilities(): {
   hevc: boolean;
   aac: boolean;
   desktop: boolean;
-  videoEnhancementBackends: Array<"webgl2-spatial">;
+  videoEnhancementBackends: Array<"webgl2-spatial" | "rtx-video">;
   maxEnhancementPixels: number;
 } {
   const mediaSource = globalThis.MediaSource;

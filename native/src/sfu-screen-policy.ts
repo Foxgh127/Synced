@@ -35,10 +35,14 @@ export function resolveSfuScreenSubscription(
       sourceHeight,
     ),
   );
-  const requestedWidth =
+  const rawRequestedWidth =
     preference.width && preference.width > 0
       ? Math.min(Math.round(preference.width), sourceWidth)
       : Math.round((requestedHeight * sourceWidth) / sourceHeight);
+  const requestedWidth =
+    rawRequestedWidth >= 16
+      ? Math.max(16, Math.floor(rawRequestedWidth / 16) * 16)
+      : rawRequestedWidth;
   const emergency = requestedHeight <= 480;
   let quality: SfuScreenSubscriptionTarget["quality"] = "high";
   if (sourceHeight > 1_080) {

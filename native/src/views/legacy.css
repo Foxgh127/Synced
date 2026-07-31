@@ -1435,6 +1435,12 @@ body.fullscreen-controls-hidden.immersive-player .viewer-stage {
   filter: brightness(0.84) contrast(0.88) saturate(0.95);
 }
 
+.viewer-stage.video-enhancement-rtx-active video.highlight-correction {
+  /* CSS filters force decoded video out of Chromium's D3D11 overlay and
+     would disable the NVIDIA video-processor super-resolution extension. */
+  filter: none;
+}
+
 .receiver-stream-badge {
   position: absolute;
   top: 14px;
@@ -2838,13 +2844,6 @@ button.participant-summary:focus-visible {
   color: var(--muted);
   font-size: 9px;
   grid-column: 1 / -1;
-}
-
-.voice-quality {
-  margin: 10px 0 0;
-  color: var(--palette-d685acd675);
-  font-size: 8px;
-  line-height: 1.5;
 }
 
 /* ── Apple Voice Card Redesign ── */
@@ -5401,57 +5400,6 @@ body.mode-immersive.panel-open:not(.panel-collapsed) .companion-panel {
   transform: translateX(0);
 }
 
-.panel-toggle {
-  position: absolute;
-  top: 50%;
-  left: -14px;
-  z-index: var(--z-7332e62758);
-  min-height: 32px;
-  border: 1px solid var(--stroke-default);
-  border-radius: var(--r-full);
-  background: var(--n-800);
-  transform: translateY(-50%);
-}
-
-.panel-toggle::after {
-  position: absolute;
-  right: calc(100% + 9px);
-  z-index: var(--z-2a42601911);
-  min-width: max-content;
-  padding: 6px 9px;
-  border: 1px solid var(--stroke-default);
-  border-radius: var(--r-sm);
-  background: var(--n-800);
-  box-shadow: var(--e-2);
-  color: var(--n-100);
-  content: attr(data-tooltip);
-  font-size: var(--t-caption);
-  font-weight: 650;
-  line-height: 1.2;
-  opacity: 0;
-  pointer-events: none;
-  transform: translateX(4px);
-  transition: opacity var(--dur-2) var(--ease-out), transform var(--dur-2) var(--ease-out);
-  white-space: nowrap;
-}
-
-.panel-toggle:hover::after,
-.panel-toggle:focus-visible::after {
-  opacity: 1;
-  transform: translateX(0);
-}
-
-.panel-toggle svg {
-  fill: none;
-  stroke: currentColor;
-  stroke-width: 1.8;
-  transition: transform var(--dur-3) var(--ease-out);
-}
-
-body.panel-collapsed .panel-toggle svg {
-  transform: scaleX(-1);
-}
-
 .session-control-dock {
   display: none !important;
 }
@@ -7218,10 +7166,6 @@ body.native-android .dock-chat-composer .dock-chat-close {
     .room-sidebar.companion-panel
     > .chat-card {
     overflow: visible;
-  }
-
-  .room-sidebar.companion-panel > .panel-toggle {
-    display: none !important;
   }
 
   .room-sidebar.companion-panel > .chat-card {

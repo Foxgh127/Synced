@@ -425,10 +425,20 @@ async function probeEmbyEndpoint(
 }
 
 function safeItem(item, serverUrl) {
-  const imageTag =
-    item?.ImageTags?.Primary ||
-    item?.SeriesPrimaryImageTag ||
-    item?.ParentPrimaryImageTag;
+  const ownImageTag = cleanText(item?.ImageTags?.Primary, 128);
+  const seriesImageTag = cleanText(item?.SeriesPrimaryImageTag, 128);
+  const parentImageTag = cleanText(item?.ParentPrimaryImageTag, 128);
+  const imageTag = ownImageTag || seriesImageTag || parentImageTag;
+  const imageItemId = cleanText(
+    item?.PrimaryImageItemId ||
+      (ownImageTag ? item?.Id : "") ||
+      (seriesImageTag ? item?.SeriesId : "") ||
+      (parentImageTag ? item?.ParentId : "") ||
+      item?.Id ||
+      item?.SeriesId ||
+      item?.ParentId,
+    128,
+  );
   const userData = item?.UserData || {};
   return {
     id: cleanText(item?.Id, 128),
@@ -441,14 +451,8 @@ function safeItem(item, serverUrl) {
     parentIndexNumber: Number(item?.ParentIndexNumber) || undefined,
     runtimeTicks: Number(item?.RunTimeTicks) || undefined,
     overview: cleanText(item?.Overview, 2_000) || undefined,
-    imageTag: imageTag ? cleanText(imageTag, 128) : undefined,
-    imageItemId:
-      cleanText(
-        item?.PrimaryImageItemId ||
-          (item?.SeriesPrimaryImageTag ? item?.SeriesId : "") ||
-          item?.Id,
-        128,
-      ) || undefined,
+    imageTag: imageTag || undefined,
+    imageItemId: imageItemId || undefined,
     playbackPositionTicks:
       Math.max(0, Number(userData?.PlaybackPositionTicks) || 0) || undefined,
     playedPercentage: Number.isFinite(Number(userData?.PlayedPercentage))

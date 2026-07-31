@@ -46,12 +46,16 @@ WebRTC P2P，严格 NAT 下再使用腾讯云 TURN。Emby 则生成多档 GOP �
   30–60 秒的部分可靠 P2P 媒体缓存；请求早于 `session-ready` 时由主播暂存，观看端在
   收到带 transport epoch 的 ACK 前按 500 ms/1 s/2 s 有界重发，三次恢复探测成功后
   热切回原 HTTPS ABR/MSE。
-- Windows 观看端可启用实际的 WebGL2 GPU 空间增强（视频纹理缩放与保守锐化，
-  无 GPU→CPU→GPU 回读）。它只用于远端 Emby 360p–1080p 放大到接近 2K/4K，
-  字幕和弹幕在增强后合成；SR p95 超过 14 ms、解码丢帧、资源压力、上下文丢失或
-  同机屏幕共享时自动关闭并冷却，频道自适应判定的 decoder/encoder/render 压力也会
-  直接关闭增强并统一让出资源。能力握手只声明真实可用后端；仓库未捆绑需要
-  NVIDIA 授权 SDK/运行时的 RTX Video 原生后端，也不会把普通锐化伪装成 RTX/DLSS。
+- Windows 观看端的远端 Emby 240p–1080p 增强优先保留 Chromium 原生视频叠加层；
+  在 RTX 20 系及更新显卡、NVIDIA 530+ 驱动、硬件解码、交流供电和 NVIDIA App 最近
+  确认 VSR 开关开启同时满足时，由 Chromium 的 D3D11 Video Processor 直接启用
+  NVIDIA RTX Video AI 超分。这样解码帧始终留在 GPU 上，也不会被中间 Canvas 复制
+  破坏 RTX 路径。驱动开关为关闭、过期或不可确认时不会虚报 RTX 已开启，而会直接使用
+  WebGL2 回退以 4K 为内部目标执行 Catmull-Rom 重建、平坦区域压缩伪影抑制、方向边缘
+  恢复、对比度自适应锐化、抗振铃与微抖动，再由合成器一次缩放到实际显示尺寸。字幕和
+  弹幕在增强后合成；GPU p95 超过 22 ms、解码丢帧、电池供电、资源压力、上下文丢失或
+  同机屏幕共享时自动关闭并冷却。应用使用 Electron/Chromium 已包含的 NVIDIA 驱动接口，
+  不伪装成 DLSS，也不随安装包分发需要单独 NVIDIA 账号许可的 RTX Video SDK 文件。
 - 成员入房即上报 MSE、H.264、HEVC 和 AAC 解码能力。默认统一使用兼容性最高的
   H.264/AAC；“允许 HEVC 直传”会显示本机与当前观众的检测结果，只有全员支持才可
   勾选。HEVC 是否可用取决于操作系统媒体栈、硬件和客户端容器支持，并非只看显卡型号；

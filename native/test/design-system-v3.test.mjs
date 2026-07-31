@@ -190,18 +190,38 @@ test("motion, presence, dialog and floating surfaces use cancelable latest-state
   assert.match(floating, /openSurfaces\.at\(-1\)/);
   assert.match(floating, /closeTopmostFloatingSurface/);
   assert.match(floating, /document\.body\.append\(surface\)/);
+  assert.match(floating, /document\.fullscreenElement/);
+  assert.match(floating, /fullscreenElement\.contains\(this\.reference\)/);
+  assert.match(floating, /this\.syncPortalHost\(\)/);
+  assert.match(floating, /private operation = 0/);
+  assert.match(floating, /operation !== this\.operation/);
 });
 
 test("home, create, join and trust flows match the current product model", () => {
   const main = read("src/main.ts");
+  const rail =
+    main.match(
+      /function railMarkup\(\): string \{[\s\S]*?\n\}\n\nfunction bindRailNavigation/,
+    )?.[0] || "";
   assert.match(main, /创建频道/);
   assert.match(main, /加入频道/);
-  assert.match(main, /继续进入/);
-  assert.match(main, /最近频道/);
-  assert.match(main, /最多 8 人/);
-  assert.match(main, /SFU/);
+  assert.match(main, /QUICK JOIN/);
+  assert.match(main, /快捷加入/);
+  assert.match(main, /recentHomeMarkup\(\)/);
+  assert.match(main, /class="app-frame home-frame"/);
+  assert.match(main, /homeProfileMarkup\(\)/);
+  const homeStart = main.indexOf("function renderDesktopHome");
+  const homeEnd = main.indexOf("async function renderHost", homeStart);
+  const home = main.slice(homeStart, homeEnd);
+  assert.doesNotMatch(home, /railMarkup\(\)/);
+  assert.doesNotMatch(main, /继续进入/);
+  assert.doesNotMatch(main, /服务器不保存影片/);
+  assert.doesNotMatch(main, /隐私与媒体线路/);
+  assert.doesNotMatch(rail, /recent-channel|data-recent-room/);
   assert.match(main, /data-recent-menu/);
   assert.match(main, /data-profile-popover/);
+  assert.match(main, /data-home-settings/);
+  assert.match(main, /class="home-profile-rename profile-action"/);
   assert.match(main, /className = "security-sheet"/);
   assert.match(main, /scanQrCode/);
   assert.match(main, /parseJoinLink\(value\)/);
@@ -213,8 +233,12 @@ test("home, create, join and trust flows match the current product model", () =>
 test("player, Companion, source and Emby surfaces expose the required semantics", () => {
   const session = read("src/channel-session.ts");
   const companion = read("src/room-companion.ts");
-  assert.match(session, /class="channel-empty channel-lobby"/);
+  assert.match(
+    session,
+    /class="channel-empty channel-lobby interactive-card"/,
+  );
   assert.match(session, /class="dock-cluster dock-transport"/);
+  assert.match(session, /data-lucide="message-square-text"/);
   assert.match(session, /id="dock-shortcuts"/);
   assert.match(session, /playback-diagnostics-dialog/);
   assert.match(session, /AmbientLightController/);
@@ -224,31 +248,40 @@ test("player, Companion, source and Emby surfaces expose the required semantics"
   assert.match(session, /broadcastModeAbort\?\.abort\(\)/);
   assert.match(session, /new VirtualGrid/);
   assert.match(session, /::view-transition|view-transition-name/);
-  assert.match(companion, /role="tablist"/);
+  assert.match(companion, /class="chat-card" id="chat-panel"/);
+  assert.match(companion, /class="voice-card" id="member-panel"/);
+  assert.doesNotMatch(companion, /role="tablist"|data-companion-tab/);
+  assert.doesNotMatch(companion, /voice-control-bar/);
   assert.match(companion, /chat-jump-latest/);
   assert.match(companion, /RECENT_EMOJI_KEY/);
   assert.match(companion, /is-grouped/);
   assert.match(companion, /new FloatingSurface\(emojiToggle/);
-  assert.match(companion, /new FloatingSurface\(deviceButton/);
+  assert.doesNotMatch(companion, /new FloatingSurface\(deviceButton/);
+  assert.match(companion, /voice-settings-visible/);
+  assert.match(companion, /new PresenceController\(devicePanel/);
+  assert.match(companion, /deviceSettingsPresence\?\.show/);
+  assert.match(companion, /deviceSettingsPresence\?\.hide/);
+  assert.doesNotMatch(companion, /id="panel-toggle"|id="voice-quality"/);
   assert.match(companion, /MAX_ROOM_PARTICIPANTS = protocolPolicy\.maxParticipantsPerRoom/);
 });
 
-test("Android sheets, foldable split layout and Back close the topmost surface", () => {
+test("Android keeps Companion inline and Back closes the topmost transient surface", () => {
   const session = read("src/channel-session.ts");
   const companionStyles = read("src/views/companion.css");
   const main = read("src/main.ts");
-  assert.match(session, /splitCompanionQuery/);
-  assert.match(session, /usesMobileSheet/);
-  assert.match(session, /requestAnimationFrame/);
-  assert.match(session, /pointercancel[\s\S]*?resetSheetDrag/);
-  assert.match(session, /window\.addEventListener\("resize", resetSheetDrag/);
+  assert.match(session, /mobilePanelQuery = window\.matchMedia\("\(max-width: 899px\)"\)/);
+  assert.match(session, /usesInlineCompanion/);
+  assert.match(session, /targetElement\?\.scrollIntoView/);
   assert.match(session, /dialogController\.closeTopmost\(\)/);
   assert.match(session, /closeTopmostFloatingSurface\(\)/);
   assert.match(main, /App\.addListener\("backButton"/);
-  assert.match(companionStyles, /body\.panel-mobile-sheet/);
-  assert.match(companionStyles, /min-aspect-ratio:\s*4 \/ 3/);
-  assert.match(companionStyles, /body\.panel-inline\.mode-theater/);
+  assert.match(companionStyles, /@media \(max-width:\s*899px\)/);
+  assert.match(companionStyles, /body:not\(\.mode-immersive\)[\s\S]*?position:\s*static/);
+  assert.match(companionStyles, /> \.chat-card\s*\{[\s\S]*?order:\s*1/);
+  assert.match(companionStyles, /> \.voice-card\s*\{[\s\S]*?order:\s*2/);
   assert.match(companionStyles, /safe-area-inset-bottom/);
+  assert.doesNotMatch(session, /sheetDragFrame|usesMobileSheet|splitCompanionQuery/);
+  assert.doesNotMatch(companionStyles, /panel-mobile-sheet/);
 });
 
 test("effects degrade using visibility, Android, GPU, memory, battery and thermal state", () => {
@@ -274,12 +307,21 @@ test("effects degrade using visibility, Android, GPU, memory, battery and therma
 test("ambient light, stars and pointer lighting honor the performance budget", () => {
   const main = read("src/main.ts");
   const ambient = read("src/ui/ambient-light.ts");
-  assert.match(main, /window\.innerWidth >= 1440 \? 72 : 48/);
-  assert.match(main, /Math\.min\(window\.devicePixelRatio \|\| 1, 1\.75\)/);
-  assert.match(main, /document\.hidden/);
+  const pointer = read("src/ui/pointer-light.ts");
+  const stars = read("src/ui/star-field.ts");
+  assert.match(
+    stars,
+    /window\.innerWidth >= 1_440[\s\S]*?\? 72[\s\S]*?window\.innerWidth >= 700[\s\S]*?\? 48[\s\S]*?: 36/,
+  );
+  assert.match(stars, /Math\.min\(window\.devicePixelRatio \|\| 1, 1\.75\)/);
+  assert.match(stars, /document\.hidden/);
+  assert.match(stars, /risePerSecond: \(Math\.random\(\) \* 5\.2 \+ 2\.8\)/);
+  assert.match(stars, /canvas\.dataset\.starFrame/);
+  assert.match(main, /bindStarField\(canvas, controller\.signal\)/);
   assert.match(main, /starController\?\.abort\(\)/);
-  assert.match(main, /pointer:\s*fine/);
-  assert.match(main, /requestAnimationFrame/);
+  assert.match(pointer, /pointer:\s*fine/);
+  assert.match(pointer, /requestAnimationFrame/);
+  assert.match(pointer, /querySelectorAll<HTMLElement>\("\.interactive-card"\)/);
   assert.doesNotMatch(main, /cursor-glow/);
   assert.match(ambient, /canvas\.width = 32/);
   assert.match(ambient, /canvas\.height = 18/);
@@ -362,7 +404,8 @@ test("race-prone UI flows converge without guessed animation delays", () => {
   assert.match(main, /element\.dataset\.presence !== "leaving"/);
   assert.match(main, /cancelElementMotion\(existing\.element, "toast-presence"\)/);
   assert.match(session, /broadcastModeAbort\?\.abort\(\)/);
-  assert.match(session, /sheetDragFrame = requestAnimationFrame/);
+  assert.match(session, /mobilePanelQuery\.addEventListener/);
+  assert.doesNotMatch(session, /sheetDragFrame|resetSheetDrag/);
   assert.match(session, /dockChatPresence\.hide/);
   assert.doesNotMatch(session, /dockChatCloseTimer/);
   assert.match(music, /Promise\.allSettled\(\[opening, refreshing\]\)/);

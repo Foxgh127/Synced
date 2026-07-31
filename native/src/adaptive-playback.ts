@@ -81,7 +81,7 @@ function targetBitrate(
         ? { bitrate: 7_000_000, width: 1_920, height: 1_080 }
         : height >= 720
           ? { bitrate: 3_200_000, width: 1_280, height: 720 }
-          : { bitrate: 1_500_000, width: 854, height: 480 };
+          : { bitrate: 1_500_000, width: 848, height: 480 };
   const actualPixels = Math.max(1, width) * Math.max(1, height);
   const referencePixels = reference.width * reference.height;
   return Math.round(

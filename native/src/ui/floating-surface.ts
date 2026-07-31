@@ -41,6 +41,7 @@ export class FloatingSurface {
   private readonly originalParent: Node | null;
   private readonly originalNextSibling: Node | null;
   private opened = false;
+  private operation = 0;
 
   constructor(
     private readonly reference: HTMLElement,
@@ -66,13 +67,23 @@ export class FloatingSurface {
 
   async open(): Promise<void> {
     if (this.opened) return;
+    const operation = ++this.operation;
     this.opened = true;
     removeOpenSurface(this);
     openSurfaces.push(this);
     this.syncMaterialBudget();
     this.openAbort?.abort();
     this.openAbort = new AbortController();
+    document.addEventListener(
+      "fullscreenchange",
+      () => {
+        this.syncPortalHost();
+        void this.position();
+      },
+      { signal: this.openAbort.signal },
+    );
     this.reference.setAttribute("aria-expanded", "true");
+    this.syncPortalHost();
     this.surface.hidden = false;
     this.cleanupPosition = autoUpdate(
       this.reference,
@@ -80,8 +91,22 @@ export class FloatingSurface {
       () => void this.position(),
     );
     await this.position();
-    await this.presence.show(this.abort.signal);
-    if (!this.opened || this.abort.signal.aborted) return;
+    if (
+      !this.opened ||
+      operation !== this.operation ||
+      this.abort.signal.aborted
+    ) {
+      return;
+    }
+    const shown = await this.presence.show(this.abort.signal);
+    if (
+      !shown ||
+      !this.opened ||
+      operation !== this.operation ||
+      this.abort.signal.aborted
+    ) {
+      return;
+    }
     this.options.onOpenChange?.(true);
     if (this.options.modal) this.focus.trap(this.surface, this.reference);
     document.addEventListener(
@@ -117,6 +142,7 @@ export class FloatingSurface {
 
   async close(): Promise<void> {
     if (!this.opened) return;
+    const operation = ++this.operation;
     this.opened = false;
     removeOpenSurface(this);
     this.syncMaterialBudget();
@@ -125,7 +151,8 @@ export class FloatingSurface {
     this.reference.setAttribute("aria-expanded", "false");
     this.cleanupPosition?.();
     this.cleanupPosition = undefined;
-    await this.presence.hide();
+    const hidden = await this.presence.hide();
+    if (!hidden || operation !== this.operation || this.opened) return;
     if (this.options.modal) {
       this.focus.release(true);
     } else if (
@@ -178,6 +205,7 @@ export class FloatingSurface {
   }
 
   destroy(): void {
+    this.operation += 1;
     this.opened = false;
     removeOpenSurface(this);
     this.syncMaterialBudget();
@@ -210,6 +238,18 @@ export class FloatingSurface {
       topmost.surface.dataset.floatingTop = "true";
     } else {
       delete document.documentElement.dataset.floatingOpen;
+    }
+  }
+
+  private syncPortalHost(): void {
+    const fullscreenElement = document.fullscreenElement;
+    const host =
+      fullscreenElement instanceof HTMLElement &&
+      fullscreenElement.contains(this.reference)
+        ? fullscreenElement
+        : document.body;
+    if (this.surface.parentElement !== host) {
+      host.append(this.surface);
     }
   }
 }

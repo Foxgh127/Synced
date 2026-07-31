@@ -205,6 +205,15 @@ test("keeps final receiver encoding rows safe after fullscreen downscaling", asy
   });
 });
 
+test("clips only incomplete legacy decoder rows as a compatibility guard", async () => {
+  const { decoderEdgeGuardPixels } = await loadModule();
+  assert.equal(decoderEdgeGuardPixels(1_920), 0);
+  assert.equal(decoderEdgeGuardPixels(848), 0);
+  assert.equal(decoderEdgeGuardPixels(854), 5);
+  assert.equal(decoderEdgeGuardPixels(1_206), 5);
+  assert.equal(decoderEdgeGuardPixels(Number.NaN), 0);
+});
+
 test("preserves ordinary aligned 720p rungs without needless quality loss", async () => {
   const { safeVideoEncodingTarget } = await loadModule();
   assert.deepEqual(safeVideoEncodingTarget(1920, 1080, 720), {

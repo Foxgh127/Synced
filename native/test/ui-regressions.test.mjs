@@ -25,6 +25,37 @@ test("form primitives do not size label.field containers", () => {
     /^\s*(?:width|min-height|height)\s*:/m,
   );
   assert.match(primitives, /:is\(input, select, textarea\)\.field\s*,/);
+  assert.match(
+    primitives,
+    /label:has\(> input:not\(\[type="checkbox"\]\):not\(\[type="radio"\]\)\)/,
+  );
+  assert.match(
+    primitives,
+    /label > :is\(input:not\(\[type="checkbox"\]\):not\(\[type="radio"\]\), select, textarea\)/,
+  );
+});
+
+test("screen-share receivers mask only legacy decoder padding", () => {
+  const source = fs.readFileSync(
+    new URL("../src/channel-session.ts", import.meta.url),
+    "utf8",
+  );
+  const styles = readStyles();
+  const guardStart = source.indexOf("function syncDecoderEdgeGuard");
+  const guardEnd = source.indexOf("\n  function", guardStart + 1);
+  const guard = source.slice(guardStart, guardEnd);
+
+  assert.ok(guardStart >= 0);
+  assert.match(guard, /broadcastCapabilities\?\.mode === "screen"/);
+  assert.match(guard, /localBroadcastMode === "screen"/);
+  assert.match(guard, /decoderEdgeGuardPixels\(video\.videoWidth\)/);
+  assert.match(guard, /guardPercent = \(inlineGuard \/ video\.videoWidth\) \* 100/);
+  assert.match(guard, /classList\.toggle\("decoder-edge-guard", inlineGuard > 0\)/);
+  assert.match(styles, /\.viewer-stage > video\.decoder-edge-guard/);
+  assert.match(
+    styles,
+    /clip-path:\s*inset\([\s\S]*var\(--decoder-edge-guard-inline, 0%\)/,
+  );
 });
 
 test("trusted app invites auto-join while unknown signal hosts still ask", () => {
@@ -294,12 +325,17 @@ test("lobby panel collapse is quiet, releases its column, and keeps only useful 
     "utf8",
   );
   const styles = readStyles();
-  const toggleStart = source.indexOf(
-    'panelToggle?.addEventListener("click"',
-  );
-  const toggleEnd = source.indexOf("});", toggleStart);
-  assert.doesNotMatch(source.slice(toggleStart, toggleEnd), /notify\(/);
+  assert.doesNotMatch(source, /id="panel-toggle"/);
   assert.doesNotMatch(source, /id="dock-members"/);
+  assert.match(
+    source,
+    /id="session-companion"[\s\S]*?aria-controls="room-companion-panel"[\s\S]*?aria-expanded="true"/,
+  );
+  assert.match(
+    source,
+    /document[\s\S]*?#session-companion[\s\S]*?addEventListener\("click"[\s\S]*?applyPanelState\(collapse\)/,
+  );
+  assert.doesNotMatch(source, /任意 Windows 成员可放映/);
   assert.match(
     styles,
     /body\.mode-lobby\.panel-collapsed \.session-shell\s*\{[\s\S]*?grid-template-columns:\s*var\(--rail-w\)\s*minmax\(0,\s*1fr\)\s*0/,
@@ -358,27 +394,27 @@ test("the emoji picker respects the chat maxlength during scripted insertion", (
   assert.match(handler, /chatInput\.value = candidate/);
 });
 
-test("companion uses tabs, a fixed voice bar, and responsive drawer modes", () => {
+test("companion restores simultaneous members and danmaku cards", () => {
   const companion = fs.readFileSync(
     new URL("../src/room-companion.ts", import.meta.url),
     "utf8",
   );
   const styles = readStyles();
-  assert.match(companion, /role="tablist" aria-label="频道陪伴内容"/);
-  assert.match(companion, /data-companion-tab="chat"/);
-  assert.match(companion, /data-companion-tab="members"/);
-  assert.match(companion, /class="voice-control-bar"/);
+  assert.match(companion, /class="chat-card" id="chat-panel"/);
+  assert.match(companion, /class="voice-card" id="member-panel"/);
+  assert.doesNotMatch(companion, /role="tablist"|data-companion-tab/);
+  assert.doesNotMatch(companion, /class="voice-control-bar"/);
   assert.match(
     styles,
-    /\.room-sidebar\.companion-panel\s*\{[\s\S]*?grid-template-rows:\s*auto minmax\(0,\s*1fr\) auto/,
+    /\.room-sidebar\.companion-panel\s*\{[\s\S]*?grid-template-rows:\s*minmax\(0,\s*1\.7fr\) minmax\(220px,\s*1fr\)/,
   );
   assert.match(
     styles,
-    /@media \(max-width:\s*1199px\)[\s\S]*?\.room-sidebar\.companion-panel,[\s\S]*?position:\s*fixed;[\s\S]*?transform:\s*translateX\(100%\)/,
+    /\.room-sidebar\.companion-panel > \.voice-card\s*\{[\s\S]*?grid-row:\s*1/,
   );
   assert.match(
     styles,
-    /@media \(max-width:\s*599px\)[\s\S]*?height:\s*min\(78dvh,\s*720px\);[\s\S]*?transform:\s*translateY\(105%\)/,
+    /@media \(max-width:\s*899px\)[\s\S]*?position:\s*static;[\s\S]*?> \.chat-card\s*\{[\s\S]*?order:\s*1;[\s\S]*?> \.voice-card\s*\{[\s\S]*?order:\s*2;/,
   );
 });
 
@@ -888,12 +924,89 @@ test("Emby detail controls and danmaku input stay inside their surfaces", () => 
   );
   assert.match(
     styles,
-    /\.room-sidebar\.companion-panel \.chat-form\s*\{[\s\S]*?border:\s*1px solid var\(--stroke-default\)/,
+    /\.emby-popup-options \.emby-stream-options select\s*\{[\s\S]*?appearance:\s*none;[\s\S]*?background:\s*var\(--surface-1\)/,
   );
   assert.match(
     styles,
-    /\.room-sidebar\.companion-panel \.chat-form:focus-within\s*\{[\s\S]*?border-color:\s*var\(--accent-border\)/,
+    /#dock-danmaku\[aria-pressed="true"\]\s*\{[\s\S]*?background:\s*var\(--accent-bg\);[\s\S]*?color:\s*var\(--accent-text\)/,
   );
+  assert.doesNotMatch(
+    styles,
+    /#dock-danmaku(?:\[aria-pressed="true"\])?::after/,
+  );
+  assert.match(
+    styles,
+    /\.room-sidebar\.companion-panel \.chat-form input\s*\{[\s\S]*?border:\s*1px solid var\(--stroke-default\)/,
+  );
+  assert.match(
+    styles,
+    /\.room-sidebar\.companion-panel \.chat-form input:focus\s*\{[\s\S]*?border-color:\s*var\(--accent-border\)/,
+  );
+});
+
+test("Emby artwork, playback chrome, and modal states stay visually coherent", () => {
+  const source = fs.readFileSync(
+    new URL("../src/channel-session.ts", import.meta.url),
+    "utf8",
+  );
+  const player = fs.readFileSync(
+    new URL("../src/emby-player.ts", import.meta.url),
+    "utf8",
+  );
+  const icons = fs.readFileSync(
+    new URL("../src/ui/icons.ts", import.meta.url),
+    "utf8",
+  );
+  const embyStyles = fs.readFileSync(
+    new URL("../src/views/emby.css", import.meta.url),
+    "utf8",
+  );
+  const legacyStyles = fs.readFileSync(
+    new URL("../src/views/legacy.css", import.meta.url),
+    "utf8",
+  );
+  const dialogStyles = fs.readFileSync(
+    new URL("../src/components/dialog.css", import.meta.url),
+    "utf8",
+  );
+  const dockStyles = fs.readFileSync(
+    new URL("../src/components/dock.css", import.meta.url),
+    "utf8",
+  );
+
+  assert.doesNotMatch(source, /if \(!item\.imageTag \|\| !window\.roomDesktop\)/);
+  assert.match(
+    source,
+    /image\.dataset\.imageState = "loading";\s*image\.hidden = false;\s*image\.src = dataUrl;/,
+  );
+  assert.match(
+    embyStyles,
+    /\.emby-popup-overview\s*\{[\s\S]*?max-width:\s*68ch;[\s\S]*?line-height:\s*1\.78;/,
+  );
+  assert.match(
+    embyStyles,
+    /\.emby-item-popup-dialog\s*\{[\s\S]*?width:\s*min\(760px,\s*82%\);/,
+  );
+  assert.match(
+    embyStyles,
+    /> input\[type="checkbox"\]\s*\{[\s\S]*?width:\s*20px;[\s\S]*?height:\s*20px;/,
+  );
+  assert.match(
+    legacyStyles,
+    /\.highlight-correction input\s*\{[\s\S]*?width:\s*46px;[\s\S]*?height:\s*26px;/,
+  );
+  assert.match(
+    dialogStyles,
+    /dialog\[open\]::backdrop\s*\{[\s\S]*?opacity:\s*1;/,
+  );
+  assert.match(source, /data-lucide="volume-x"/);
+  assert.match(icons, /\bVolumeX\b/);
+  assert.match(
+    dockStyles,
+    /#dock-mute\[aria-pressed="true"\] \.dock-volume-muted\s*\{[\s\S]*?display:\s*block;/,
+  );
+  assert.doesNotMatch(player, /this\.video\.controls = this\.host/);
+  assert.match(player, /this\.video\.controls = false/);
 });
 
 test("playback chrome stays centered on the video and removes redundant badges", () => {
@@ -968,6 +1081,18 @@ test("danmaku composer reserves a readable field and 44px touch targets", () => 
   assert.match(
     styles,
     /\.chat-form\s*>\s*\.chat-send-btn\s*\{[\s\S]*?min-height:\s*44px;/,
+  );
+  assert.match(
+    styles,
+    /\.room-sidebar\.companion-panel \.chat-form\s*\{[\s\S]*?grid-template-columns:\s*minmax\(0,\s*1fr\)\s*var\(--control-min\)\s*auto;/,
+  );
+  assert.match(
+    styles,
+    /\.room-sidebar\.companion-panel \.chat-form > \.chat-emoji-btn\s*\{[\s\S]*?position:\s*static;[\s\S]*?grid-column:\s*2;/,
+  );
+  assert.match(
+    styles,
+    /\.room-sidebar\.companion-panel \.mute-btn\s*\{[\s\S]*?width:\s*var\(--control-min\);[\s\S]*?padding:\s*var\(--s-0\);/,
   );
 });
 

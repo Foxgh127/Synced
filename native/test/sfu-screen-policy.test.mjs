@@ -65,7 +65,7 @@ test("1440p SFU subscription policy maps every viewer rung explicitly", async ()
       frameRate: 60,
     }),
     {
-      width: 854,
+      width: 848,
       height: 480,
       frameRate: 24,
       quality: "low",
@@ -78,7 +78,7 @@ test("SFU emergency publication requires verified 480p track settings", async ()
   const { isVerifiedEmergencyTrackSettings } = await loadModule("src/sfu.ts");
   assert.equal(
     isVerifiedEmergencyTrackSettings({
-      width: 854,
+      width: 848,
       height: 480,
       frameRate: 24,
     }),
@@ -95,7 +95,7 @@ test("SFU emergency publication requires verified 480p track settings", async ()
   );
   assert.equal(
     isVerifiedEmergencyTrackSettings({
-      width: 854,
+      width: 848,
       height: 480,
     }),
     false,
@@ -103,12 +103,44 @@ test("SFU emergency publication requires verified 480p track settings", async ()
   );
   assert.equal(
     isVerifiedEmergencyTrackSettings({
-      width: 854,
+      width: 848,
       height: 480,
       frameRate: 30,
     }),
     false,
   );
+  assert.equal(
+    isVerifiedEmergencyTrackSettings({
+      width: 854,
+      height: 480,
+      frameRate: 24,
+    }),
+    false,
+    "the emergency publication width must use a complete decoder row",
+  );
+  assert.equal(
+    isVerifiedEmergencyTrackSettings({
+      width: 842,
+      height: 480,
+      frameRate: 24,
+    }),
+    false,
+    "a smaller but unaligned emergency track is still decoder-unsafe",
+  );
+});
+
+test("SFU publication constraints align non-standard source rasters", async () => {
+  const { safeSfuScreenDimensions } = await loadModule("src/sfu.ts");
+  const target = safeSfuScreenDimensions(3_618, 2_160);
+  assert.equal(target.width % 16, 0);
+  assert.equal(target.height % 2, 0);
+  assert.ok(target.width <= 2_560);
+  assert.ok(target.height <= 1_440);
+  assert.ok(Math.abs(target.width / target.height - 3_618 / 2_160) < 0.01);
+  assert.deepEqual(safeSfuScreenDimensions(2_560, 1_440), {
+    width: 2_560,
+    height: 1_440,
+  });
 });
 
 test("one weak viewer degrades within two seconds without changing peers", async () => {

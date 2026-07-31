@@ -40,6 +40,26 @@ const MAX_SOURCE_AREA_JITTER = 0.2;
 // aspect transition (such as windowed -> F11) as a new capture surface.
 const MAX_SOURCE_ASPECT_JITTER = 0.08;
 
+/**
+ * Returns the symmetric inline crop needed when a legacy sender or SFU layer
+ * still exposes a partial H.264 macroblock. New publications are aligned
+ * before encoding; this is the final receiver/local-preview guard for streams
+ * already negotiated at widths such as 854 or 1206.
+ */
+export function decoderEdgeGuardPixels(encodedWidthInput: number): number {
+  const encodedWidth = Math.round(Number(encodedWidthInput));
+  if (!Number.isFinite(encodedWidth) || encodedWidth < ENCODER_ROW_ALIGNMENT) {
+    return 0;
+  }
+  const validRemainder = encodedWidth % ENCODER_ROW_ALIGNMENT;
+  return validRemainder === 0
+    ? 0
+    : Math.min(
+        ENCODER_ROW_ALIGNMENT / 2,
+        Math.ceil((ENCODER_ROW_ALIGNMENT - validRemainder) / 2),
+      );
+}
+
 function alignmentFloor(value: number, alignment: number): number {
   return Math.floor(value / alignment) * alignment;
 }

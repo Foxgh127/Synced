@@ -5,6 +5,10 @@ export type VideoEnhancementPressure =
   | "decoder-limited"
   | "render-limited"
   | "encoder-limited";
+export type VideoEnhancementBackend =
+  | "rtx-video"
+  | "webgl2-spatial"
+  | "none";
 
 export type VideoEnhancementReason =
   | "active"
@@ -30,6 +34,7 @@ export interface VideoEnhancementPolicyInput {
   outputWidth: number;
   outputHeight: number;
   hdr: boolean;
+  hdrBackendSupported?: boolean;
   pressure: VideoEnhancementPressure;
   renderP95Ms?: number;
   droppedFrameRatio?: number;
@@ -45,17 +50,34 @@ export interface VideoEnhancementPolicyDecision {
 }
 
 export interface VideoEnhancementCapabilities {
-  backends: Array<"webgl2-spatial">;
+  backends: Array<"webgl2-spatial" | "rtx-video">;
   maxPixels: number;
+}
+
+export interface VideoEnhancementHardwareInfo {
+  deviceName: string;
+  driverVersion: string;
+  driverRelease?: number;
+  activeGpuIsNvidia: boolean;
+  rtxGpu: boolean;
+  hardwareVideoDecode: boolean;
+  videoDecodeStatus: string;
+  rtxVideoSupported: boolean;
+  rtxVideoDriverState: "enabled" | "disabled" | "unknown";
+  rtxVideoDriverQuality?: number;
+  onBatteryPower: boolean;
+  error?: string;
 }
 
 export interface VideoEnhancementState
   extends VideoEnhancementPolicyDecision {
-  backend: "webgl2-spatial" | "none";
+  backend: VideoEnhancementBackend;
   sourceWidth: number;
   sourceHeight: number;
   outputWidth: number;
   outputHeight: number;
+  targetWidth: number;
+  targetHeight: number;
   renderP95Ms?: number;
   droppedFrameRatio?: number;
 }
@@ -75,17 +97,23 @@ interface TimerQueryExtension {
 }
 
 const MAX_OUTPUT_PIXELS = 3_840 * 2_160;
-const OUTPUT_MIN_WIDTH = 2_500;
-const OUTPUT_MIN_HEIGHT = 1_400;
-const SOURCE_MIN_HEIGHT = 360;
+const SOURCE_MIN_HEIGHT = 240;
 const SOURCE_MAX_HEIGHT = 1_080;
 const MIN_USEFUL_SCALE = 1.22;
-const GPU_BUDGET_MS = 14;
+const GPU_BUDGET_MS = 22;
 const DROP_RATIO_LIMIT = 0.03;
 const PRESSURE_COOLDOWN_MS = 30_000;
 const METRIC_WINDOW = 90;
 
 let detectedCapabilities: VideoEnhancementCapabilities | undefined;
+let detectedHardwareInfo: VideoEnhancementHardwareInfo | undefined;
+
+export function rememberVideoEnhancementHardwareInfo(
+  info: VideoEnhancementHardwareInfo,
+): void {
+  detectedHardwareInfo = { ...info };
+  detectedCapabilities = undefined;
+}
 
 export function percentile95(values: readonly number[]): number | undefined {
   const finite = values
@@ -127,14 +155,11 @@ export function evaluateVideoEnhancementPolicy(
   ) {
     return inactive("source-out-of-range");
   }
-  if (
-    outputWidth < OUTPUT_MIN_WIDTH &&
-    outputHeight < OUTPUT_MIN_HEIGHT
-  ) {
-    return inactive("output-too-small");
-  }
+  if (!outputWidth || !outputHeight) return inactive("output-too-small");
   if (scale < MIN_USEFUL_SCALE) return inactive("scale-too-small");
-  if (input.hdr) return inactive("hdr-unsupported");
+  if (input.hdr && input.hdrBackendSupported !== true) {
+    return inactive("hdr-unsupported");
+  }
   if (input.pressure !== "healthy") return inactive("resource-pressure");
   if (
     input.renderP95Ms !== undefined &&
@@ -156,16 +181,23 @@ export function evaluateVideoEnhancementPolicy(
     active: true,
     reason: "active",
     scale,
-    // A conservative CAS-style gain avoids ringing on subtitles and anime
-    // line art while still restoring contrast lost during 720p/1080p scaling.
-    sharpness: Math.min(0.34, 0.14 + Math.max(0, scale - 1) * 0.09),
+    // The WebGL fallback combines cubic reconstruction, artifact suppression,
+    // directional edge recovery and contrast-adaptive sharpening. RTX Video
+    // ignores this value because its trained driver model owns reconstruction.
+    sharpness: Math.min(0.6, 0.28 + Math.max(0, scale - 1) * 0.08),
   };
 }
 
 export function detectVideoEnhancementCapabilities(): VideoEnhancementCapabilities {
   if (detectedCapabilities) return detectedCapabilities;
+  const rtxVideoSupported =
+    detectedHardwareInfo?.rtxVideoSupported === true &&
+    detectedHardwareInfo.rtxVideoDriverState === "enabled";
   if (typeof document === "undefined") {
-    return { backends: [], maxPixels: 0 };
+    return {
+      backends: rtxVideoSupported ? ["rtx-video"] : [],
+      maxPixels: rtxVideoSupported ? MAX_OUTPUT_PIXELS : 0,
+    };
   }
   const probe = document.createElement("canvas");
   const gl = probe.getContext("webgl2", {
@@ -178,13 +210,19 @@ export function detectVideoEnhancementCapabilities(): VideoEnhancementCapabiliti
     stencil: false,
   });
   if (!gl) {
-    detectedCapabilities = { backends: [], maxPixels: 0 };
+    detectedCapabilities = {
+      backends: rtxVideoSupported ? ["rtx-video"] : [],
+      maxPixels: rtxVideoSupported ? MAX_OUTPUT_PIXELS : 0,
+    };
     return detectedCapabilities;
   }
   const loseContext = gl.getExtension("WEBGL_lose_context");
   loseContext?.loseContext();
   detectedCapabilities = {
-    backends: ["webgl2-spatial"],
+    backends: [
+      "webgl2-spatial",
+      ...(rtxVideoSupported ? (["rtx-video"] as const) : []),
+    ],
     maxPixels: MAX_OUTPUT_PIXELS,
   };
   return detectedCapabilities;
@@ -205,6 +243,35 @@ function boundedOutputDimensions(
   boundedWidth = Math.max(1, Math.round(boundedWidth * dimensionScale));
   boundedHeight = Math.max(1, Math.round(boundedHeight * dimensionScale));
   return { width: boundedWidth, height: boundedHeight };
+}
+
+export function target4kDimensions(
+  viewportWidth: number,
+  viewportHeight: number,
+): { width: number; height: number } {
+  const safeWidth =
+    Number.isFinite(viewportWidth) && viewportWidth > 0
+      ? viewportWidth
+      : 16;
+  const safeHeight =
+    Number.isFinite(viewportHeight) && viewportHeight > 0
+      ? viewportHeight
+      : 9;
+  const aspect = Math.max(0.25, Math.min(4, safeWidth / safeHeight));
+  let width: number;
+  let height: number;
+  if (aspect >= 16 / 9) {
+    width = 3_840;
+    height = width / aspect;
+  } else {
+    height = 2_160;
+    width = height * aspect;
+  }
+  // Video surfaces and hardware compositors behave best on even dimensions.
+  return {
+    width: Math.max(2, Math.round(width / 2) * 2),
+    height: Math.max(2, Math.round(height / 2) * 2),
+  };
 }
 
 function compileShader(
@@ -244,21 +311,115 @@ function createProgram(gl: WebGL2RenderingContext): WebGLProgram {
       precision highp float;
       uniform sampler2D u_frame;
       uniform vec2 u_texel;
+      uniform vec2 u_output_texel;
       uniform float u_sharpness;
+      uniform float u_scale;
       in vec2 v_uv;
       out vec4 out_color;
 
+      float luma(vec3 color) {
+        return dot(color, vec3(0.2126, 0.7152, 0.0722));
+      }
+
+      float catmull_rom(float value) {
+        float x = abs(value);
+        if (x <= 1.0) {
+          return 1.5 * x * x * x - 2.5 * x * x + 1.0;
+        }
+        if (x < 2.0) {
+          return -0.5 * x * x * x + 2.5 * x * x - 4.0 * x + 2.0;
+        }
+        return 0.0;
+      }
+
+      vec3 cubic_reconstruct(vec2 uv) {
+        vec2 source_size = 1.0 / u_texel;
+        vec2 source_position = uv * source_size - 0.5;
+        vec2 source_base = floor(source_position);
+        vec2 fraction = fract(source_position);
+        vec3 accumulated = vec3(0.0);
+        float accumulated_weight = 0.0;
+        for (int y = -1; y <= 2; y++) {
+          for (int x = -1; x <= 2; x++) {
+            float weight =
+              catmull_rom(float(x) - fraction.x) *
+              catmull_rom(float(y) - fraction.y);
+            vec2 coordinate =
+              (source_base + vec2(float(x), float(y)) + 0.5) * u_texel;
+            accumulated += texture(u_frame, coordinate).rgb * weight;
+            accumulated_weight += weight;
+          }
+        }
+        return accumulated / max(accumulated_weight, 0.0001);
+      }
+
       void main() {
-        vec3 c = texture(u_frame, v_uv).rgb;
-        vec3 n = texture(u_frame, v_uv + vec2(0.0, -u_texel.y)).rgb;
-        vec3 s = texture(u_frame, v_uv + vec2(0.0, u_texel.y)).rgb;
-        vec3 e = texture(u_frame, v_uv + vec2(u_texel.x, 0.0)).rgb;
-        vec3 w = texture(u_frame, v_uv + vec2(-u_texel.x, 0.0)).rgb;
-        vec3 local_min = min(c, min(min(n, s), min(e, w)));
-        vec3 local_max = max(c, max(max(n, s), max(e, w)));
-        vec3 local_average = (n + s + e + w) * 0.25;
-        vec3 sharpened = c + (c - local_average) * u_sharpness;
-        out_color = vec4(clamp(sharpened, local_min, local_max), 1.0);
+        vec3 center = cubic_reconstruct(v_uv);
+        vec3 north = texture(u_frame, v_uv - vec2(0.0, u_texel.y)).rgb;
+        vec3 south = texture(u_frame, v_uv + vec2(0.0, u_texel.y)).rgb;
+        vec3 east = texture(u_frame, v_uv + vec2(u_texel.x, 0.0)).rgb;
+        vec3 west = texture(u_frame, v_uv - vec2(u_texel.x, 0.0)).rgb;
+        vec3 north_east = texture(u_frame, v_uv + vec2(u_texel.x, -u_texel.y)).rgb;
+        vec3 north_west = texture(u_frame, v_uv - u_texel).rgb;
+        vec3 south_east = texture(u_frame, v_uv + u_texel).rgb;
+        vec3 south_west = texture(u_frame, v_uv + vec2(-u_texel.x, u_texel.y)).rgb;
+
+        float gradient_x =
+          luma(north_east) + 2.0 * luma(east) + luma(south_east) -
+          luma(north_west) - 2.0 * luma(west) - luma(south_west);
+        float gradient_y =
+          luma(south_west) + 2.0 * luma(south) + luma(south_east) -
+          luma(north_west) - 2.0 * luma(north) - luma(north_east);
+        float edge_strength =
+          smoothstep(0.025, 0.32, length(vec2(gradient_x, gradient_y)));
+
+        vec3 local_min = min(
+          center,
+          min(min(north, south), min(east, west))
+        );
+        vec3 local_max = max(
+          center,
+          max(max(north, south), max(east, west))
+        );
+        vec3 cross_average = (north + south + east + west) * 0.25;
+        float local_range = luma(local_max) - luma(local_min);
+
+        // Suppress codec block noise only in flat regions. Edges and texture
+        // remain owned by the cubic and directional reconstruction.
+        float flat_region = 1.0 - smoothstep(0.018, 0.11, local_range);
+        float artifact_weight =
+          flat_region * smoothstep(1.35, 3.0, u_scale) * 0.18;
+        vec3 reconstructed = mix(center, cross_average, artifact_weight);
+
+        vec2 gradient = vec2(gradient_x, gradient_y);
+        vec2 tangent =
+          length(gradient) > 0.0001
+            ? normalize(vec2(-gradient.y, gradient.x))
+            : vec2(1.0, 0.0);
+        vec2 directional_step = tangent * max(u_output_texel, u_texel * 0.35);
+        vec3 along_a = texture(u_frame, v_uv - directional_step).rgb;
+        vec3 along_b = texture(u_frame, v_uv + directional_step).rgb;
+        vec3 directional_detail =
+          reconstructed - (along_a + along_b) * 0.5;
+        reconstructed += directional_detail * edge_strength * 0.22;
+
+        vec3 adaptive_detail = reconstructed - cross_average;
+        float sharpening =
+          u_sharpness * mix(0.48, 1.0, edge_strength) *
+          (1.0 - flat_region * 0.35);
+        vec3 sharpened = reconstructed + adaptive_detail * sharpening;
+
+        // Anti-ringing clamp allows a tiny reconstruction headroom while
+        // preventing bright/dark halos around subtitles and anime line art.
+        vec3 bounded = clamp(
+          sharpened,
+          local_min - vec3(0.018),
+          local_max + vec3(0.018)
+        );
+        float dither =
+          fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453)
+          - 0.5;
+        out_color = vec4(clamp(bounded + dither / 1024.0, 0.0, 1.0), 1.0);
       }`,
   );
   const program = gl.createProgram();
@@ -315,14 +476,17 @@ export class VideoEnhancementController extends EventTarget {
   private preference: VideoEnhancementPreference = "auto";
   private playbackMode: VideoEnhancementPlaybackMode = "off";
   private pressure: VideoEnhancementPressure = "healthy";
-  private backendAvailable =
+  private webglBackendAvailable =
     detectVideoEnhancementCapabilities().backends.includes(
       "webgl2-spatial",
     );
+  private hardwareInfo?: VideoEnhancementHardwareInfo;
   private cooldownUntil = 0;
   private gl?: WebGL2RenderingContext;
   private program?: WebGLProgram;
   private texture?: WebGLTexture;
+  private textureWidth = 0;
+  private textureHeight = 0;
   private vertexArray?: WebGLVertexArrayObject;
   private timerExtension?: TimerQueryExtension;
   private timerQueries: WebGLQuery[] = [];
@@ -338,6 +502,7 @@ export class VideoEnhancementController extends EventTarget {
   private videoFrameCallback?: number;
   private animationFrame?: number;
   private active = false;
+  private activeBackend: VideoEnhancementBackend = "none";
   private sharpness = 0;
   private destroyed = false;
   private lastSubtitleText = "";
@@ -352,6 +517,8 @@ export class VideoEnhancementController extends EventTarget {
     sourceHeight: 0,
     outputWidth: 0,
     outputHeight: 0,
+    targetWidth: 3_840,
+    targetHeight: 2_160,
   };
 
   private readonly handleVideoChange = (): void => {
@@ -360,7 +527,7 @@ export class VideoEnhancementController extends EventTarget {
 
   private readonly handleVisibilityChange = (): void => {
     if (document.hidden) {
-      this.applyActive(false);
+      this.applyBackend("none");
     } else {
       this.refresh();
     }
@@ -369,13 +536,17 @@ export class VideoEnhancementController extends EventTarget {
   private readonly handleContextLost = (event: Event): void => {
     event.preventDefault();
     this.releaseGraphics(false);
-    this.backendAvailable = false;
-    this.enterCooldown("resource-pressure");
+    this.webglBackendAvailable = false;
+    if (this.activeBackend === "webgl2-spatial") {
+      this.enterCooldown("resource-pressure");
+    } else {
+      this.refresh();
+    }
     this.onDiagnostic?.("video-enhancement-context-lost", {});
   };
 
   private readonly handleContextRestored = (): void => {
-    this.backendAvailable = true;
+    this.webglBackendAvailable = true;
     this.cooldownUntil = performance.now() + 5_000;
     this.refresh();
   };
@@ -419,6 +590,35 @@ export class VideoEnhancementController extends EventTarget {
     return this.state;
   }
 
+  setHardwareInfo(info: VideoEnhancementHardwareInfo): void {
+    const previous = this.hardwareInfo;
+    this.hardwareInfo = { ...info };
+    rememberVideoEnhancementHardwareInfo(info);
+    if (
+      previous?.rtxVideoSupported !== info.rtxVideoSupported ||
+      previous?.rtxVideoDriverState !== info.rtxVideoDriverState ||
+      previous?.onBatteryPower !== info.onBatteryPower ||
+      previous?.deviceName !== info.deviceName ||
+      previous?.driverVersion !== info.driverVersion
+    ) {
+      this.onDiagnostic?.("video-enhancement-hardware", {
+        deviceName: info.deviceName,
+        driverVersion: info.driverVersion,
+        driverRelease: info.driverRelease,
+        rtxGpu: info.rtxGpu,
+        activeGpuIsNvidia: info.activeGpuIsNvidia,
+        hardwareVideoDecode: info.hardwareVideoDecode,
+        rtxVideoSupported: info.rtxVideoSupported,
+        rtxVideoDriverState: info.rtxVideoDriverState,
+        rtxVideoDriverQuality: info.rtxVideoDriverQuality,
+        onBatteryPower: info.onBatteryPower,
+      });
+      this.cooldownUntil = 0;
+      this.resetMetrics();
+      this.refresh();
+    }
+  }
+
   setPreference(preference: VideoEnhancementPreference): void {
     if (this.preference === preference) return;
     this.preference = preference;
@@ -453,28 +653,72 @@ export class VideoEnhancementController extends EventTarget {
       1,
       Math.min(2.5, globalThis.devicePixelRatio || 1),
     );
-    const desiredOutput = boundedOutputDimensions(
+    const displayOutput = boundedOutputDimensions(
       rect.width * pixelRatio,
       rect.height * pixelRatio,
     );
+    const target4k = target4kDimensions(rect.width, rect.height);
     const renderP95Ms =
       this.renderSamples.length >= 30
         ? percentile95(this.renderSamples)
         : undefined;
-    const decision = evaluateVideoEnhancementPolicy({
+    const hardware = this.hardwareInfo;
+    const rtxReady = Boolean(
+      hardware?.rtxVideoSupported &&
+        hardware.rtxVideoDriverState === "enabled" &&
+        !hardware.onBatteryPower,
+    );
+    const effectivePressure: VideoEnhancementPressure =
+      hardware?.onBatteryPower === true ? "render-limited" : this.pressure;
+    const commonPolicy = {
       preference: this.preference,
       playbackMode: this.playbackMode,
-      backendAvailable: this.backendAvailable,
       sourceWidth: this.video.videoWidth,
       sourceHeight: this.video.videoHeight,
-      outputWidth: desiredOutput.width,
-      outputHeight: desiredOutput.height,
       hdr: isHdrVideo(this.video),
-      pressure: this.pressure,
-      renderP95Ms,
+      pressure: effectivePressure,
       droppedFrameRatio: this.droppedFrameRatio,
       cooldownUntil: this.cooldownUntil,
+    };
+    const rtxDecision = evaluateVideoEnhancementPolicy({
+      ...commonPolicy,
+      backendAvailable: rtxReady,
+      outputWidth: displayOutput.width,
+      outputHeight: displayOutput.height,
+      hdrBackendSupported: true,
     });
+    const webglDecision = evaluateVideoEnhancementPolicy({
+      ...commonPolicy,
+      backendAvailable: this.webglBackendAvailable,
+      outputWidth: target4k.width,
+      outputHeight: target4k.height,
+      hdrBackendSupported: false,
+      renderP95Ms,
+    });
+    let decision = webglDecision;
+    let desiredBackend: VideoEnhancementBackend = webglDecision.active
+      ? "webgl2-spatial"
+      : "none";
+    let desiredOutput = target4k;
+
+    // RTX Video runs inside Chromium's native D3D11 video-processor path and
+    // keeps decoded frames on the GPU. It must win whenever the visible
+    // viewport is actually being enlarged. When the viewport is too small to
+    // trigger driver scaling, the 4K WebGL path remains useful as an internal
+    // reconstruction target and is downsampled once by the compositor.
+    if (rtxDecision.active) {
+      decision = rtxDecision;
+      desiredBackend = "rtx-video";
+      desiredOutput = displayOutput;
+    } else if (
+      rtxReady &&
+      rtxDecision.reason !== "scale-too-small" &&
+      rtxDecision.reason !== "output-too-small"
+    ) {
+      decision = rtxDecision;
+      desiredBackend = "none";
+      desiredOutput = displayOutput;
+    }
 
     if (
       decision.reason === "render-budget" ||
@@ -484,9 +728,13 @@ export class VideoEnhancementController extends EventTarget {
       return;
     }
 
-    if (decision.active && !this.ensureGraphics()) {
-      this.backendAvailable = false;
-      this.applyActive(false);
+    if (
+      desiredBackend === "webgl2-spatial" &&
+      decision.active &&
+      !this.ensureGraphics()
+    ) {
+      this.webglBackendAvailable = false;
+      this.applyBackend("none");
       this.commitState({
         ...decision,
         active: false,
@@ -496,6 +744,8 @@ export class VideoEnhancementController extends EventTarget {
         sourceHeight: this.video.videoHeight,
         outputWidth: desiredOutput.width,
         outputHeight: desiredOutput.height,
+        targetWidth: target4k.width,
+        targetHeight: target4k.height,
         renderP95Ms,
         droppedFrameRatio: this.droppedFrameRatio,
       });
@@ -504,6 +754,7 @@ export class VideoEnhancementController extends EventTarget {
 
     if (
       decision.active &&
+      desiredBackend === "webgl2-spatial" &&
       (this.canvas.width !== desiredOutput.width ||
         this.canvas.height !== desiredOutput.height)
     ) {
@@ -511,17 +762,19 @@ export class VideoEnhancementController extends EventTarget {
       this.canvas.height = desiredOutput.height;
     }
     this.sharpness = decision.sharpness;
-    this.applyActive(decision.active && !document.hidden);
-    if (decision.active && !this.active) return;
+    const visibleBackend =
+      decision.active && !document.hidden ? desiredBackend : "none";
+    this.applyBackend(visibleBackend);
     this.commitState({
       ...decision,
-      active: decision.active && !document.hidden,
-      backend:
-        decision.active && this.gl ? "webgl2-spatial" : "none",
+      active: visibleBackend !== "none",
+      backend: visibleBackend,
       sourceWidth: this.video.videoWidth,
       sourceHeight: this.video.videoHeight,
       outputWidth: desiredOutput.width,
       outputHeight: desiredOutput.height,
+      targetWidth: target4k.width,
+      targetHeight: target4k.height,
       renderP95Ms,
       droppedFrameRatio: this.droppedFrameRatio,
     });
@@ -531,7 +784,7 @@ export class VideoEnhancementController extends EventTarget {
   destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;
-    this.applyActive(false);
+    this.applyBackend("none");
     if (this.policyTimer !== undefined) {
       window.clearInterval(this.policyTimer);
       this.policyTimer = undefined;
@@ -561,6 +814,8 @@ export class VideoEnhancementController extends EventTarget {
     );
     this.releaseGraphics(true);
     this.stage.classList.remove("video-enhancement-active");
+    this.stage.classList.remove("video-enhancement-rtx-active");
+    delete this.stage.dataset.videoEnhancementBackend;
     this.canvas.hidden = true;
     this.subtitleLayer.hidden = true;
   }
@@ -632,34 +887,57 @@ export class VideoEnhancementController extends EventTarget {
     this.timerQueries = [];
     this.timerExtension = undefined;
     this.texture = undefined;
+    this.textureWidth = 0;
+    this.textureHeight = 0;
     this.vertexArray = undefined;
     this.program = undefined;
     this.gl = undefined;
   }
 
-  private applyActive(active: boolean): void {
-    if (this.active === active && active) {
-      this.renderFrame();
+  private applyBackend(backend: VideoEnhancementBackend): void {
+    if (this.activeBackend === backend) {
+      if (backend === "webgl2-spatial") this.renderFrame();
       return;
     }
-    this.active = active;
-    if (active) {
+    this.cancelFrame();
+    this.stage.classList.remove(
+      "video-enhancement-active",
+      "video-enhancement-rtx-active",
+    );
+    this.canvas.hidden = true;
+    this.subtitleLayer.hidden = true;
+    this.lastSubtitleText = "";
+    this.activeBackend = backend;
+    this.active = backend !== "none";
+    if (backend === "webgl2-spatial") {
+      this.stage.dataset.videoEnhancementBackend = backend;
       // Draw the already-decoded frame immediately. This prevents a paused
       // movie from turning black while requestVideoFrameCallback waits for a
       // future presentation.
       this.renderFrame();
       this.scheduleFrame();
-    } else {
-      this.cancelFrame();
-      this.stage.classList.remove("video-enhancement-active");
-      this.canvas.hidden = true;
-      this.subtitleLayer.hidden = true;
-      this.lastSubtitleText = "";
+      return;
     }
+    if (backend === "rtx-video") {
+      // A WebGL canvas would force Chromium to copy the decoded frame out of
+      // the native video overlay, preventing the NVIDIA D3D11 VP extension
+      // from running. Tear it down and leave the <video> surface untouched.
+      this.releaseGraphics(true);
+      this.stage.dataset.videoEnhancementBackend = backend;
+      this.stage.classList.add("video-enhancement-rtx-active");
+      return;
+    }
+    delete this.stage.dataset.videoEnhancementBackend;
   }
 
   private scheduleFrame(): void {
-    if (!this.active || this.destroyed) return;
+    if (
+      !this.active ||
+      this.activeBackend !== "webgl2-spatial" ||
+      this.destroyed
+    ) {
+      return;
+    }
     if (typeof this.video.requestVideoFrameCallback === "function") {
       if (this.videoFrameCallback !== undefined) return;
       this.videoFrameCallback = this.video.requestVideoFrameCallback(() => {
@@ -695,6 +973,7 @@ export class VideoEnhancementController extends EventTarget {
     const vertexArray = this.vertexArray;
     if (
       !this.active ||
+      this.activeBackend !== "webgl2-spatial" ||
       !gl ||
       !program ||
       !texture ||
@@ -717,14 +996,31 @@ export class VideoEnhancementController extends EventTarget {
       }
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, texture);
-      gl.texImage2D(
-        gl.TEXTURE_2D,
-        0,
-        gl.RGBA,
-        gl.RGBA,
-        gl.UNSIGNED_BYTE,
-        this.video,
-      );
+      if (
+        this.textureWidth !== this.video.videoWidth ||
+        this.textureHeight !== this.video.videoHeight
+      ) {
+        gl.texImage2D(
+          gl.TEXTURE_2D,
+          0,
+          gl.RGBA,
+          gl.RGBA,
+          gl.UNSIGNED_BYTE,
+          this.video,
+        );
+        this.textureWidth = this.video.videoWidth;
+        this.textureHeight = this.video.videoHeight;
+      } else {
+        gl.texSubImage2D(
+          gl.TEXTURE_2D,
+          0,
+          0,
+          0,
+          gl.RGBA,
+          gl.UNSIGNED_BYTE,
+          this.video,
+        );
+      }
       gl.useProgram(program);
       gl.bindVertexArray(vertexArray);
       gl.uniform2f(
@@ -732,9 +1028,21 @@ export class VideoEnhancementController extends EventTarget {
         1 / this.video.videoWidth,
         1 / this.video.videoHeight,
       );
+      gl.uniform2f(
+        gl.getUniformLocation(program, "u_output_texel"),
+        1 / this.canvas.width,
+        1 / this.canvas.height,
+      );
       gl.uniform1f(
         gl.getUniformLocation(program, "u_sharpness"),
         this.sharpness,
+      );
+      gl.uniform1f(
+        gl.getUniformLocation(program, "u_scale"),
+        Math.min(
+          this.canvas.width / this.video.videoWidth,
+          this.canvas.height / this.video.videoHeight,
+        ),
       );
       gl.disable(gl.BLEND);
       gl.clearColor(0, 0, 0, 1);
@@ -750,7 +1058,10 @@ export class VideoEnhancementController extends EventTarget {
       if (!this.timerExtension) {
         this.pushRenderSample(performance.now() - startedAt);
       }
-      if (this.active) {
+      if (
+        this.active &&
+        this.activeBackend === "webgl2-spatial"
+      ) {
         this.canvas.hidden = false;
         this.stage.classList.add("video-enhancement-active");
       }
@@ -764,7 +1075,7 @@ export class VideoEnhancementController extends EventTarget {
         }
         gl.deleteQuery(timerQuery);
       }
-      this.backendAvailable = false;
+      this.webglBackendAvailable = false;
       this.onDiagnostic?.("video-enhancement-render-failed", {
         message: error instanceof Error ? error.message : String(error),
       });
@@ -870,16 +1181,20 @@ export class VideoEnhancementController extends EventTarget {
   ): void {
     const renderP95Ms = percentile95(this.renderSamples);
     this.cooldownUntil = performance.now() + PRESSURE_COOLDOWN_MS;
-    this.applyActive(false);
+    const previousBackend = this.activeBackend;
+    this.applyBackend("none");
     const rect = this.stage.getBoundingClientRect();
     const pixelRatio = Math.max(
       1,
       Math.min(2.5, globalThis.devicePixelRatio || 1),
     );
-    const output = boundedOutputDimensions(
+    const displayOutput = boundedOutputDimensions(
       rect.width * pixelRatio,
       rect.height * pixelRatio,
     );
+    const target4k = target4kDimensions(rect.width, rect.height);
+    const output =
+      previousBackend === "rtx-video" ? displayOutput : target4k;
     this.commitState({
       active: false,
       reason,
@@ -896,6 +1211,8 @@ export class VideoEnhancementController extends EventTarget {
       sourceHeight: this.video.videoHeight,
       outputWidth: output.width,
       outputHeight: output.height,
+      targetWidth: target4k.width,
+      targetHeight: target4k.height,
       renderP95Ms,
       droppedFrameRatio: this.droppedFrameRatio,
     });
@@ -922,7 +1239,9 @@ export class VideoEnhancementController extends EventTarget {
       next.sourceWidth !== this.state.sourceWidth ||
       next.sourceHeight !== this.state.sourceHeight ||
       next.outputWidth !== this.state.outputWidth ||
-      next.outputHeight !== this.state.outputHeight;
+      next.outputHeight !== this.state.outputHeight ||
+      next.targetWidth !== this.state.targetWidth ||
+      next.targetHeight !== this.state.targetHeight;
     this.state = next;
     if (changed) {
       this.dispatchEvent(
@@ -939,9 +1258,13 @@ export class VideoEnhancementController extends EventTarget {
     if (now - this.lastDiagnosticAt < 5_000) return;
     this.lastDiagnosticAt = now;
     this.onDiagnostic?.("video-enhancement-metrics", {
-      backend: "webgl2-spatial",
+      backend: this.activeBackend,
       source: `${this.video.videoWidth}x${this.video.videoHeight}`,
-      output: `${this.canvas.width}x${this.canvas.height}`,
+      output:
+        this.activeBackend === "webgl2-spatial"
+          ? `${this.canvas.width}x${this.canvas.height}`
+          : `${this.state.outputWidth}x${this.state.outputHeight}`,
+      target: `${this.state.targetWidth}x${this.state.targetHeight}`,
       renderP95Ms: percentile95(this.renderSamples),
       droppedFrameRatio: this.droppedFrameRatio,
     });

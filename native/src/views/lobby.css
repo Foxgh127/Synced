@@ -5,6 +5,7 @@ body.mode-lobby .viewer-stage {
 }
 
 .channel-lobby {
+  isolation: isolate;
   position: relative;
   display: grid;
   width: min(680px, calc(100% - 32px));
@@ -15,7 +16,9 @@ body.mode-lobby .viewer-stage {
   overflow: hidden;
   border: 1px solid var(--stroke-subtle);
   border-radius: var(--r-2xl);
-  background: var(--material-l1);
+  background:
+    radial-gradient(circle at 50% 24%, var(--accent-bg), transparent 44%),
+    var(--canvas-1);
   box-shadow: var(--e-card);
   text-align: center;
 }
@@ -38,57 +41,12 @@ body.mode-lobby .viewer-stage {
 
 .lobby-light-field {
   position: absolute;
+  z-index: var(--z-canvas);
   inset: 0;
-  overflow: hidden;
-  pointer-events: none;
-}
-
-.lobby-light-field::before {
-  position: absolute;
-  width: 60%;
-  aspect-ratio: 1;
-  border-radius: var(--radius-8ec82c689f);
-  background: var(--accent-bg);
-  content: "";
-  filter: blur(var(--blur-52686b14ab));
-  inset: 8% 20% auto;
+  width: 100%;
+  height: 100%;
   opacity: 0.72;
-}
-
-.lobby-light-field i {
-  position: absolute;
-  width: 7px;
-  height: 7px;
-  border-radius: var(--radius-8ec82c689f);
-  background: var(--accent-2);
-  box-shadow: var(--shadow-7956de19a5);
-  opacity: 0.42;
-  animation: lobby-drift 12s var(--ease-in-out) infinite alternate;
-}
-
-.lobby-light-field i:nth-child(1) {
-  top: 24%;
-  left: 22%;
-}
-
-.lobby-light-field i:nth-child(2) {
-  top: 36%;
-  right: 18%;
-  animation-delay: -4s;
-  animation-duration: 15s;
-}
-
-.lobby-light-field i:nth-child(3) {
-  right: 34%;
-  bottom: 18%;
-  animation-delay: -8s;
-  animation-duration: 18s;
-}
-
-body:not(.mode-lobby) .lobby-light-field i,
-html[data-effects-quality="minimal"] .lobby-light-field i,
-html[data-motion="reduced"] .lobby-light-field i {
-  animation: none;
+  pointer-events: none;
 }
 
 .lobby-room-code {
@@ -170,14 +128,115 @@ html[data-motion="reduced"] .lobby-light-field i {
   font-size: var(--t-small);
 }
 
-@keyframes lobby-drift {
-  from {
-    transform: translate3d(-4px, 3px, 0);
-  }
+.invite-dialog {
+  position: fixed;
+  inset: var(--s-0);
+  display: grid;
+  width: min(620px, calc(100vw - var(--s-8)));
+  max-height: calc(100dvh - var(--s-8));
+  margin: auto;
+  gap: var(--s-5);
+  padding: var(--s-7);
+  overflow-x: hidden;
+  overflow-y: auto;
+  border-color: var(--stroke-strong);
+  border-radius: var(--r-xl);
+  background:
+    var(--glass-shine),
+    var(--n-850);
+  box-shadow: var(--e-3);
+  text-align: left;
+}
 
-  to {
-    transform: translate3d(6px, -5px, 0);
-  }
+.invite-dialog:not([open]) {
+  display: none;
+}
+
+.invite-dialog .dialog-header {
+  align-items: center;
+}
+
+.invite-dialog .dialog-header h2 {
+  margin: var(--s-2) 0 var(--s-0);
+  font-size: var(--t-page);
+  line-height: var(--lh-page);
+}
+
+.invite-channel-name {
+  width: max-content;
+  max-width: 100%;
+  margin: var(--s-0);
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: var(--t-small);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.invite-content {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 200px;
+  align-items: stretch;
+  gap: var(--s-5);
+}
+
+.invite-copy-column {
+  display: grid;
+  min-width: 0;
+  align-content: center;
+  gap: var(--s-4);
+}
+
+.invite-dialog .invite-code {
+  width: 100%;
+  min-height: 112px;
+  margin: var(--s-0);
+  padding: var(--s-4);
+  border-color: var(--accent-border);
+  background: var(--accent-bg);
+}
+
+.invite-dialog .invite-code span {
+  font-size: clamp(24px, 4vw, 34px);
+}
+
+.invite-dialog .invite-code small {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-2);
+}
+
+.invite-dialog .invite-help {
+  margin: var(--s-0);
+  color: var(--text-tertiary);
+  font-size: var(--t-small);
+  line-height: var(--lh-body);
+}
+
+.invite-qr-shell {
+  display: grid;
+  width: 200px;
+  height: 200px;
+  place-items: center;
+  overflow: hidden;
+  border-radius: var(--r-md);
+  background: var(--n-000);
+}
+
+.invite-dialog .invite-qr-shell img {
+  display: block;
+  width: 200px;
+  height: 200px;
+  margin: var(--s-0);
+  border-radius: var(--r-sm);
+}
+
+.invite-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: var(--s-3);
+  margin-top: var(--s-1);
 }
 
 @container theater (max-width: 520px) {
@@ -191,5 +250,32 @@ html[data-motion="reduced"] .lobby-light-field i {
   .lobby-avatar {
     width: 44px;
     height: 44px;
+  }
+}
+
+@media (max-width: 640px) {
+  .invite-dialog {
+    width: calc(100vw - var(--s-5));
+    max-height: calc(100dvh - var(--s-5));
+    padding: var(--s-5);
+  }
+
+  .invite-content {
+    grid-template-columns: 1fr;
+  }
+
+  .invite-qr-shell {
+    width: 176px;
+    height: 176px;
+    justify-self: center;
+  }
+
+  .invite-dialog .invite-qr-shell img {
+    width: 176px;
+    height: 176px;
+  }
+
+  .invite-actions > .btn {
+    flex: 1 1 auto;
   }
 }

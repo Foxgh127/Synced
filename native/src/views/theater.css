@@ -14,6 +14,12 @@
   height: 18px;
 }
 
+.session-header #session-companion.is-on {
+  border-color: var(--accent-border);
+  background: var(--accent-bg);
+  color: var(--accent-text);
+}
+
 .session-status-line {
   display: flex;
   min-width: 0;
@@ -141,6 +147,18 @@
 .viewer-stage > canvas:not(.ambient-light-field) {
   position: relative;
   z-index: var(--z-bbf0bd5a18);
+}
+
+.viewer-stage > video.decoder-edge-guard {
+  /*
+   * A few legacy H.264 senders expose the decoder's partially filled
+   * 16-pixel macroblock row as a green strip. New captures are aligned at
+   * the producer; this narrowly clips only the unsafe remainder for an
+   * already-negotiated stream.
+   */
+  clip-path: inset(
+    0 var(--decoder-edge-guard-inline, 0%)
+  );
 }
 
 .viewer-stage > .channel-lobby,

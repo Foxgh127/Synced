@@ -100,6 +100,80 @@
   color: var(--text-tertiary);
 }
 
+.emby-popup-options {
+  min-width: 0;
+  margin: var(--s-0) var(--s-6);
+  padding: var(--s-5);
+  border: 1px solid var(--stroke-default);
+  border-radius: var(--r-lg);
+  background:
+    var(--glass-shine),
+    var(--material-l1);
+  box-shadow: var(--e-1);
+}
+
+.emby-popup-options .emby-stream-options {
+  width: 100%;
+  min-width: 0;
+  margin: var(--s-0);
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--s-4);
+}
+
+.emby-popup-options .emby-stream-options label {
+  position: relative;
+  width: 100%;
+  min-width: 0;
+  gap: var(--s-2);
+  color: var(--text-secondary);
+  font-size: var(--t-caption);
+}
+
+.emby-popup-options .emby-stream-options label:has(> select)::after {
+  position: absolute;
+  right: var(--s-4);
+  bottom: 18px;
+  width: 7px;
+  height: 7px;
+  border-right: 2px solid var(--text-tertiary);
+  border-bottom: 2px solid var(--text-tertiary);
+  content: "";
+  pointer-events: none;
+  transform: rotate(45deg);
+}
+
+.emby-popup-options .emby-stream-options select {
+  width: 100%;
+  min-width: 0;
+  min-height: var(--control-min);
+  padding: var(--s-0) var(--s-8) var(--s-0) var(--s-4);
+  overflow: hidden;
+  appearance: none;
+  border: 1px solid var(--stroke-default);
+  border-radius: var(--r-sm);
+  background: var(--surface-1);
+  color: var(--text-primary);
+  font: 600 var(--t-small) / var(--lh-body) var(--font-body);
+  text-overflow: ellipsis;
+  transition: border-color var(--dur-micro) var(--ease-out), background-color var(--dur-micro) var(--ease-out);
+}
+
+.emby-popup-options .emby-stream-options select:hover {
+  border-color: var(--stroke-strong);
+  background: var(--surface-2);
+}
+
+.emby-popup-options .emby-stream-options select:focus-visible {
+  border-color: var(--accent);
+  outline: none;
+  box-shadow: var(--shadow-f6f16fb327);
+}
+
+.emby-popup-options .emby-stream-options select option {
+  background: var(--n-850);
+  color: var(--text-primary);
+}
+
 .emby-item-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(148px, 1fr));
@@ -119,7 +193,7 @@
   right: 0;
   bottom: 0;
   display: block;
-  width: min(560px, 62%);
+  width: min(760px, 82%);
   padding: var(--s-7);
   overflow-y: auto;
   overflow-x: hidden;
@@ -129,6 +203,88 @@
     var(--material-l2);
   box-shadow: var(--e-3);
   overscroll-behavior: contain;
+}
+
+.emby-popup-layout {
+  grid-template-columns: 200px minmax(0, 1fr);
+  gap: var(--s-7);
+  padding: var(--s-8) var(--s-9) var(--s-6) var(--s-7);
+}
+
+.emby-popup-poster {
+  width: 200px;
+}
+
+.emby-popup-info {
+  min-width: 0;
+}
+
+.emby-popup-overview {
+  width: 100%;
+  max-width: 68ch;
+  font-size: var(--t-small);
+  line-height: 1.78;
+  text-wrap: pretty;
+}
+
+.emby-popup-options .emby-stream-options :is(
+  .emby-resume-option,
+  .emby-hevc-option
+) {
+  display: flex;
+  min-height: var(--control-min);
+  align-items: center;
+  gap: var(--s-3);
+}
+
+.emby-popup-options .emby-stream-options :is(
+  .emby-resume-option,
+  .emby-hevc-option
+) > input[type="checkbox"] {
+  position: relative;
+  width: 20px;
+  min-width: 20px;
+  height: 20px;
+  min-height: 20px;
+  padding: 0;
+  appearance: none;
+  border: 1px solid var(--stroke-strong);
+  border-radius: var(--r-xs);
+  background: var(--surface-2);
+  cursor: pointer;
+}
+
+.emby-popup-options .emby-stream-options :is(
+  .emby-resume-option,
+  .emby-hevc-option
+) > input[type="checkbox"]::after {
+  position: absolute;
+  top: 3px;
+  left: 6px;
+  width: 5px;
+  height: 9px;
+  border-right: 2px solid var(--accent-ink);
+  border-bottom: 2px solid var(--accent-ink);
+  content: "";
+  opacity: 0;
+  transform: rotate(45deg) scale(0.7);
+  transition: opacity var(--dur-micro) var(--ease-out), transform var(--dur-micro) var(--ease-spring);
+}
+
+.emby-popup-options .emby-stream-options :is(
+  .emby-resume-option,
+  .emby-hevc-option
+) > input[type="checkbox"]:checked {
+  border-color: var(--accent);
+  background: var(--accent);
+}
+
+.emby-popup-options .emby-stream-options :is(
+  .emby-resume-option,
+  .emby-hevc-option
+) > input[type="checkbox"]:checked::after {
+  opacity: 1;
+  transform: rotate(45deg) scale(1);
 }
 
 progress.emby-progress {
@@ -234,6 +390,15 @@ progress.emby-progress::-webkit-progress-value {
   object-fit: cover;
 }
 
+.emby-poster img[data-image-state="loading"] {
+  opacity: 0;
+}
+
+.emby-poster img[data-image-state="ready"] {
+  opacity: 1;
+  transition: opacity var(--dur-control) var(--ease-out), transform 600ms var(--ease-emphasis);
+}
+
 .emby-virtual-spacer {
   grid-column: 1 / -1;
   width: 100%;
@@ -269,5 +434,34 @@ progress.emby-progress::-webkit-progress-value {
     width: 100%;
     padding: var(--s-5);
     border-left: 0;
+  }
+
+  .emby-popup-layout {
+    grid-template-columns: 150px minmax(0, 1fr);
+    gap: var(--s-5);
+    padding: var(--s-7) var(--s-7) var(--s-5) var(--s-5);
+  }
+
+  .emby-popup-poster {
+    width: 150px;
+  }
+
+  .emby-popup-options {
+    margin-inline: var(--s-0);
+  }
+}
+
+@media (max-width: 520px) {
+  .emby-popup-layout {
+    grid-template-columns: 104px minmax(0, 1fr);
+    padding-right: var(--s-5);
+  }
+
+  .emby-popup-poster {
+    width: 104px;
+  }
+
+  .emby-popup-options .emby-stream-options {
+    grid-template-columns: 1fr;
   }
 }

@@ -83,6 +83,10 @@ declare global {
         depthPerComponent: number;
         hdr: boolean;
       }>;
+      getVideoEnhancementInfo: () => Promise<VideoEnhancementHardwareInfo>;
+      onVideoEnhancementInfoChanged: (
+        callback: (info: VideoEnhancementHardwareInfo) => void,
+      ) => () => void;
       openDisplaySettings: () => Promise<void>;
       embyLogin: (input: EmbyLoginInput) => Promise<EmbyAccount>;
       embyLogout: () => Promise<EmbyAccountState>;
@@ -189,6 +193,21 @@ declare global {
       platform: string;
     };
     __syncedEnterMiniWindowForMinimize?: () => Promise<boolean>;
+  }
+
+  interface VideoEnhancementHardwareInfo {
+    deviceName: string;
+    driverVersion: string;
+    driverRelease?: number;
+    activeGpuIsNvidia: boolean;
+    rtxGpu: boolean;
+    hardwareVideoDecode: boolean;
+    videoDecodeStatus: string;
+    rtxVideoSupported: boolean;
+    rtxVideoDriverState: "enabled" | "disabled" | "unknown";
+    rtxVideoDriverQuality?: number;
+    onBatteryPower: boolean;
+    error?: string;
   }
 
   interface EmbeddedGameBounds {

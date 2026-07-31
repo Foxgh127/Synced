@@ -149,6 +149,62 @@ async function main() {
       .executeJavaScript("Boolean(document.querySelector('#invite-dialog[open]'))")
       .catch(() => false),
   );
+  await new Promise((resolve) => setTimeout(resolve, 320));
+  const inviteLayout = await mainWindow.webContents.executeJavaScript(`(() => {
+    const dialog = document.querySelector("#invite-dialog[open]");
+    const header = dialog?.querySelector(".dialog-header");
+    const content = dialog?.querySelector(".invite-content");
+    const code = dialog?.querySelector(".invite-code");
+    const qr = dialog?.querySelector(".invite-qr-shell");
+    const actions = dialog?.querySelector(".invite-actions");
+    const close = dialog?.querySelector("[data-close-invite]");
+    const rect = dialog?.getBoundingClientRect();
+    const headerRect = header?.getBoundingClientRect();
+    const contentRect = content?.getBoundingClientRect();
+    const codeRect = code?.getBoundingClientRect();
+    const qrRect = qr?.getBoundingClientRect();
+    const actionsRect = actions?.getBoundingClientRect();
+    const closeRect = close?.getBoundingClientRect();
+    return {
+      open: Boolean(dialog),
+      viewportWidth: innerWidth,
+      viewportHeight: innerHeight,
+      left: rect?.left || 0,
+      right: rect?.right || 0,
+      top: rect?.top || 0,
+      bottom: rect?.bottom || 0,
+      centerDelta: rect
+        ? rect.left + rect.width / 2 - innerWidth / 2
+        : 999,
+      opaqueSurface:
+        Boolean(dialog) &&
+        getComputedStyle(dialog).backgroundImage !== "none",
+      closeInsideHeader:
+        Boolean(headerRect && closeRect) &&
+        closeRect.left >= headerRect.left &&
+        closeRect.right <= headerRect.right + 1 &&
+        closeRect.top >= headerRect.top - 1 &&
+        closeRect.bottom <= headerRect.bottom + 1,
+      contentBelowHeader:
+        Boolean(contentRect && headerRect) &&
+        contentRect.top >= headerRect.bottom,
+      codeAndQrAligned:
+        Boolean(codeRect && qrRect) &&
+        Math.abs(codeRect.top - qrRect.top) <= 44 &&
+        codeRect.right <= qrRect.left,
+      actionsBelowContent:
+        Boolean(actionsRect && contentRect) &&
+        actionsRect.top >= contentRect.bottom,
+    };
+  })()`);
+  const inviteScreenshotPath = path.join(
+    os.tmpdir(),
+    "synced-invite-layout-smoke.png",
+  );
+  fs.writeFileSync(
+    inviteScreenshotPath,
+    await mainWindow.webContents.capturePage().then((image) => image.toPNG()),
+  );
   await mainWindow.webContents.executeJavaScript(
     "document.querySelector('#enter-created-room')?.click()",
   );
@@ -220,9 +276,22 @@ async function main() {
     const chatRect = chat?.getBoundingClientRect();
     const sidebarRect = sidebar?.getBoundingClientRect();
     const danmakuRect = danmakuLayer?.getBoundingClientRect();
-    const stage = document.querySelector("#player-stage");
-    const stageRect = stage?.getBoundingClientRect();
-    const danmakuStyle = danmakuLayer
+     const stage = document.querySelector("#player-stage");
+     const stageRect = stage?.getBoundingClientRect();
+     const lobby = document.querySelector(".channel-lobby");
+     const lobbyStars = document.querySelector(".lobby-light-field");
+     const lobbyStarFrameBefore = Number(lobbyStars?.dataset.starFrame || 0);
+     const lobbyRect = lobby?.getBoundingClientRect();
+     lobby?.dispatchEvent(new PointerEvent("pointermove", {
+       bubbles: true,
+       clientX: (lobbyRect?.left || 0) + (lobbyRect?.width || 0) * 0.65,
+       clientY: (lobbyRect?.top || 0) + (lobbyRect?.height || 0) * 0.4,
+     }));
+     await new Promise((resolve) => requestAnimationFrame(() =>
+       requestAnimationFrame(resolve)
+     ));
+     const lobbyStarFrameAfter = Number(lobbyStars?.dataset.starFrame || 0);
+     const danmakuStyle = danmakuLayer
       ? getComputedStyle(danmakuLayer)
       : undefined;
     const danmakuItems = [...document.querySelectorAll(".danmaku")];
@@ -232,9 +301,39 @@ async function main() {
     const chatInput = document.querySelector("#chat-input");
     const chatInputRect = chatInput?.getBoundingClientRect();
     chatInput?.focus();
-    const chatInputStyle = chatInput
-      ? getComputedStyle(chatInput)
-      : undefined;
+     const chatInputStyle = chatInput
+       ? getComputedStyle(chatInput)
+       : undefined;
+     const chatEmoji = document.querySelector("#chat-emoji-toggle");
+     const chatSend = document.querySelector(".chat-send-btn");
+     const chatEmojiRect = chatEmoji?.getBoundingClientRect();
+     const chatSendRect = chatSend?.getBoundingClientRect();
+     const voiceSettingsButton =
+       document.querySelector("#voice-settings-toggle");
+     const voiceSettingsPanel =
+       document.querySelector("#voice-device-panel");
+     const muteButton = document.querySelector("#mute-button");
+     const muteIcon = muteButton?.querySelector("svg");
+     const danmakuButton = document.querySelector("#dock-danmaku");
+     if (danmakuButton?.getAttribute("aria-pressed") !== "true") {
+       danmakuButton?.click();
+     }
+     voiceSettingsButton?.click();
+     const voiceSettingsAnimated =
+       voiceSettingsPanel?.dataset.presence === "entering" &&
+       voiceSettingsPanel.getAnimations().length > 0;
+     await new Promise((resolve) => setTimeout(resolve, 420));
+     const voiceSettingsRect = voiceSettingsPanel?.getBoundingClientRect();
+     const voiceSettingsOpen = Boolean(
+       voiceSettingsPanel &&
+       !voiceSettingsPanel.hidden &&
+       voiceSettingsPanel.classList.contains("voice-settings-visible") &&
+       getComputedStyle(voiceSettingsPanel).visibility === "visible" &&
+       voiceSettingsRect &&
+       voiceSettingsRect.height > 100
+     );
+     voiceSettingsButton?.click();
+     await new Promise((resolve) => setTimeout(resolve, 420));
     const movieVolume = document.querySelector("#dock-volume");
     if (movieVolume) {
       movieVolume.value = "0.37";
@@ -333,14 +432,54 @@ async function main() {
             control?.getAttribute("data-tooltip"),
         );
       }),
-      panelToggleDocumented: Boolean(
-        document.querySelector("#panel-toggle")?.getAttribute("data-tooltip"),
-      ),
-      chatInputWidth: Math.round(chatInputRect?.width || 0),
-      chatInputHeight: Math.round(chatInputRect?.height || 0),
-      chatInputOutline: chatInputStyle?.outlineStyle,
-      chatInputRadius: Number.parseFloat(chatInputStyle?.borderRadius || "0"),
-      obsoleteStageBadgesAbsent:
+      obsoletePanelToggleAbsent:
+        !document.querySelector("#panel-toggle"),
+      danmakuIconClear:
+        Boolean(danmakuButton?.querySelector(".lucide-message-square-text")),
+      danmakuActiveVisible:
+        danmakuButton?.getAttribute("aria-pressed") === "true" &&
+        getComputedStyle(danmakuButton).backgroundColor !==
+          "rgba(0, 0, 0, 0)",
+       chatInputWidth: Math.round(chatInputRect?.width || 0),
+       chatInputHeight: Math.round(chatInputRect?.height || 0),
+       chatInputOutline: chatInputStyle?.outlineStyle,
+       chatInputRadius: Number.parseFloat(chatInputStyle?.borderRadius || "0"),
+       chatComposerAligned:
+         Boolean(chatInputRect && chatEmojiRect && chatSendRect) &&
+         chatInputRect.right <= chatEmojiRect.left + 1 &&
+         chatEmojiRect.right <= chatSendRect.left + 1,
+       chatEmojiWidth: Math.round(chatEmojiRect?.width || 0),
+       voiceSettingsAnimated,
+       voiceSettingsOpen,
+       voiceSettingsClosed:
+         voiceSettingsPanel?.hidden === true &&
+         voiceSettingsButton?.getAttribute("aria-expanded") === "false",
+       voiceSettingsInsideCard:
+         Boolean(voiceSettingsPanel) &&
+         document.querySelector(".voice-card")?.contains(voiceSettingsPanel),
+       muteIconPresent:
+         Boolean(muteIcon) &&
+         muteIcon.classList.contains("lucide-mic-off"),
+       muteButtonWidth:
+         Math.round(muteButton?.getBoundingClientRect().width || 0),
+       muteIconWidth:
+         Math.round(muteIcon?.getBoundingClientRect().width || 0),
+       lobbyInteractive:
+         lobby?.classList.contains("interactive-card") === true,
+       lobbyPointerLight:
+         lobby?.style.getPropertyValue("--pointer-opacity") === "1",
+      lobbyStarsPresent:
+         lobbyStars instanceof HTMLCanvasElement &&
+         Number(lobbyStars?.dataset.starCount || 0) >= 18 &&
+         Number(lobbyStars?.dataset.starCount || 0) < 80,
+       lobbyStarsMoving:
+         lobbyStarFrameAfter > lobbyStarFrameBefore,
+       obsoleteLobbyDotsAbsent:
+         document.querySelectorAll(".lobby-light-field > i").length === 0,
+       windowsBroadcastCopyAbsent:
+         !document.querySelector(".session-header")?.textContent
+           ?.includes("任意 Windows 成员可放映"),
+       obsoleteStageBadgesAbsent:
         !document.querySelector("#local-stage-badge") &&
         !document.querySelector("#audio-route-badge"),
       semanticDockGroups: [
@@ -349,8 +488,8 @@ async function main() {
         ".dock-social",
         ".dock-view",
       ].every((selector) => Boolean(document.querySelector(selector))),
-      inactiveVoiceHelpHidden:
-        document.querySelector("#voice-quality")?.hidden === true,
+      obsoleteVoiceDiagnosticsAbsent:
+        !document.querySelector("#voice-quality"),
       pictureInPictureWindowBridge:
         typeof window.roomDesktop?.setMiniWindowEnabled === "function" &&
         typeof window.roomDesktop?.restoreFromPictureInPicture === "function" &&
@@ -373,29 +512,60 @@ async function main() {
   })()`);
   const screenshotPath = path.join(os.tmpdir(), "synced-sidebar-smoke.png");
   fs.writeFileSync(screenshotPath, await mainWindow.webContents.capturePage().then((image) => image.toPNG()));
+  const voiceSettingsScreenshotPath = path.join(
+    os.tmpdir(),
+    "synced-voice-settings-smoke.png",
+  );
+  await mainWindow.webContents.executeJavaScript(`(async () => {
+    const toggle = document.querySelector("#voice-settings-toggle");
+    if (toggle?.getAttribute("aria-expanded") !== "true") toggle?.click();
+    await new Promise((resolve) => setTimeout(resolve, 180));
+  })()`);
+  fs.writeFileSync(
+    voiceSettingsScreenshotPath,
+    await mainWindow.webContents.capturePage().then((image) => image.toPNG()),
+  );
+  await mainWindow.webContents.executeJavaScript(`(async () => {
+    const toggle = document.querySelector("#voice-settings-toggle");
+    if (toggle?.getAttribute("aria-expanded") === "true") toggle?.click();
+    await new Promise((resolve) => setTimeout(resolve, 420));
+  })()`);
   const lobbyPanelLayout =
     await mainWindow.webContents.executeJavaScript(`(async () => {
-      const body = document.body;
-      const stage = document.querySelector("#player-stage");
-      const toggle = document.querySelector("#panel-toggle");
-      body.classList.remove("mode-theater", "mode-immersive", "panel-collapsed");
-      body.classList.add("mode-lobby", "is-lobby", "panel-open");
+       const body = document.body;
+       const stage = document.querySelector("#player-stage");
+       const toggle = document.querySelector("#session-companion");
+       body.classList.remove("mode-theater", "mode-immersive", "panel-collapsed");
+       body.classList.add("mode-lobby", "is-lobby", "panel-open");
       await new Promise((resolve) => setTimeout(resolve, 420));
       const expandedWidth = stage?.getBoundingClientRect().width || 0;
       toggle?.click();
       await new Promise((resolve) => setTimeout(resolve, 420));
-      const collapsedWidth = stage?.getBoundingClientRect().width || 0;
-      const collapsed = body.classList.contains("panel-collapsed");
-      toggle?.click();
-      await new Promise((resolve) => setTimeout(resolve, 420));
-      return { expandedWidth, collapsedWidth, collapsed };
+       const collapsedWidth = stage?.getBoundingClientRect().width || 0;
+       const collapsed = body.classList.contains("panel-collapsed");
+       const collapsedAria =
+         toggle?.getAttribute("aria-expanded") === "false" &&
+         toggle?.getAttribute("aria-pressed") === "false";
+       toggle?.click();
+       await new Promise((resolve) => setTimeout(resolve, 420));
+       const reopened =
+         !body.classList.contains("panel-collapsed") &&
+         toggle?.getAttribute("aria-expanded") === "true" &&
+         toggle?.getAttribute("aria-pressed") === "true";
+       return {
+         expandedWidth,
+         collapsedWidth,
+         collapsed,
+         collapsedAria,
+         reopened,
+       };
     })()`);
   const theaterPanelLayout =
     await mainWindow.webContents.executeJavaScript(`(async () => {
-      const body = document.body;
-      const stage = document.querySelector("#player-stage");
-      const dock = document.querySelector("#stage-dock");
-      const toggle = document.querySelector("#panel-toggle");
+       const body = document.body;
+       const stage = document.querySelector("#player-stage");
+       const dock = document.querySelector("#stage-dock");
+       const toggle = document.querySelector("#session-companion");
       body.classList.remove("mode-lobby", "mode-immersive", "panel-collapsed");
       body.classList.add("mode-theater", "panel-open");
       if (dock) dock.hidden = false;
@@ -497,6 +667,16 @@ async function main() {
     const progressRect = progress.getBoundingClientRect();
     const dockStyle = getComputedStyle(dock);
     const progressStyle = getComputedStyle(progress);
+    const moreButton = document.querySelector("#dock-more");
+    if (moreButton?.getAttribute("aria-expanded") !== "true") {
+      moreButton?.click();
+    }
+    await new Promise((resolve) => setTimeout(resolve, 420));
+    const moreMenu = document.querySelector("#dock-more-menu");
+    const moreMenuRect = moreMenu?.getBoundingClientRect();
+    const moreMenuStyle = moreMenu
+      ? getComputedStyle(moreMenu)
+      : undefined;
     return {
       fullscreenElementIsStage: document.fullscreenElement === stage,
       hiddenBeforePointerMove,
@@ -510,6 +690,20 @@ async function main() {
       smartCropInMoreMenu: Boolean(
         document.querySelector("#dock-more-menu #dock-smart-crop"),
       ),
+      moreMenuOpen:
+        moreMenu?.hidden === false &&
+        moreButton?.getAttribute("aria-expanded") === "true",
+      moreMenuInsideFullscreen:
+        Boolean(moreMenu) && stage.contains(moreMenu),
+      moreMenuVisible:
+        moreMenuStyle?.display !== "none" &&
+        Number(moreMenuStyle?.opacity || "0") > 0.9,
+      moreMenuWithinViewport:
+        Boolean(moreMenuRect) &&
+        moreMenuRect.left >= -1 &&
+        moreMenuRect.top >= -1 &&
+        moreMenuRect.right <= innerWidth + 1 &&
+        moreMenuRect.bottom <= innerHeight + 1,
       fullscreenInDock: dock.contains(document.querySelector("#dock-fullscreen")),
       controlsVisible:
         dockStyle.display !== "none" &&
@@ -532,6 +726,14 @@ async function main() {
     fullscreenScreenshotPath,
     await mainWindow.webContents.capturePage().then((image) => image.toPNG()),
   );
+  await mainWindow.webContents.executeJavaScript(`(async () => {
+    const moreButton = document.querySelector("#dock-more");
+    if (moreButton?.getAttribute("aria-expanded") === "true") {
+      moreButton.click();
+      await new Promise((resolve) => setTimeout(resolve, 420));
+    }
+    moreButton?.blur();
+  })()`);
   // Start the idle window after capturePage; Electron may synthesize a pointer
   // update while capturing the visible window and legitimately reset the timer.
   await mainWindow.webContents.executeJavaScript(
@@ -713,13 +915,11 @@ async function main() {
   mainWindow.setMinimumSize(320, 480);
   mainWindow.setContentSize(375, 812);
   let mobileLayout;
-  let mobileSheetOpenLayout;
+  let mobileInlineAfterToggleLayout;
   try {
     await new Promise((resolve) => setTimeout(resolve, 500));
     mobileLayout = await mainWindow.webContents.executeJavaScript(`(async () => {
       document.body.classList.add("native-android");
-      document.body.classList.add("panel-collapsed");
-      document.body.classList.remove("panel-open");
       await new Promise((resolve) => setTimeout(resolve, 420));
       const shell = document.querySelector(".session-shell");
       if (shell) shell.scrollTop = 0;
@@ -730,7 +930,6 @@ async function main() {
       const panelSection = panel?.querySelector("section");
       const chat = document.querySelector("#chat-panel");
       const membersPanel = document.querySelector("#member-panel");
-      const panelToggle = document.querySelector("#panel-toggle");
       const dock = document.querySelector("#stage-dock");
       if (dock) {
         dock.hidden = false;
@@ -754,7 +953,6 @@ async function main() {
       const headerRect = header?.getBoundingClientRect();
       const headerIdentityRect = headerIdentity?.getBoundingClientRect();
       const panelRect = panel?.getBoundingClientRect();
-      const panelToggleRect = panelToggle?.getBoundingClientRect();
       const chatRect = chat?.getBoundingClientRect();
       const membersRect = membersPanel?.getBoundingClientRect();
       const dockRect = dock?.getBoundingClientRect();
@@ -824,10 +1022,8 @@ async function main() {
             chat.compareDocumentPosition(membersPanel) &
               Node.DOCUMENT_POSITION_FOLLOWING,
           ),
-        panelToggleDisplay: panelToggle
-          ? getComputedStyle(panelToggle).display
-          : "",
-        panelToggleLeft: panelToggleRect?.left || 0,
+        obsoletePanelToggleAbsent:
+          !document.querySelector("#panel-toggle"),
         dockOverflowX: dockStyle?.overflowX || "",
         dockClientWidth: dock?.clientWidth || 0,
         dockScrollWidth: dock?.scrollWidth || 0,
@@ -872,13 +1068,15 @@ async function main() {
         touchTargetHeight: profileButton?.getBoundingClientRect().height || 0,
       };
     })()`);
-    mobileSheetOpenLayout =
+    mobileInlineAfterToggleLayout =
       await mainWindow.webContents.executeJavaScript(`(async () => {
-        const toggle = document.querySelector("#panel-toggle");
+        const toggle = document.querySelector("#session-companion");
         toggle?.click();
         await new Promise((resolve) => setTimeout(resolve, 420));
         const panel = document.querySelector(".companion-panel");
         const panelSection = panel?.querySelector("section");
+        const chat = document.querySelector("#chat-panel");
+        const members = document.querySelector("#member-panel");
         const scrim = document.querySelector("#companion-scrim");
         const rect = panel?.getBoundingClientRect();
         const style = panel ? getComputedStyle(panel) : undefined;
@@ -895,7 +1093,9 @@ async function main() {
           panelSectionVisibility: panelSection
             ? getComputedStyle(panelSection).visibility
             : "",
-          scrimHidden: scrim?.hidden !== false,
+          chatVisibility: chat ? getComputedStyle(chat).visibility : "",
+          membersVisibility: members ? getComputedStyle(members).visibility : "",
+          scrimAbsent: !scrim,
         };
       })()`);
     fs.writeFileSync(
@@ -931,6 +1131,17 @@ async function main() {
     setupLayout.buttonGap < 0 ||
     setupLayout.railEmptyDisplay !== "none" ||
     setupLayout.horizontalOverflow > 1 ||
+    !inviteLayout.open ||
+    inviteLayout.left < 0 ||
+    inviteLayout.right > inviteLayout.viewportWidth + 1 ||
+    inviteLayout.top < 0 ||
+    inviteLayout.bottom > inviteLayout.viewportHeight + 1 ||
+    Math.abs(inviteLayout.centerDelta) > 2 ||
+    !inviteLayout.opaqueSurface ||
+    !inviteLayout.closeInsideHeader ||
+    !inviteLayout.contentBelowHeader ||
+    !inviteLayout.codeAndQrAligned ||
+    !inviteLayout.actionsBelowContent ||
     result.participants !== 3 ||
     result.volumeControlsBeforeClick !== 0 ||
     result.volumeControlsAfterClick !== 1 ||
@@ -969,14 +1180,31 @@ async function main() {
     !result.unifiedFullscreenActions ||
     !result.pictureInPictureControl ||
     !result.documentedDockControls ||
-    !result.panelToggleDocumented ||
+    !result.obsoletePanelToggleAbsent ||
+    !result.danmakuIconClear ||
+    !result.danmakuActiveVisible ||
     result.chatInputOutline !== "none" ||
     result.chatInputRadius < 8 ||
     result.chatInputWidth < 180 ||
     result.chatInputHeight < 44 ||
+    !result.chatComposerAligned ||
+    result.chatEmojiWidth < 44 ||
+    !result.voiceSettingsAnimated ||
+    !result.voiceSettingsOpen ||
+    !result.voiceSettingsClosed ||
+    !result.voiceSettingsInsideCard ||
+    !result.muteIconPresent ||
+    result.muteButtonWidth < 44 ||
+    result.muteIconWidth < 18 ||
+    !result.lobbyInteractive ||
+    !result.lobbyPointerLight ||
+    !result.lobbyStarsPresent ||
+    !result.lobbyStarsMoving ||
+    !result.obsoleteLobbyDotsAbsent ||
+    !result.windowsBroadcastCopyAbsent ||
     !result.obsoleteStageBadgesAbsent ||
     !result.semanticDockGroups ||
-    !result.inactiveVoiceHelpHidden ||
+    !result.obsoleteVoiceDiagnosticsAbsent ||
     !result.pictureInPictureInMoreMenu ||
     !result.pictureInPictureLabel?.includes("小窗模式") ||
     result.pictureInPictureState !== "关" ||
@@ -1004,6 +1232,10 @@ async function main() {
     !fullscreenLayout.progressInsideStage ||
     !fullscreenLayout.legacyControlsAbsent ||
     !fullscreenLayout.smartCropInMoreMenu ||
+    !fullscreenLayout.moreMenuOpen ||
+    !fullscreenLayout.moreMenuInsideFullscreen ||
+    !fullscreenLayout.moreMenuVisible ||
+    !fullscreenLayout.moreMenuWithinViewport ||
     !fullscreenLayout.fullscreenInDock ||
     !fullscreenLayout.controlsVisible ||
     !fullscreenLayout.progressVisible ||
@@ -1018,6 +1250,8 @@ async function main() {
     fullscreenAutoHidden.progressOpacity > 0.05 ||
     fullscreenAutoHidden.progressPointerEvents !== "none" ||
     !lobbyPanelLayout.collapsed ||
+    !lobbyPanelLayout.collapsedAria ||
+    !lobbyPanelLayout.reopened ||
     lobbyPanelLayout.collapsedWidth - lobbyPanelLayout.expandedWidth < 240 ||
     !theaterPanelLayout.collapsed ||
     theaterPanelLayout.collapsedWidth - theaterPanelLayout.expandedWidth < 240 ||
@@ -1053,15 +1287,19 @@ async function main() {
     mobileLayout.headerIdentityLeft < 0 ||
     Math.abs(mobileLayout.panelWidth - mobileLayout.viewportWidth) > 2 ||
     Math.abs(mobileLayout.panelLeft) > 2 ||
-    !mobileLayout.bodyClasses.includes("panel-mobile-sheet") ||
-    !mobileLayout.bodyClasses.includes("panel-collapsed") ||
-    mobileLayout.panelPosition !== "fixed" ||
-    mobileLayout.panelTransform === "none" ||
-    mobileLayout.panelSectionVisibility !== "hidden" ||
-    mobileLayout.chatVisibility !== "hidden" ||
-    mobileLayout.membersVisibility !== "hidden" ||
+    !mobileLayout.bodyClasses.includes("panel-inline") ||
+    !mobileLayout.bodyClasses.includes("panel-open") ||
+    mobileLayout.bodyClasses.includes("panel-mobile-sheet") ||
+    mobileLayout.bodyClasses.includes("panel-collapsed") ||
+    mobileLayout.panelPosition !== "static" ||
+    mobileLayout.panelTransform !== "none" ||
+    mobileLayout.panelSectionVisibility !== "visible" ||
+    mobileLayout.chatVisibility !== "visible" ||
+    mobileLayout.membersVisibility !== "visible" ||
     !mobileLayout.chatBeforeMembers ||
-    mobileLayout.panelToggleDisplay === "none" ||
+    !mobileLayout.obsoletePanelToggleAbsent ||
+    mobileLayout.chatTop < mobileLayout.stageBottom - 1 ||
+    mobileLayout.membersTop < mobileLayout.chatBottom - 1 ||
     mobileLayout.dockOverflowX !== "visible" ||
     mobileLayout.fullscreenLeft < -1 ||
     mobileLayout.fullscreenRight > mobileLayout.viewportWidth + 1 ||
@@ -1086,26 +1324,28 @@ async function main() {
     mobileLayout.quickChatCloseHeight < 43 ||
     !mobileLayout.lowPriorityDockControlsHidden ||
     mobileLayout.touchTargetHeight < 43 ||
-    !mobileSheetOpenLayout.bodyClasses.includes("panel-mobile-sheet") ||
-    !mobileSheetOpenLayout.bodyClasses.includes("panel-open") ||
-    mobileSheetOpenLayout.bodyClasses.includes("panel-collapsed") ||
-    mobileSheetOpenLayout.toggleExpanded !== "true" ||
-    mobileSheetOpenLayout.panelPosition !== "fixed" ||
-    mobileSheetOpenLayout.panelTransform !== "matrix(1, 0, 0, 1, 0, 0)" ||
-    mobileSheetOpenLayout.panelPointerEvents === "none" ||
+    !mobileInlineAfterToggleLayout.bodyClasses.includes("panel-inline") ||
+    !mobileInlineAfterToggleLayout.bodyClasses.includes("panel-open") ||
+    mobileInlineAfterToggleLayout.bodyClasses.includes("panel-collapsed") ||
+    mobileInlineAfterToggleLayout.bodyClasses.includes("panel-mobile-sheet") ||
+    mobileInlineAfterToggleLayout.toggleExpanded !== "true" ||
+    mobileInlineAfterToggleLayout.panelPosition !== "static" ||
+    mobileInlineAfterToggleLayout.panelTransform !== "none" ||
+    mobileInlineAfterToggleLayout.panelPointerEvents === "none" ||
     Math.abs(
-      mobileSheetOpenLayout.panelWidth - mobileLayout.viewportWidth,
+      mobileInlineAfterToggleLayout.panelWidth - mobileLayout.viewportWidth,
     ) > 2 ||
-    Math.abs(mobileSheetOpenLayout.panelLeft) > 2 ||
-    mobileSheetOpenLayout.panelHeight < mobileLayout.viewportHeight * 0.5 ||
-    mobileSheetOpenLayout.panelHeight > mobileLayout.viewportHeight * 0.8 ||
-    Math.abs(mobileSheetOpenLayout.panelBottomGap - 52) > 2 ||
-    mobileSheetOpenLayout.panelSectionVisibility !== "visible" ||
-    mobileSheetOpenLayout.scrimHidden
+    Math.abs(mobileInlineAfterToggleLayout.panelLeft) > 2 ||
+    mobileInlineAfterToggleLayout.panelHeight < 600 ||
+    mobileInlineAfterToggleLayout.panelSectionVisibility !== "visible" ||
+    mobileInlineAfterToggleLayout.chatVisibility !== "visible" ||
+    mobileInlineAfterToggleLayout.membersVisibility !== "visible" ||
+    !mobileInlineAfterToggleLayout.scrimAbsent
   ) {
     throw new Error(
       `sidebar validation failed: ${JSON.stringify({
-        setupLayout,
+         setupLayout,
+         inviteLayout,
         result,
         fullscreenLayout,
         fullscreenAutoHidden,
@@ -1113,7 +1353,7 @@ async function main() {
         theaterPanelLayout,
         dockAutoHidden,
         mobileLayout,
-        mobileSheetOpenLayout,
+        mobileInlineAfterToggleLayout,
         miniWindowRestoreEvents,
         miniWindowVideoReady,
         miniWindowEnteredOnMinimize,
@@ -1128,9 +1368,12 @@ async function main() {
     `${JSON.stringify({
       ok: true,
       room,
-      setupLayout,
-      setupScreenshotPath,
+       setupLayout,
+       setupScreenshotPath,
+       inviteLayout,
+       inviteScreenshotPath,
       screenshotPath,
+      voiceSettingsScreenshotPath,
       fullscreenScreenshotPath,
       fullscreenLayout,
       fullscreenAutoHidden,
@@ -1139,7 +1382,7 @@ async function main() {
       dockAutoHidden,
       mobileScreenshotPath,
       mobileLayout,
-      mobileSheetOpenLayout,
+      mobileInlineAfterToggleLayout,
       miniWindowRestoreEvents,
       miniWindowOnScreenshotPath,
       miniWindowVideoReady,

@@ -1772,6 +1772,7 @@ test("lets any desktop member start and stop broadcasting in a channel", async (
         desktop: true,
         videoEnhancementBackends: [
           "webgl2-spatial",
+          "rtx-video",
           "invalid-backend",
           "webgl2-spatial",
         ],
@@ -1801,7 +1802,7 @@ test("lets any desktop member start and stop broadcasting in a channel", async (
       hevc: false,
       aac: true,
       desktop: true,
-      videoEnhancementBackends: ["webgl2-spatial"],
+      videoEnhancementBackends: ["webgl2-spatial", "rtx-video"],
       maxEnhancementPixels: 8_294_400,
     },
   );

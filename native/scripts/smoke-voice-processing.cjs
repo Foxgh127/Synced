@@ -179,7 +179,8 @@ async function main() {
         window,
         `(() => {
         const button = document.querySelector("#voice-button");
-        const quality = document.querySelector("#voice-quality")?.textContent || "";
+        const quality =
+          document.querySelector("#room-companion-panel")?.dataset.voiceQuality || "";
         const error = document.querySelector(".toast.error")?.textContent || "";
         if (error) return { error };
         if (!button?.classList.contains("connected")) return undefined;
@@ -202,7 +203,8 @@ async function main() {
       const diagnostics = await window.webContents.executeJavaScript(`({
         voiceButton: document.querySelector("#voice-button")?.textContent,
         voiceButtonDisabled: document.querySelector("#voice-button")?.disabled,
-        quality: document.querySelector("#voice-quality")?.textContent,
+        quality:
+          document.querySelector("#room-companion-panel")?.dataset.voiceQuality,
         toasts: [...document.querySelectorAll(".toast")].map((item) => item.textContent),
       })`);
       throw new Error(
@@ -479,7 +481,8 @@ async function main() {
     const deepFilter = await waitFor(
       window,
       `(() => {
-        const quality = document.querySelector("#voice-quality")?.textContent || "";
+        const quality =
+          document.querySelector("#room-companion-panel")?.dataset.voiceQuality || "";
         const error = document.querySelector(".toast.error")?.textContent || "";
         if (error) return { error };
         return quality.includes("强力消噪 · DeepFilterNet3 深度滤波")
@@ -533,7 +536,8 @@ async function main() {
           }
           return {
             rows,
-            quality: document.querySelector("#voice-quality")?.textContent,
+            quality:
+              document.querySelector("#room-companion-panel")?.dataset.voiceQuality,
             toasts: [...document.querySelectorAll(".toast")].map((item) => item.textContent),
           };
         })()`),
