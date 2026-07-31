@@ -1,29 +1,30 @@
 package com.synced.room;
 
-import android.content.Context;
+import android.Manifest;
 import android.content.Intent;
-import android.media.AudioManager;
+import android.os.Build;
 import android.provider.Settings;
 import android.view.WindowManager;
 
+import com.getcapacitor.PermissionState;
 import com.getcapacitor.JSObject;
 import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
+import com.getcapacitor.annotation.Permission;
+import com.getcapacitor.annotation.PermissionCallback;
 
-@CapacitorPlugin(name = "PlaybackControls")
-public class PlaybackControlsPlugin extends Plugin {
-    private AudioManager audioManager;
-
-    private AudioManager manager() {
-        if (audioManager == null) {
-            audioManager =
-                (AudioManager) getContext().getSystemService(Context.AUDIO_SERVICE);
-        }
-        return audioManager;
+@CapacitorPlugin(
+    name = "PlaybackControls",
+    permissions = {
+        @Permission(
+            alias = "notifications",
+            strings = { Manifest.permission.POST_NOTIFICATIONS }
+        )
     }
-
+)
+public class PlaybackControlsPlugin extends Plugin {
     @PluginMethod
     public void getState(PluginCall call) {
         getActivity().runOnUiThread(() -> {
@@ -53,32 +54,38 @@ public class PlaybackControlsPlugin extends Plugin {
     }
 
     @PluginMethod
-    public void setVolume(PluginCall call) {
-        double requested = call.getDouble("value", 0.5);
-        getActivity().runOnUiThread(() -> {
-            try {
-                AudioManager manager = manager();
-                int maximum = Math.max(
-                    1,
-                    manager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-                );
-                int volume = (int) Math.round(
-                    Math.max(0.0, Math.min(1.0, requested)) * maximum
-                );
-                manager.setStreamVolume(
-                    AudioManager.STREAM_MUSIC,
-                    volume,
-                    0
-                );
-                call.resolve(currentState());
-            } catch (Exception error) {
-                call.reject("调节音量失败", error);
-            }
-        });
+    public void setPlaybackActive(PluginCall call) {
+        boolean active = Boolean.TRUE.equals(call.getBoolean("active", false));
+        if (
+            active &&
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            getPermissionState("notifications") != PermissionState.GRANTED
+        ) {
+            requestPermissionForAlias(
+                "notifications",
+                call,
+                "notificationPermissionCallback"
+            );
+            return;
+        }
+        applyPlaybackActive(call);
     }
 
-    @PluginMethod
-    public void setPlaybackActive(PluginCall call) {
+    @PermissionCallback
+    private void notificationPermissionCallback(PluginCall call) {
+        if (
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            getPermissionState("notifications") != PermissionState.GRANTED
+        ) {
+            call.reject(
+                "需要通知权限才能在后台保持播放；请在系统设置中允许“同频”通知"
+            );
+            return;
+        }
+        applyPlaybackActive(call);
+    }
+
+    private void applyPlaybackActive(PluginCall call) {
         boolean active = Boolean.TRUE.equals(call.getBoolean("active", false));
         String title = call.getString("title", "正在观看频道");
         getActivity().runOnUiThread(() -> {
@@ -119,12 +126,6 @@ public class PlaybackControlsPlugin extends Plugin {
     }
 
     private JSObject currentState() {
-        AudioManager manager = manager();
-        int maximum = Math.max(
-            1,
-            manager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-        );
-        int volume = manager.getStreamVolume(AudioManager.STREAM_MUSIC);
         float windowBrightness =
             getActivity().getWindow().getAttributes().screenBrightness;
         double brightness = windowBrightness;
@@ -141,7 +142,10 @@ public class PlaybackControlsPlugin extends Plugin {
         }
         JSObject result = new JSObject();
         result.put("brightness", Math.max(0.02, Math.min(1.0, brightness)));
-        result.put("volume", Math.max(0.0, Math.min(1.0, volume / (double) maximum)));
+        // Volume is owned by the renderer's media elements. Returning a
+        // neutral value keeps this bridge from coupling gestures to the
+        // process-wide STREAM_MUSIC state.
+        result.put("volume", 1.0);
         return result;
     }
 }

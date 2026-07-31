@@ -387,14 +387,14 @@ test("publishes protocol-v3 capabilities and bounded v2 probes", async () => {
   const capabilities = await capabilitiesResponse.json();
   assert.equal(capabilities.protocolVersion, 3);
   assert.ok(capabilities.serverFeatures.includes("server-time"));
-  assert.ok(capabilities.serverFeatures.includes("voice-policy-v2"));
+  assert.ok(capabilities.serverFeatures.includes("voice-policy-v3"));
   assert.deepEqual(capabilities.networkProbe.versions, [1, 2]);
   assert.equal(capabilities.networkProbe.version2.chunkBytes, 64 * 1024);
   assert.equal(
     capabilities.networkProbe.version2.maximumBytesPerDirection,
     2 * 64 * 1024,
   );
-  assert.equal(capabilities.voicePolicy.speechTargetBitrateBps, 256_000);
+  assert.equal(capabilities.voicePolicy.speechTargetBitrateBps, 64_000);
 
   const socket = await openSocket();
   const hello = await nextMessage(socket, "server:hello");
@@ -616,6 +616,27 @@ test("issues scoped LiveKit access and refreshable TURN credentials", async () =
     const refreshed = await pushedRefresh;
     assert.ok(Array.isArray(refreshed.iceServers));
     assert.ok(refreshed.iceExpiresAt > Date.now());
+
+    const voiceReadyMessage = nextMessage(viewer, "voice:ready");
+    viewer.send(JSON.stringify({ type: "voice:join" }));
+    const voiceReady = await voiceReadyMessage;
+    assert.equal(voiceReady.voicePolicy.version, 3);
+    assert.equal(
+      voiceReady.voiceSfu.room,
+      `synced-${credential.room.toLowerCase()}-voice`,
+    );
+    const voiceClaims = JSON.parse(
+      Buffer.from(
+        voiceReady.voiceSfu.token.split(".")[1],
+        "base64url",
+      ).toString(),
+    );
+    assert.equal(voiceClaims.sub, viewerJoined.clientId);
+    assert.equal(voiceClaims.video.roomJoin, true);
+    assert.equal(voiceClaims.video.canPublish, true);
+    assert.equal(voiceClaims.video.canPublishData, false);
+    assert.deepEqual(voiceClaims.video.canPublishSources, ["microphone"]);
+    assert.equal(voiceClaims.video.canSubscribe, true);
 
     const endpoint = await fetch(
       `${httpUrl}/iceservers?clientId=${encodeURIComponent(hostJoined.clientId)}`,
@@ -1209,10 +1230,10 @@ test("aggregates private v2 transport telemetry into stable room advice", async 
     const ready = nextMessage(viewer, "voice:ready");
     viewer.send(JSON.stringify({ type: "voice:join" }));
     const voiceReady = await ready;
-    assert.equal(voiceReady.voicePolicy.version, 2);
+    assert.equal(voiceReady.voicePolicy.version, 3);
     assert.equal(voiceReady.voicePolicy.sampleRate, 48_000);
-    assert.equal(voiceReady.voicePolicy.minimumBitrateBps, 96_000);
-    assert.equal(voiceReady.voicePolicy.speechTargetBitrateBps, 256_000);
+    assert.equal(voiceReady.voicePolicy.minimumBitrateBps, 32_000);
+    assert.equal(voiceReady.voicePolicy.speechTargetBitrateBps, 64_000);
 
     const rateLimited = nextMessage(viewer, "error");
     viewer.send(
@@ -1470,6 +1491,62 @@ test("announces participants, relays voice signaling, and broadcasts chat", asyn
 
   host.close();
   viewer.close();
+});
+
+test("servers without voice SFU cap mesh at three participants", async () => {
+  const sockets = await Promise.all([
+    openSocket(),
+    openSocket(),
+    openSocket(),
+    openSocket(),
+  ]);
+  const [host, first, second, fourth] = sockets;
+  try {
+    const createdMessage = nextMessage(host, "room:created");
+    host.send(
+      JSON.stringify({
+        type: "host:create",
+        room: "D7K9P2WX",
+        nickname: "房主",
+      }),
+    );
+    await createdMessage;
+
+    for (const [index, socket] of [first, second, fourth].entries()) {
+      const joinedMessage = nextMessage(socket, "room:joined");
+      socket.send(
+        JSON.stringify({
+          type: "viewer:join",
+          room: "D7K9P2WX",
+          nickname: `成员${index + 1}`,
+        }),
+      );
+      await joinedMessage;
+    }
+
+    for (const socket of [host, first, second]) {
+      const readyMessage = nextMessage(socket, "voice:ready");
+      socket.send(JSON.stringify({ type: "voice:join" }));
+      await readyMessage;
+    }
+
+    const rejectedMessage = nextMessage(fourth, "error");
+    fourth.send(JSON.stringify({ type: "voice:join" }));
+    const rejected = await rejectedMessage;
+    assert.equal(rejected.code, "voice-sfu-required");
+    assert.equal(rejected.requestedType, "voice:join");
+
+    const fourthSawLeave = nextMessage(fourth, "voice:left");
+    host.send(JSON.stringify({ type: "voice:leave" }));
+    await fourthSawLeave;
+    const retryReadyMessage = nextMessage(fourth, "voice:ready");
+    fourth.send(JSON.stringify({ type: "voice:join" }));
+    const retryReady = await retryReadyMessage;
+    assert.equal(retryReady.participants.length, 2);
+    assert.equal(retryReady.voiceSfu, undefined);
+  } finally {
+    for (const socket of sockets) socket.close();
+  }
 });
 
 test("skips stale members when a legacy room transfers ownership", async () => {

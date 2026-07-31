@@ -59,6 +59,16 @@ declare global {
         lanAddresses: string[];
         hasVirtualTunnel: boolean;
         virtualInterfaces: string[];
+        allAddresses: Array<{
+          address: string;
+          family: "ipv4" | "ipv6";
+          interfaceName: string;
+          tunnel: boolean;
+          private: boolean;
+          privacySensitive: boolean;
+          publishable: boolean;
+          directHintEligible: boolean;
+        }>;
       }>;
       writeClipboard: (text: string) => Promise<void>;
       readClipboard: () => Promise<string>;
@@ -219,7 +229,13 @@ declare global {
   }
 
   interface ProcessAudioStatus {
-    type: "ready" | "error" | "stopped" | "window" | "flow";
+    type:
+      | "ready"
+      | "error"
+      | "stopped"
+      | "window"
+      | "flow"
+      | "overrun";
     message?: string;
     captureId?: number;
     code?: number | null;
@@ -237,6 +253,12 @@ declare global {
     visible?: boolean;
     foreground?: boolean;
     minimized?: boolean;
+    stage?: "helper-writer" | "main-renderer";
+    droppedPackets?: number;
+    queueDepth?: number;
+    queueCapacityPackets?: number;
+    blockDurationMs?: number;
+    inFlightPackets?: number;
   }
 
   interface ProcessAudioPacket {
@@ -255,6 +277,9 @@ declare global {
     byteCount: number;
     lastPacketAt: number;
     lastPacketAgeMs?: number;
+    helperDroppedPackets?: number;
+    transportDroppedPackets?: number;
+    transportQueueDepth?: number;
     sourceHandle?: string;
     processId?: number;
     sampleRate?: number;

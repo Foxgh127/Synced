@@ -1,26 +1,33 @@
+import protocolPolicy from "../server/protocol-policy.json";
+
+const voicePolicy = protocolPolicy.voice;
+
 /**
- * Keep full-band Opus well above the old 96 kbps floor. Stereo is negotiated
- * up front so a music source can be mixed into the same sender without a
- * disruptive renegotiation. Even the five-person tier remains below 1 Mbps of
- * aggregate voice upload per client, while the higher ceiling avoids throwing
- * away the detail recovered by the new denoisers.
+ * Full-band Opus remains intelligible at substantially lower rates than the
+ * previous 224–320 kbps profile. Speech is mono; the higher music tier is only
+ * used while accompaniment is actually active. This keeps TURN and mobile
+ * uplink cost bounded as rooms grow.
  */
 export function voiceBitrateForPeerCount(
   peerCount: number,
   music = false,
 ): number {
   if (music) {
-    if (peerCount <= 1) return 320_000;
-    if (peerCount === 2) return 288_000;
-    return 256_000;
+    if (peerCount <= 1) return voicePolicy.musicBitrateBps.onePeer;
+    if (peerCount === 2) return voicePolicy.musicBitrateBps.twoPeers;
+    return voicePolicy.musicBitrateBps.manyPeers;
   }
-  if (peerCount <= 1) return 256_000;
-  if (peerCount === 2) return 240_000;
-  return 224_000;
+  if (peerCount <= 1) return voicePolicy.speechBitrateBps.onePeer;
+  if (peerCount === 2) return voicePolicy.speechBitrateBps.twoPeers;
+  return voicePolicy.speechBitrateBps.manyPeers;
 }
 
-export const MIN_ADAPTIVE_VOICE_BITRATE = 112_000;
-export const MAX_ADAPTIVE_VOICE_BITRATE = 320_000;
+export const MIN_ADAPTIVE_VOICE_BITRATE =
+  voicePolicy.minimumAdaptiveBitrateBps;
+export const MAX_ADAPTIVE_VOICE_BITRATE =
+  voicePolicy.maximumAdaptiveBitrateBps;
+export const MAX_VOICE_MESH_PARTICIPANTS =
+  voicePolicy.maxMeshParticipantsWithoutSfu;
 
 export interface VoiceNetworkSample {
   availableOutgoingBitrate?: number;
@@ -43,12 +50,12 @@ function clampVoiceBitrate(value: number): number {
 }
 
 /**
- * Per-peer congestion fallback for the high-quality voice profiles above.
+ * Per-peer congestion fallback for the bounded full-band profiles above.
  *
  * Loss and a collapsed ICE bandwidth estimate reduce bitrate quickly, while
  * recovery requires several clean samples and climbs in 32 kbps steps. This
  * avoids the audible pumping caused by changing Opus parameters every health
- * tick and never falls back to the old 96 kbps voice ceiling.
+ * tick.
  */
 export class AdaptiveVoiceBitrateController {
   private bitrate: number;
@@ -56,7 +63,7 @@ export class AdaptiveVoiceBitrateController {
   private stableSamples = 0;
   private lastChangeAt = Number.NEGATIVE_INFINITY;
 
-  constructor(initialBitrate = 256_000) {
+  constructor(initialBitrate = 64_000) {
     this.bitrate = clampVoiceBitrate(initialBitrate);
   }
 
@@ -106,7 +113,7 @@ export class AdaptiveVoiceBitrateController {
           ? this.bitrate * 0.72
           : this.bitrate * 0.84;
         const next = clampVoiceBitrate(
-          Math.min(this.bitrate - 24_000, reduction, bandwidthCeiling),
+          Math.min(this.bitrate - 8_000, reduction, bandwidthCeiling),
         );
         if (next < this.bitrate) {
           this.bitrate = next;
@@ -128,7 +135,7 @@ export class AdaptiveVoiceBitrateController {
       this.bitrate < target &&
       nowMs - this.lastChangeAt >= 8_000
     ) {
-      this.bitrate = Math.min(target, this.bitrate + 32_000);
+      this.bitrate = Math.min(target, this.bitrate + 8_000);
       this.lastChangeAt = nowMs;
       this.stableSamples = 0;
     }

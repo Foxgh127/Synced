@@ -14,6 +14,14 @@ const electronMain = readFileSync(
   new URL("../electron/main.cjs", import.meta.url),
   "utf8",
 );
+const electronPreload = readFileSync(
+  new URL("../electron/preload.cjs", import.meta.url),
+  "utf8",
+);
+const audioHelper = readFileSync(
+  new URL("../audio-helper/Program.cs", import.meta.url),
+  "utf8",
+);
 
 test("application startup does not run an eager network speed probe", () => {
   assert.doesNotMatch(rendererEntry, /warmNetworkProbe/);
@@ -52,6 +60,56 @@ test("capture diagnostics are buffered and written asynchronously", () => {
   assert.match(electronMain, /diagnosticBuffer\.push\(entry\)/);
   assert.match(electronMain, /fs\.promises\.appendFile\(/);
   assert.match(electronMain, /\.then\(\(\) => flushDiagnosticLog\(\)\)/);
+});
+
+test("process audio uses bounded queues off the MMCSS callback", () => {
+  const callbackStart = audioHelper.indexOf("recorder.DataAvailable +=");
+  const callbackEnd = audioHelper.indexOf(
+    "recorder.RecordingStopped +=",
+    callbackStart,
+  );
+  const callback = audioHelper.slice(callbackStart, callbackEnd);
+  const packetWriterStart = audioHelper.indexOf(
+    "private static async Task WriteAudioPacketAsync",
+  );
+  const packetWriterEnd = audioHelper.indexOf(
+    "private static int Fail",
+    packetWriterStart,
+  );
+  const packetWriter = audioHelper.slice(packetWriterStart, packetWriterEnd);
+
+  assert.ok(callbackStart >= 0 && callbackEnd > callbackStart);
+  assert.match(audioHelper, /Channel\.CreateBounded<AudioPacket>/);
+  assert.match(audioHelper, /BoundedChannelFullMode\.DropOldest/);
+  assert.match(audioHelper, /WriteAudioPacketsAsync/);
+  assert.match(callback, /TryWrite/);
+  assert.doesNotMatch(
+    callback,
+    /output\.(?:Write|Flush)|\.Wait\(|GetAwaiter/,
+  );
+  assert.match(packetWriter, /WriteAsync/);
+  assert.doesNotMatch(packetWriter, /Flush/);
+});
+
+test("process audio crosses Electron through a bounded acknowledged MessagePort", () => {
+  assert.match(electronMain, /new MessageChannelMain\(\)/);
+  assert.match(electronMain, /PROCESS_AUDIO_PENDING_CAPACITY = 20/);
+  assert.match(electronMain, /PROCESS_AUDIO_MAX_IN_FLIGHT = 4/);
+  assert.match(electronMain, /processAudioPending\.shift\(\)/);
+  assert.match(electronMain, /process-audio-overrun/);
+  assert.match(electronMain, /event\.data\?\.type !== "audio-consumed"/);
+  assert.match(
+    electronPreload,
+    /type: "audio-consumed",[\s\S]{0,120}?transportPacketId:/,
+  );
+  assert.doesNotMatch(
+    electronMain,
+    /webContents\.send\("capture:audio-data"/,
+  );
+  assert.doesNotMatch(
+    electronPreload,
+    /ipcRenderer\.on\("capture:audio-data"/,
+  );
 });
 
 test("portable firewall checks use an exact-path TTL and coalesce callers", () => {

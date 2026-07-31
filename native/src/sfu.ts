@@ -64,6 +64,7 @@ export interface SfuAccess {
 export interface SfuPublishPreset {
   maxBitrate: number;
   frameRate: number;
+  maxLayers?: number;
   contentMode?: "detail" | "motion" | "balanced";
 }
 
@@ -665,6 +666,11 @@ export class SfuSession {
       throw new DOMException("SFU publication was replaced", "AbortError");
     }
     const streamName = "synced-screen";
+    const maxLayers = Math.max(
+      1,
+      Math.min(3, Math.floor(preset.maxLayers || 3)),
+    );
+    let publishedVideoLayerCount = 1;
     const publicationSpecs: Array<{
       sourceTrack: MediaStreamTrack;
       role: "primary" | "audio";
@@ -715,7 +721,7 @@ export class SfuSession {
         sourceTrack.getSettings().height ||
         stream.getVideoTracks()[0]?.getSettings().height ||
         1_440;
-      const explicitLayers =
+      const candidateLayers =
         sourceHeight > 1_080
           ? [
               new VideoPreset(854, 480, 2_200_000, 24),
@@ -727,6 +733,13 @@ export class SfuSession {
                 new VideoPreset(1_280, 720, 5_000_000, 30),
               ]
             : [new VideoPreset(854, 480, 2_200_000, 24)];
+      const explicitLayers = candidateLayers.slice(
+        0,
+        Math.max(0, maxLayers - 1),
+      );
+      if (role === "primary") {
+        publishedVideoLayerCount = 1 + explicitLayers.length;
+      }
       const publishing = room.localParticipant.publishTrack(track, {
         name: spec.name,
         source:
@@ -737,7 +750,7 @@ export class SfuSession {
         ...(role === "primary"
           ? {
               videoCodec: "h264" as const,
-              simulcast: true,
+              simulcast: maxLayers > 1,
               screenShareSimulcastLayers: explicitLayers,
               screenShareEncoding: {
                 maxBitrate: Math.max(500_000, preset.maxBitrate),
@@ -798,11 +811,7 @@ export class SfuSession {
       tracks: this.publishedScreenTracks.length,
       maxBitrate: preset.maxBitrate,
       frameRate: Math.min(30, preset.frameRate),
-      simulcastLayers: [
-        "1440p",
-        "720p",
-        "480p-dynacast-low",
-      ],
+      simulcastLayers: publishedVideoLayerCount,
       contentMode: preset.contentMode || "balanced",
     });
   }

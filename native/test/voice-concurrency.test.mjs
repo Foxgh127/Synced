@@ -66,6 +66,61 @@ test("microphone capture mutations execute serially and recover after rejection"
   ]);
 });
 
+test("a stuck voice mutation times out and releases later work", async () => {
+  const { SerialAsyncQueue, VoiceOperationTimeoutError } =
+    await loadVoiceModule();
+  const queue = new SerialAsyncQueue(25);
+  const stuck = queue.run(() => new Promise(() => {}), {
+    label: "stuck voice mutation",
+  });
+  const next = queue.run(async () => "released");
+  await assert.rejects(
+    stuck,
+    (error) =>
+      error instanceof VoiceOperationTimeoutError &&
+      /stuck voice mutation/u.test(error.message),
+  );
+  assert.equal(await next, "released");
+});
+
+test("a timed-out operation receives cancellation before its late result", async () => {
+  const { SerialAsyncQueue, VoiceOperationTimeoutError } =
+    await loadVoiceModule();
+  const queue = new SerialAsyncQueue(10);
+  let mutated = false;
+  const late = queue.run(async (signal) => {
+    await new Promise((resolve) => setTimeout(resolve, 35));
+    if (!signal.aborted) mutated = true;
+  });
+
+  await assert.rejects(
+    late,
+    (error) => error instanceof VoiceOperationTimeoutError,
+  );
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.equal(mutated, false);
+});
+
+test("a cancelled queued voice mutation never applies late state", async () => {
+  const { SerialAsyncQueue } = await loadVoiceModule();
+  const queue = new SerialAsyncQueue();
+  const controller = new AbortController();
+  let mutated = false;
+  const blocker = queue.run(
+    () => new Promise((resolve) => setTimeout(resolve, 30)),
+  );
+  const cancelled = queue.run(
+    async () => {
+      mutated = true;
+    },
+    { signal: controller.signal, label: "cancelled voice mutation" },
+  );
+  controller.abort(new DOMException("cancelled", "AbortError"));
+  await blocker;
+  await assert.rejects(cancelled, /cancelled/u);
+  assert.equal(mutated, false);
+});
+
 test("pending voice ICE candidates have a hard 64-entry limit", async () => {
   const {
     MAX_PENDING_VOICE_CANDIDATES,

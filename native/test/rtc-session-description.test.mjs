@@ -663,7 +663,7 @@ test("voice keeps full-band Opus and a modest anti-crackle jitter target", async
   const rtc = await loadRtcModule();
   const tuned = rtc.tuneVoiceOpus(nativeLikeDescription());
   assert.match(tuned.sdp, /maxplaybackrate=48000/);
-  assert.match(tuned.sdp, /maxaveragebitrate=320000/);
+  assert.match(tuned.sdp, /maxaveragebitrate=128000/);
   assert.match(tuned.sdp, /stereo=1/);
   assert.match(tuned.sdp, /useinbandfec=1/);
   assert.match(tuned.sdp, /usedtx=0/);
@@ -681,6 +681,22 @@ test("voice keeps full-band Opus and a modest anti-crackle jitter target", async
   assert.equal(receiver.jitterBufferTarget, 90);
   assert.equal(rtc.voiceJitterBufferTarget(false), 90);
   assert.equal(rtc.voiceJitterBufferTarget(true), 125);
+});
+
+test("voice sender bitrate uses the shared 32–128 kbps policy", async () => {
+  const rtc = await loadRtcModule();
+  let applied;
+  const sender = {
+    getParameters: () => ({ encodings: [{}] }),
+    setParameters: async (parameters) => {
+      applied = parameters;
+    },
+  };
+
+  await rtc.tuneVoiceSender(sender, 20_000);
+  assert.equal(applied.encodings[0].maxBitrate, 32_000);
+  await rtc.tuneVoiceSender(sender, 200_000);
+  assert.equal(applied.encodings[0].maxBitrate, 128_000);
 });
 
 test("movie Opus uses one full-band 320 kbps parameter set", async () => {

@@ -31,6 +31,11 @@ const appRoot: HTMLDivElement = root;
 
 const DEFAULT_SIGNAL_URL = HOME_SIGNAL_URL;
 const isDesktop = Boolean(window.roomDesktop);
+const signalUrlPolicy = { allowInsecure: !isNativeAndroid() } as const;
+
+function normalizeAppSignalUrl(value: string): string {
+  return normalizeSignalUrl(value, signalUrlPolicy);
+}
 
 if (isNativeAndroid()) {
   document.addEventListener("contextmenu", (event) => {
@@ -57,14 +62,14 @@ function getSignalUrl(): string {
   const saved = localStorage.getItem("synced:signal");
   if (!saved) return DEFAULT_SIGNAL_URL;
   try {
-    return normalizeSignalUrl(saved);
+    return normalizeAppSignalUrl(saved);
   } catch {
     return DEFAULT_SIGNAL_URL;
   }
 }
 
 function saveSignalUrl(value: string): string {
-  const normalized = normalizeSignalUrl(value);
+  const normalized = normalizeAppSignalUrl(value);
   localStorage.setItem("synced:signal", normalized);
   return normalized;
 }
@@ -127,9 +132,14 @@ function confirmExternalInvite(
   }
   let signalUrl: string;
   try {
-    signalUrl = normalizeSignalUrl(parsed.signal || getSignalUrl());
-  } catch {
-    toast("邀请链接中的信令服务器地址无效", "danger");
+    signalUrl = normalizeAppSignalUrl(parsed.signal || getSignalUrl());
+  } catch (error) {
+    toast(
+      error instanceof Error
+        ? error.message
+        : "邀请链接中的信令服务器地址无效",
+      "danger",
+    );
     return undefined;
   }
   const untrusted = requiresSignalTrust(signalUrl);
@@ -552,7 +562,7 @@ async function renderHost(): Promise<void> {
             <details class="server-settings">
               <summary>服务器设置</summary>
               <label class="field">
-                <span>信令服务器</span>
+                <span>信令服务器${isNativeAndroid() ? "（Android 仅支持 wss://）" : ""}</span>
                 <input id="host-signal-url" value="${escapeHtml(signalUrl)}" />
               </label>
               <button id="save-host-server" type="button" class="ghost-button">保存服务器</button>
@@ -625,7 +635,7 @@ async function renderViewer(options: ViewerOptions = {}): Promise<void> {
   const querySignal = new URLSearchParams(location.search).get("signal");
   if (querySignal) {
     try {
-      signalUrl = normalizeSignalUrl(querySignal);
+      signalUrl = normalizeAppSignalUrl(querySignal);
     } catch {
       // Ignore malformed invitation data.
     }
@@ -659,7 +669,7 @@ async function renderViewer(options: ViewerOptions = {}): Promise<void> {
           </button>
           <details class="server-settings">
             <summary>服务器设置</summary>
-            <label class="field"><span>信令服务器</span><input id="viewer-signal-url" value="${escapeHtml(signalUrl)}" /></label>
+            <label class="field"><span>信令服务器${isNativeAndroid() ? "（Android 仅支持 wss://）" : ""}</span><input id="viewer-signal-url" value="${escapeHtml(signalUrl)}" /></label>
           </details>
         </section>
       </main>

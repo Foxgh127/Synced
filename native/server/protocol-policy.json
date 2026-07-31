@@ -1,5 +1,22 @@
 {
   "maxParticipantsPerRoom": 8,
+  "voice": {
+    "maxMeshParticipantsWithoutSfu": 3,
+    "sampleRate": 48000,
+    "packetizationMs": 20,
+    "minimumAdaptiveBitrateBps": 32000,
+    "maximumAdaptiveBitrateBps": 128000,
+    "speechBitrateBps": {
+      "onePeer": 64000,
+      "twoPeers": 56000,
+      "manyPeers": 48000
+    },
+    "musicBitrateBps": {
+      "onePeer": 96000,
+      "twoPeers": 80000,
+      "manyPeers": 72000
+    }
+  },
   "networkProbe": {
     "version1": {
       "chunkBytes": 32768,

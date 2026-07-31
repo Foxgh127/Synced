@@ -5,7 +5,9 @@
 [`PROJECT_GUIDE.md`](./PROJECT_GUIDE.md)。
 
 > Native 产品代码位于 [`native/`](./native/)；下面内容只说明仓库根目录的
-> vinext/VDO.Ninja 网页工程。
+> vinext/VDO.Ninja 网页工程。根目录网页已明确归类为
+> **legacy / experimental / read-only maintenance**：它不共享 Native 的信令、
+> SFU、弱网自适应、缓存或测试体系，不能作为 Native 的可靠故障兜底。
 
 ## 根目录网页工程
 

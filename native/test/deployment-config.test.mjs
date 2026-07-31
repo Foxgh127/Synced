@@ -201,6 +201,85 @@ test("Android playback owns a media foreground service only while active", () =>
   assert.match(plugin, /stopService/);
 });
 
+test("Android enforces WSS, app-local gesture volume and explicit notification consent", () => {
+  const manifest = source("android/app/src/main/AndroidManifest.xml");
+  const activity = source(
+    "android/app/src/main/java/com/synced/room/MainActivity.java",
+  );
+  const plugin = source(
+    "android/app/src/main/java/com/synced/room/PlaybackControlsPlugin.java",
+  );
+  const rendererConfig = source("src/config.ts");
+  const rendererMain = source("src/main.ts");
+  const channel = source("src/channel-session.ts");
+  const secureCredentials = source(
+    "android/app/src/main/java/com/synced/room/SecureCredentialsPlugin.java",
+  );
+  const channelStore = source("src/channel-store.ts");
+
+  assert.match(manifest, /usesCleartextTraffic="false"/);
+  assert.doesNotMatch(manifest, /largeHeap=/);
+  assert.match(rendererConfig, /allowInsecure\?: boolean/);
+  assert.match(rendererConfig, /policy\.allowInsecure === false/);
+  assert.match(rendererMain, /allowInsecure: !isNativeAndroid\(\)/);
+  assert.ok(rendererMain.includes("Android 仅支持 wss://"));
+  assert.match(plugin, /alias = "notifications"/);
+  assert.match(plugin, /requestPermissionForAlias\(/);
+  assert.match(plugin, /notificationPermissionCallback/);
+  assert.doesNotMatch(plugin, /setStreamVolume|adjustStreamVolume/);
+  assert.doesNotMatch(channel, /setPlaybackVolume/);
+  assert.match(activity, /registerPlugin\(SecureCredentialsPlugin\.class\)/);
+  assert.match(secureCredentials, /AndroidKeyStore/);
+  assert.match(secureCredentials, /AES\/GCM\/NoPadding/);
+  assert.match(secureCredentials, /Context\.MODE_PRIVATE/);
+  assert.match(channelStore, /await loadSecureChannelOwnership\(\)/);
+  assert.match(channelStore, /await saveSecureChannelOwnership\(ownership\)/);
+  assert.match(channel, /applyMovieVolume\(pending\.value\)/);
+  assert.match(
+    activity,
+    /setRendererPriorityPolicy\(WebView\.RENDERER_PRIORITY_BOUND, true\)/,
+  );
+});
+
+test("Android reports routed, physical, VPN and IPv6 paths without hiding overlays", () => {
+  const activity = source(
+    "android/app/src/main/java/com/synced/room/MainActivity.java",
+  );
+  const network = source(
+    "android/app/src/main/java/com/synced/room/NetworkBridgePlugin.java",
+  );
+  const resources = source(
+    "android/app/src/main/java/com/synced/room/DeviceResourcePlugin.java",
+  );
+  const electron = source("electron/main.cjs");
+  const rendererNetwork = source("src/native-network.ts");
+
+  assert.match(activity, /registerPlugin\(DeviceResourcePlugin\.class\)/);
+  assert.match(network, /"physicalNetwork"/);
+  assert.match(network, /"defaultRoutedNetwork"/);
+  assert.match(network, /"vpnActive"/);
+  assert.match(network, /"socketSelectedPath"/);
+  assert.match(network, /"observed", false/);
+  assert.match(network, /"system-default-route"/);
+  assert.match(network, /Inet6Address/);
+  assert.match(network, /"privacySensitive"/);
+  assert.match(network, /"directHintEligible", true/);
+  assert.match(network, /record\.put\("publishable", privateAddress\)/);
+  assert.match(electron, /directHintEligible: true/);
+  assert.match(
+    electron,
+    /\.filter\(\(entry\) => entry\.directHintEligible\)/,
+  );
+  assert.match(resources, /getCurrentThermalStatus/);
+  assert.match(resources, /isPowerSaveMode/);
+  assert.match(resources, /BATTERY_PROPERTY_CAPACITY/);
+  assert.match(rendererNetwork, /diagnosticNetworkSummary/);
+  assert.doesNotMatch(
+    rendererNetwork,
+    /physicalNetwork: path\.physicalNetwork/,
+  );
+});
+
 test("Android keeps private app data out of cloud backup and device transfer", () => {
   const manifest = source("android/app/src/main/AndroidManifest.xml");
   const extractionRules = source(

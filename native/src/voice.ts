@@ -25,6 +25,7 @@ import {
 } from "./rtc";
 import {
   AdaptiveVoiceBitrateController,
+  MAX_VOICE_MESH_PARTICIPANTS,
   voiceBitrateForPeerCount,
 } from "./voice-quality";
 import {
@@ -39,6 +40,16 @@ import {
   voiceCaptureProfileForMode,
   voicePeerMediaStallTimeout,
 } from "./voice-processing";
+import {
+  currentResourceBudget,
+  listenForResourceBudgetChanges,
+} from "./resource-budget";
+import {
+  VoiceSfuSession,
+  type VoiceSfuSpeakingEvent,
+  type VoiceSfuTrackEvent,
+} from "./voice-sfu";
+import type { SfuAccess } from "./sfu";
 
 interface VoicePeer {
   pc: RTCPeerConnection;
@@ -121,6 +132,36 @@ export function queuePendingVoiceCandidate(
   return true;
 }
 
+function combineVoiceAbortSignals(
+  ...signals: AbortSignal[]
+): AbortSignal {
+  const controller = new AbortController();
+  const subscriptions: Array<{
+    signal: AbortSignal;
+    listener: () => void;
+  }> = [];
+  const cleanup = (): void => {
+    for (const { signal, listener } of subscriptions) {
+      signal.removeEventListener("abort", listener);
+    }
+    subscriptions.length = 0;
+  };
+  const abort = (signal: AbortSignal): void => {
+    if (!controller.signal.aborted) controller.abort(signal.reason);
+  };
+  for (const signal of signals) {
+    if (signal.aborted) {
+      abort(signal);
+      break;
+    }
+    const listener = (): void => abort(signal);
+    subscriptions.push({ signal, listener });
+    signal.addEventListener("abort", listener, { once: true });
+  }
+  controller.signal.addEventListener("abort", cleanup, { once: true });
+  return controller.signal;
+}
+
 /**
  * Serializes asynchronous media mutations while allowing each caller to
  * observe its own result. A rejected operation does not poison later work.
@@ -128,8 +169,81 @@ export function queuePendingVoiceCandidate(
 export class SerialAsyncQueue {
   private tail: Promise<void> = Promise.resolve();
 
-  run<T>(operation: () => Promise<T>): Promise<T> {
-    const result = this.tail.then(operation);
+  constructor(private readonly defaultTimeoutMs = 15_000) {}
+
+  run<T>(
+    operation: (signal: AbortSignal) => Promise<T>,
+    options: {
+      signal?: AbortSignal;
+      timeoutMs?: number;
+      label?: string;
+    } = {},
+  ): Promise<T> {
+    const execute = async (): Promise<T> => {
+      const controller = new AbortController();
+      const timeoutMs = Math.max(
+        1,
+        Number(options.timeoutMs) || this.defaultTimeoutMs,
+      );
+      let timeout: ReturnType<typeof globalThis.setTimeout> | undefined;
+      const abort = (): void => controller.abort(options.signal?.reason);
+      const cancelled = new Promise<never>((_, reject) => {
+        controller.signal.addEventListener(
+          "abort",
+          () =>
+            reject(
+              controller.signal.reason instanceof Error
+                ? controller.signal.reason
+                : new DOMException(
+                    `${options.label || "语音操作"}已取消`,
+                    "AbortError",
+                  ),
+            ),
+          { once: true },
+        );
+      });
+      if (options.signal?.aborted) abort();
+      else options.signal?.addEventListener("abort", abort, { once: true });
+      const deadline = new Promise<never>((_, reject) => {
+        timeout = globalThis.setTimeout(() => {
+          const error = new VoiceOperationTimeoutError(
+            options.label || "串行语音操作",
+            timeoutMs,
+          );
+          controller.abort(error);
+          reject(error);
+        }, timeoutMs);
+      });
+      try {
+        const started = Promise.resolve().then(() => {
+          if (controller.signal.aborted) {
+            throw (
+              controller.signal.reason instanceof Error
+                ? controller.signal.reason
+                : new DOMException(
+                    `${options.label || "语音操作"}已取消`,
+                    "AbortError",
+                  )
+            );
+          }
+          return operation(controller.signal);
+        });
+        return await Promise.race([
+          started,
+          cancelled,
+          deadline,
+        ]);
+      } finally {
+        if (timeout !== undefined) globalThis.clearTimeout(timeout);
+        options.signal?.removeEventListener("abort", abort);
+        if (!controller.signal.aborted) {
+          controller.abort(
+            new DOMException("语音操作已经结束", "AbortError"),
+          );
+        }
+      }
+    };
+    const result = this.tail.then(execute);
     this.tail = result.then(
       () => undefined,
       () => undefined,
@@ -206,6 +320,7 @@ export interface VoiceState {
   bitrate: number;
   connectedPeers: number;
   relayedPeers: number;
+  transport: "mesh" | "sfu";
 }
 
 export interface VoiceSpeakingChange {
@@ -245,7 +360,6 @@ const VOICE_AUDIO_RESUME_TIMEOUT_MS = 3_000;
 const VOICE_CAPTURE_REQUEST_TIMEOUT_MS = 30_000;
 const VOICE_DEVICE_OPERATION_TIMEOUT_MS = 8_000;
 const VOICE_NOISE_PROCESSOR_TIMEOUT_MS = 12_000;
-
 export class VoiceOperationTimeoutError extends Error {
   constructor(
     readonly operation: string,
@@ -561,9 +675,16 @@ export class VoiceMesh extends EventTarget {
     PlaybackRepairQueue
   >();
   private readonly blockedPlaybackPeers = new Set<string>();
+  private readonly voiceSfu = new VoiceSfuSession();
+  private readonly sfuRemoteStreams = new Map<string, MediaStream>();
+  private readonly voiceTransportQueue = new SerialAsyncQueue(35_000);
+  private voiceTransport: "mesh" | "sfu" = "mesh";
+  private voiceGeneration = 0;
+  private voiceOperationController = new AbortController();
+  private readonly removeResourceBudgetListener: () => void;
   private playbackGestureRetryArmed = false;
   private voiceTuneQueue: Promise<void> = Promise.resolve();
-  private readonly captureMutationQueue = new SerialAsyncQueue();
+  private readonly captureMutationQueue = new SerialAsyncQueue(45_000);
   private readonly captureLifecycle = new VoiceCaptureLifecycle();
   private joinInFlight?: {
     epoch: number;
@@ -633,7 +754,7 @@ export class VoiceMesh extends EventTarget {
     this.disarmPlaybackGestureRetry();
     if (!this.active || this.destroyed) return;
     for (const peerId of peerIds) {
-      if (!this.peers.has(peerId)) continue;
+      if (!this.hasVoiceRoute(peerId)) continue;
       const playback = this.playbackGraphs.get(peerId);
       if (playback && playback.context.state !== "running") {
         void playback.context
@@ -650,6 +771,63 @@ export class VoiceMesh extends EventTarget {
       }
     }
   };
+  private readonly handleSfuTrack = (event: Event): void => {
+    if (!this.active || this.destroyed || this.voiceTransport !== "sfu") {
+      return;
+    }
+    const detail = (event as CustomEvent<VoiceSfuTrackEvent>).detail;
+    if (!detail?.participantId || detail.participantId === this.selfId) return;
+    this.expectedPeers.add(detail.participantId);
+    this.sfuRemoteStreams.set(detail.participantId, detail.stream);
+    detail.track.addEventListener(
+      "ended",
+      () => this.removeSfuRemoteAudio(detail.participantId, detail.track),
+      { once: true },
+    );
+    this.attachRemoteAudio(detail.participantId, detail.stream);
+    this.emitState();
+  };
+  private readonly handleSfuTrackRemoved = (event: Event): void => {
+    this.removeSfuRemoteAudio((event as CustomEvent<string>).detail);
+  };
+  private readonly handleSfuSpeaking = (event: Event): void => {
+    if (!this.active || this.destroyed || this.voiceTransport !== "sfu") {
+      return;
+    }
+    const detail = (event as CustomEvent<VoiceSfuSpeakingEvent>).detail;
+    if (!detail?.participantId || detail.participantId === this.selfId) {
+      return;
+    }
+    this.updateSpeakingState(
+      detail.participantId,
+      detail.level,
+      detail.speaking,
+    );
+  };
+  private readonly handleSfuStateChange = (event: Event): void => {
+    if (this.destroyed || this.voiceTransport !== "sfu") return;
+    const state = (
+      event as CustomEvent<"connected" | "reconnecting" | "disconnected">
+    ).detail;
+    if (state === "disconnected" && this.active) {
+      this.dispatchEvent(
+        new CustomEvent<string>("connectionerror", {
+          detail:
+            this.expectedPeers.size + 1 > MAX_VOICE_MESH_PARTICIPANTS
+              ? "语音 SFU 已断开；大房间不会退回 full mesh，正在等待服务器恢复"
+              : "语音 SFU 已断开，正在恢复小房间直连语音",
+        }),
+      );
+      if (
+        this.expectedPeers.size + 1 <=
+        MAX_VOICE_MESH_PARTICIPANTS
+      ) {
+        this.voiceTransport = "mesh";
+        this.ensureMissingPeers();
+      }
+    }
+    this.emitState();
+  };
 
   constructor(
     private readonly signal: SignalClient,
@@ -658,6 +836,44 @@ export class VoiceMesh extends EventTarget {
     private readonly audioContainer: HTMLElement,
   ) {
     super();
+    this.voiceSfu.addEventListener("track", this.handleSfuTrack);
+    this.voiceSfu.addEventListener(
+      "trackremoved",
+      this.handleSfuTrackRemoved,
+    );
+    this.voiceSfu.addEventListener(
+      "speaking",
+      this.handleSfuSpeaking,
+    );
+    this.voiceSfu.addEventListener(
+      "statechange",
+      this.handleSfuStateChange,
+    );
+    this.removeResourceBudgetListener =
+      listenForResourceBudgetChanges((budget) => {
+        if (
+          !this.active ||
+          this.destroyed ||
+          this.noiseMode !== "strong" ||
+          Boolean(this.graph?.noiseProcessor) ===
+            budget.allowNeuralVoiceProcessing
+        ) {
+          return;
+        }
+        void this.setInputDevice(this.inputDeviceId, true).catch(
+          (error) => {
+            if (this.destroyed || !this.active) return;
+            this.dispatchEvent(
+              new CustomEvent<string>("deviceerror", {
+                detail:
+                  error instanceof Error
+                    ? `应用语音资源预算失败：${error.message}`
+                    : "应用语音资源预算失败",
+              }),
+            );
+          },
+        );
+      });
     navigator.mediaDevices?.addEventListener(
       "devicechange",
       this.handleMediaDevicesChange,
@@ -724,11 +940,12 @@ export class VoiceMesh extends EventTarget {
       bitrate: this.voiceBitrate(),
       connectedPeers: [...this.peers.values()].filter(
         ({ pc }) => pc.connectionState === "connected",
-      ).length,
+      ).length + (this.voiceTransport === "sfu" ? this.sfuRemoteStreams.size : 0),
       relayedPeers: [...this.peers.values()].filter(
         ({ pc, relayOnly }) =>
           relayOnly && pc.connectionState === "connected",
       ).length,
+      transport: this.voiceTransport,
     };
   }
 
@@ -774,6 +991,7 @@ export class VoiceMesh extends EventTarget {
       await existing.promise;
       return;
     }
+    const voiceGeneration = this.advanceVoiceGeneration();
     const epoch = this.captureLifecycle.begin();
     // Create and resume the processing context synchronously from the button
     // gesture. Waiting for the Android bridge, permission UI and model load
@@ -784,8 +1002,19 @@ export class VoiceMesh extends EventTarget {
       latencyHint: "interactive",
     });
     void captureContext.resume().catch(() => undefined);
-    const promise = this.captureMutationQueue.run(() =>
-      this.performJoin(epoch, captureContext, upgradingListener),
+    const promise = this.captureMutationQueue.run(
+      (signal) =>
+        this.performJoin(
+          epoch,
+          voiceGeneration,
+          captureContext,
+          upgradingListener,
+          signal,
+        ),
+      {
+        signal: this.voiceOperationController.signal,
+        label: "加入连麦",
+      },
     );
     const request = { epoch, promise };
     this.joinInFlight = request;
@@ -800,14 +1029,19 @@ export class VoiceMesh extends EventTarget {
 
   private async performJoin(
     epoch: number,
+    voiceGeneration: number,
     captureContext: AudioContext,
     upgradingListener = false,
+    operationSignal?: AbortSignal,
   ): Promise<void> {
     let replacement: CaptureGraph | undefined;
     let installed = false;
     let nativeRouteStarted = false;
     const current = (): boolean =>
-      !this.destroyed && this.captureLifecycle.isCurrent(epoch);
+      !this.destroyed &&
+      !operationSignal?.aborted &&
+      this.voiceGeneration === voiceGeneration &&
+      this.captureLifecycle.isCurrent(epoch);
     try {
       if (!current()) return;
       try {
@@ -827,7 +1061,12 @@ export class VoiceMesh extends EventTarget {
         this.inputDeviceId,
         this.noiseMode,
         captureContext,
-        this.captureLifecycle.signalFor(epoch),
+        operationSignal
+          ? combineVoiceAbortSignals(
+              operationSignal,
+              this.captureLifecycle.signalFor(epoch),
+            )
+          : this.captureLifecycle.signalFor(epoch),
       );
       if (!current()) return;
       if (hasNativeAudioRoute()) {
@@ -897,29 +1136,181 @@ export class VoiceMesh extends EventTarget {
     }
   }
 
+  private advanceVoiceGeneration(): number {
+    this.voiceOperationController.abort(
+      new DOMException("语音状态已经更新", "AbortError"),
+    );
+    this.voiceOperationController = new AbortController();
+    this.voiceGeneration += 1;
+    return this.voiceGeneration;
+  }
+
+  private async activateVoiceSfu(access: SfuAccess): Promise<boolean> {
+    if (!this.active || this.destroyed) return false;
+    const generation = this.voiceGeneration;
+    const operationSignal = this.voiceOperationController.signal;
+    try {
+      return await this.voiceTransportQueue.run(
+        async (signal) => {
+          const current = (): boolean =>
+            !signal.aborted &&
+            !this.destroyed &&
+            this.active &&
+            this.voiceGeneration === generation;
+          if (!current()) return false;
+
+          this.voiceTransport = "sfu";
+          try {
+            await this.voiceSfu.connect(
+              access,
+              this.iceServers,
+              signal,
+            );
+            if (!current()) {
+              return false;
+            }
+            const localTrack =
+              this.graph?.processedStream.getAudioTracks()[0];
+            if (!this.listeningOnly && localTrack) {
+              await this.voiceSfu.publish(
+                localTrack,
+                this.voiceBitrate(),
+                Boolean(this.accompanimentTrack),
+                signal,
+              );
+            } else {
+              await this.voiceSfu.unpublish();
+            }
+            if (!current()) {
+              return false;
+            }
+            for (const peerId of [...this.peers.keys()]) {
+              this.closePeer(peerId);
+            }
+            this.emitState();
+            return true;
+          } catch (error) {
+            if (current()) {
+              await this.voiceSfu.disconnect();
+              this.voiceTransport = "mesh";
+              if (
+                this.expectedPeers.size + 1 <=
+                MAX_VOICE_MESH_PARTICIPANTS
+              ) {
+                this.ensureMissingPeers();
+              }
+              this.dispatchEvent(
+                new CustomEvent<string>("connectionerror", {
+                  detail:
+                    error instanceof Error
+                      ? `语音 SFU 连接失败：${error.message}`
+                      : "语音 SFU 连接失败",
+                }),
+              );
+              this.emitState();
+            }
+            return false;
+          }
+        },
+        {
+          signal: operationSignal,
+          label: "应用语音传输状态",
+        },
+      );
+    } catch (error) {
+      if (
+        error instanceof DOMException &&
+        error.name === "AbortError"
+      ) {
+        return false;
+      }
+      if (
+        error instanceof VoiceOperationTimeoutError &&
+        this.voiceGeneration === generation &&
+        this.active &&
+        !this.destroyed
+      ) {
+        this.voiceTransport = "mesh";
+        await this.voiceSfu.disconnect();
+        this.dispatchEvent(
+          new CustomEvent<string>("connectionerror", {
+            detail: "应用语音 SFU 状态超时，已取消并回到安全传输状态",
+          }),
+        );
+      }
+      return false;
+    }
+  }
+
   async handle(message: SignalEnvelope): Promise<boolean> {
     if (message.type === "voice:ready" && message.participants) {
       if (message.iceServers?.length) {
         this.iceServers = message.iceServers;
       }
       const peerIds = this.reconcileExpectedPeers(message.participants);
+      if (message.voiceSfu) {
+        const switched = await this.activateVoiceSfu(message.voiceSfu);
+        if (switched) return true;
+      }
+      if (peerIds.length + 1 > MAX_VOICE_MESH_PARTICIPANTS) {
+        this.dispatchEvent(
+          new CustomEvent<string>("connectionerror", {
+            detail:
+              "当前服务器没有可用的语音 SFU；为避免 4–8 人 full mesh 过载，本次连麦已停止",
+          }),
+        );
+        await this.leave();
+        return true;
+      }
+      this.voiceTransport = "mesh";
       await Promise.allSettled(peerIds.map((peerId) => this.offerTo(peerId)));
       return true;
     }
     if (message.type === "voice:peers" && message.participants) {
       this.reconcileExpectedPeers(message.participants);
+      if (message.voiceSfu) {
+        const switched = await this.activateVoiceSfu(message.voiceSfu);
+        if (switched) return true;
+      }
+      if (
+        this.voiceTransport !== "sfu" &&
+        this.expectedPeers.size + 1 > MAX_VOICE_MESH_PARTICIPANTS
+      ) {
+        this.dispatchEvent(
+          new CustomEvent<string>("connectionerror", {
+            detail:
+              "连麦人数已超过 P2P 安全上限，等待语音 SFU 后再继续",
+          }),
+        );
+        return true;
+      }
       this.ensureMissingPeers();
       return true;
     }
     if (message.type === "voice:signal" && message.from && message.data) {
+      if (this.voiceTransport === "sfu") return true;
       const peerId = message.from;
       this.expectedPeers.add(peerId);
+      if (
+        this.expectedPeers.size + 1 >
+        MAX_VOICE_MESH_PARTICIPANTS
+      ) {
+        this.closePeer(peerId);
+        this.dispatchEvent(
+          new CustomEvent<string>("connectionerror", {
+            detail:
+              "已拒绝超过安全人数上限的 P2P 语音信令，等待语音 SFU",
+          }),
+        );
+        return true;
+      }
       await this.handlePeerSignal(
         peerId,
         message.data,
         message.sessionId,
         message.iceMode,
       ).catch(() => {
+        this.closePeer(peerId);
         this.schedulePeerRecovery(peerId);
       });
       return true;
@@ -928,6 +1319,7 @@ export class VoiceMesh extends EventTarget {
       this.expectedPeers.delete(message.participantId);
       this.expectedPeerMuteStates.delete(message.participantId);
       this.clearPeerRetry(message.participantId);
+      this.removeSfuRemoteAudio(message.participantId);
       this.closePeer(message.participantId);
       this.retiredPeerSessions.delete(message.participantId);
       this.peerFailureCounts.delete(message.participantId);
@@ -937,6 +1329,19 @@ export class VoiceMesh extends EventTarget {
     if (message.type === "voice:joined" && message.participant) {
       if (message.participant.id !== this.selfId) {
         this.expectedPeers.add(message.participant.id);
+        if (this.voiceTransport === "sfu") return true;
+        if (
+          this.expectedPeers.size + 1 >
+          MAX_VOICE_MESH_PARTICIPANTS
+        ) {
+          this.dispatchEvent(
+            new CustomEvent<string>("connectionerror", {
+              detail:
+                "连麦人数已超过 P2P 安全上限，等待语音 SFU 后再连接",
+            }),
+          );
+          return true;
+        }
         // The newly joined member sends the first offer. If that offer is
         // lost, the deterministic health monitor below rebuilds the edge.
         this.schedulePeerRecovery(message.participant.id, 8_000);
@@ -948,6 +1353,7 @@ export class VoiceMesh extends EventTarget {
 
   async listenForSharedAudio(): Promise<void> {
     if (this.destroyed || this.active) return;
+    this.advanceVoiceGeneration();
     this.captureLifecycle.invalidate();
     this.active = true;
     this.listeningOnly = true;
@@ -1082,84 +1488,124 @@ export class VoiceMesh extends EventTarget {
 
   async setInputDevice(deviceId: string, force = false): Promise<void> {
     const requested = deviceId || "default";
-    await this.captureMutationQueue.run(async () => {
-      if (this.destroyed) {
-        throw new Error("连麦设备管理已关闭");
-      }
-      if (requested === this.inputDeviceId && !force) return;
-      if (!this.active) {
-        this.inputDeviceId = requested;
-        localStorage.setItem(INPUT_KEY, requested);
-        this.emitState();
-        return;
-      }
-
-      const replacement = await this.createCaptureGraph(
-        requested,
-        this.noiseMode,
-        undefined,
-        this.captureLifecycle.signal,
-      );
-      if (!(await this.replaceCaptureGraph(replacement))) {
-        if (!this.destroyed) {
+    await this.captureMutationQueue.run(
+      async (operationSignal) => {
+        if (this.destroyed) {
+          throw new Error("连麦设备管理已关闭");
+        }
+        if (requested === this.inputDeviceId && !force) return;
+        if (!this.active) {
           this.inputDeviceId = requested;
           localStorage.setItem(INPUT_KEY, requested);
           this.emitState();
+          return;
         }
-        return;
-      }
-      this.inputDeviceId = replacement.selectedDeviceId;
-      localStorage.setItem(INPUT_KEY, this.inputDeviceId);
-      this.emitState();
-    });
+
+        const replacement = await this.createCaptureGraph(
+          requested,
+          this.noiseMode,
+          undefined,
+          combineVoiceAbortSignals(
+            operationSignal,
+            this.captureLifecycle.signal,
+          ),
+        );
+        if (
+          !(await this.replaceCaptureGraph(
+            replacement,
+            operationSignal,
+          ))
+        ) {
+          if (!this.destroyed && !operationSignal.aborted) {
+            this.inputDeviceId = requested;
+            localStorage.setItem(INPUT_KEY, requested);
+            this.emitState();
+          }
+          return;
+        }
+        if (operationSignal.aborted) return;
+        this.inputDeviceId = replacement.selectedDeviceId;
+        localStorage.setItem(INPUT_KEY, this.inputDeviceId);
+        this.emitState();
+      },
+      {
+        signal: this.voiceOperationController.signal,
+        label: "切换麦克风",
+      },
+    );
   }
 
   async setOutputDevice(deviceId: string): Promise<void> {
     const requested = deviceId || "default";
-    await this.applyOutputDevice(requested);
-    this.outputDeviceId = requested;
-    localStorage.setItem(OUTPUT_KEY, requested);
-    await this.repairAllRemotePlayback(true);
-    this.emitState();
+    await this.captureMutationQueue.run(
+      async (operationSignal) => {
+        await this.applyOutputDevice(requested);
+        if (operationSignal.aborted || this.destroyed) return;
+        this.outputDeviceId = requested;
+        localStorage.setItem(OUTPUT_KEY, requested);
+        await this.repairAllRemotePlayback(true);
+        if (!operationSignal.aborted) this.emitState();
+      },
+      {
+        signal: this.voiceOperationController.signal,
+        timeoutMs: 15_000,
+        label: "切换语音输出设备",
+      },
+    );
   }
 
   async setNoiseMode(mode: VoiceNoiseMode): Promise<void> {
     if (!["natural", "clear", "strong"].includes(mode)) {
       throw new Error("无效的麦克风降噪模式");
     }
-    await this.captureMutationQueue.run(async () => {
-      if (this.destroyed) {
-        throw new Error("连麦设备管理已关闭");
-      }
-      if (mode === this.noiseMode) return;
-      this.captureProcessorFallbackNotified = false;
-      if (!this.active) {
-        this.noiseMode = mode;
-        localStorage.setItem(NOISE_MODE_KEY, mode);
-        this.emitState();
-        return;
-      }
-
-      const replacement = await this.createCaptureGraph(
-        this.inputDeviceId,
-        mode,
-        undefined,
-        this.captureLifecycle.signal,
-      );
-      if (!(await this.replaceCaptureGraph(replacement))) {
-        if (!this.destroyed) {
+    await this.captureMutationQueue.run(
+      async (operationSignal) => {
+        if (this.destroyed) {
+          throw new Error("连麦设备管理已关闭");
+        }
+        if (mode === this.noiseMode) return;
+        this.captureProcessorFallbackNotified = false;
+        if (!this.active) {
           this.noiseMode = mode;
           localStorage.setItem(NOISE_MODE_KEY, mode);
           this.emitState();
+          return;
         }
-        return;
-      }
-      this.inputDeviceId = replacement.selectedDeviceId;
-      this.noiseMode = mode;
-      localStorage.setItem(INPUT_KEY, this.inputDeviceId);
-      localStorage.setItem(NOISE_MODE_KEY, mode);
-      this.emitState();
-    });
+
+        const replacement = await this.createCaptureGraph(
+          this.inputDeviceId,
+          mode,
+          undefined,
+          combineVoiceAbortSignals(
+            operationSignal,
+            this.captureLifecycle.signal,
+          ),
+        );
+        if (
+          !(await this.replaceCaptureGraph(
+            replacement,
+            operationSignal,
+          ))
+        ) {
+          if (!this.destroyed && !operationSignal.aborted) {
+            this.noiseMode = mode;
+            localStorage.setItem(NOISE_MODE_KEY, mode);
+            this.emitState();
+          }
+          return;
+        }
+        if (operationSignal.aborted) return;
+        this.inputDeviceId = replacement.selectedDeviceId;
+        this.noiseMode = mode;
+        localStorage.setItem(INPUT_KEY, this.inputDeviceId);
+        localStorage.setItem(NOISE_MODE_KEY, mode);
+        this.emitState();
+      },
+      {
+        signal: this.voiceOperationController.signal,
+        label: "切换麦克风降噪",
+      },
+    );
   }
 
   setVolume(value: number): void {
@@ -1190,6 +1636,7 @@ export class VoiceMesh extends EventTarget {
   }
 
   async leave(): Promise<void> {
+    this.advanceVoiceGeneration();
     this.captureLifecycle.invalidate();
     this.joinInFlight = undefined;
     if (this.active) {
@@ -1200,6 +1647,7 @@ export class VoiceMesh extends EventTarget {
       }
     }
     this.active = false;
+    this.voiceTransport = "mesh";
     window.roomDesktop?.releaseMediaPermission("microphone");
     this.listeningOnly = false;
     this.muted = false;
@@ -1218,6 +1666,8 @@ export class VoiceMesh extends EventTarget {
     for (const peerId of [...this.peers.keys()]) {
       this.closePeer(peerId);
     }
+    await this.voiceSfu.disconnect();
+    this.sfuRemoteStreams.clear();
     for (const peerId of this.playbackGraphs.keys()) {
       this.disposePlaybackGraph(peerId);
     }
@@ -1242,6 +1692,7 @@ export class VoiceMesh extends EventTarget {
   async destroy(): Promise<void> {
     if (this.destroyed) return;
     this.destroyed = true;
+    this.removeResourceBudgetListener();
     if (this.deviceChangeTimer !== undefined) {
       window.clearTimeout(this.deviceChangeTimer);
       this.deviceChangeTimer = undefined;
@@ -1265,6 +1716,19 @@ export class VoiceMesh extends EventTarget {
       : undefined;
     await this.leave();
     await removingNativeDeviceListener;
+    this.voiceSfu.removeEventListener("track", this.handleSfuTrack);
+    this.voiceSfu.removeEventListener(
+      "trackremoved",
+      this.handleSfuTrackRemoved,
+    );
+    this.voiceSfu.removeEventListener(
+      "speaking",
+      this.handleSfuSpeaking,
+    );
+    this.voiceSfu.removeEventListener(
+      "statechange",
+      this.handleSfuStateChange,
+    );
   }
 
   private async enumerateNormalizedDevices(): Promise<NormalizedDeviceInventory> {
@@ -1456,7 +1920,10 @@ export class VoiceMesh extends EventTarget {
     void context.resume().catch(() => undefined);
     const profile = voiceCaptureProfileForMode(noiseMode);
     let noiseProcessor: DeepFilterNoiseProcessor | undefined;
-    if (noiseMode === "strong") {
+    if (
+      noiseMode === "strong" &&
+      currentResourceBudget().allowNeuralVoiceProcessing
+    ) {
       const processorRequest = createDeepFilterNoiseProcessor(
         context,
         "attenuationLimitDb" in profile
@@ -1738,8 +2205,9 @@ export class VoiceMesh extends EventTarget {
 
   private async replaceCaptureGraph(
     replacement: CaptureGraph,
+    operationSignal?: AbortSignal,
   ): Promise<boolean> {
-    if (!this.active || this.destroyed) {
+    if (!this.active || this.destroyed || operationSignal?.aborted) {
       await this.disposeGraph(replacement);
       return false;
     }
@@ -1751,29 +2219,43 @@ export class VoiceMesh extends EventTarget {
     }
     replacementTrack.enabled = true;
     this.applyMicrophoneGate(replacement);
-    await Promise.all(
-      [...this.peers.entries()].map(async ([peerId, peer]) => {
-        const replacements = peer.pc
-          .getSenders()
-          .filter((sender) => sender.track?.kind === "audio")
-          .map((sender) =>
-            boundedVoiceOperation(
-              sender.replaceTrack(replacementTrack),
-              `替换 ${peerId} 的语音音轨超时`,
-              VOICE_RTC_TRACK_REPLACE_TIMEOUT_MS,
-            ),
-          );
-        const results = await Promise.allSettled(replacements);
-        if (
-          results.some((result) => result.status === "rejected") &&
-          this.peers.get(peerId) === peer
-        ) {
-          this.closePeer(peerId);
-          this.schedulePeerRecovery(peerId, 120, true);
-        }
-      }),
-    );
-    if (!this.active || this.destroyed) {
+    if (this.voiceTransport === "sfu") {
+      try {
+        await this.voiceSfu.publish(
+          replacementTrack,
+          this.voiceBitrate(),
+          Boolean(this.accompanimentTrack),
+          operationSignal,
+        );
+      } catch (error) {
+        await this.disposeGraph(replacement);
+        throw error;
+      }
+    } else {
+      await Promise.all(
+        [...this.peers.entries()].map(async ([peerId, peer]) => {
+          const replacements = peer.pc
+            .getSenders()
+            .filter((sender) => sender.track?.kind === "audio")
+            .map((sender) =>
+              boundedVoiceOperation(
+                sender.replaceTrack(replacementTrack),
+                `替换 ${peerId} 的语音音轨超时`,
+                VOICE_RTC_TRACK_REPLACE_TIMEOUT_MS,
+              ),
+            );
+          const results = await Promise.allSettled(replacements);
+          if (
+            results.some((result) => result.status === "rejected") &&
+            this.peers.get(peerId) === peer
+          ) {
+            this.closePeer(peerId);
+            this.schedulePeerRecovery(peerId, 120, true);
+          }
+        }),
+      );
+    }
+    if (!this.active || this.destroyed || operationSignal?.aborted) {
       // leave() closes every sender before clearing active, so no live sender
       // can retain this replacement when a queued mutation finishes late.
       await this.disposeGraph(replacement);
@@ -1858,7 +2340,7 @@ export class VoiceMesh extends EventTarget {
     this.captureRecoveryPending = false;
     let retry = false;
     try {
-      await this.captureMutationQueue.run(async () => {
+      await this.captureMutationQueue.run(async (operationSignal) => {
         if (!this.active || this.destroyed) return;
         const current = this.graph;
         const sourceTrack = current?.sourceStream.getAudioTracks()[0];
@@ -1889,14 +2371,28 @@ export class VoiceMesh extends EventTarget {
           this.inputDeviceId,
           forceFallback ? "clear" : this.noiseMode,
           undefined,
-          this.captureLifecycle.signal,
+          combineVoiceAbortSignals(
+            operationSignal,
+            this.captureLifecycle.signal,
+          ),
         );
-        if (!(await this.replaceCaptureGraph(replacement))) return;
+        if (
+          !(await this.replaceCaptureGraph(
+            replacement,
+            operationSignal,
+          ))
+        ) {
+          return;
+        }
+        if (operationSignal.aborted) return;
         this.inputDeviceId = replacement.selectedDeviceId;
         localStorage.setItem(INPUT_KEY, this.inputDeviceId);
         this.captureRecoveryErrorNotified = false;
         await this.retuneVoiceSenders();
         this.emitState();
+      }, {
+        signal: this.voiceOperationController.signal,
+        label: "恢复麦克风采集",
       });
     } catch (error) {
       if (!this.captureRecoveryErrorNotified && !this.destroyed) {
@@ -1991,7 +2487,9 @@ export class VoiceMesh extends EventTarget {
 
   private voiceBitrate(): number {
     return voiceBitrateForPeerCount(
-      this.peers.size,
+      this.voiceTransport === "sfu"
+        ? this.expectedPeers.size
+        : this.peers.size,
       Boolean(this.accompanimentTrack),
     );
   }
@@ -2032,11 +2530,50 @@ export class VoiceMesh extends EventTarget {
     graph.accompanimentGain = undefined;
   }
 
+  private async tunePeerVoiceSender(
+    peerId: string,
+    peer: VoicePeer,
+    sender: RTCRtpSender,
+    bitrate: number,
+    label: string,
+  ): Promise<void> {
+    try {
+      await boundedVoiceOperation(
+        tuneVoiceSender(sender, bitrate),
+        label,
+        VOICE_RTC_TUNE_TIMEOUT_MS,
+      );
+    } catch (error) {
+      if (
+        error instanceof VoiceOperationTimeoutError &&
+        this.peers.get(peerId) === peer
+      ) {
+        // setParameters is not cancellable. Closing this generation prevents
+        // its late result from overriding a newer desired bitrate.
+        this.closePeer(peerId);
+        this.schedulePeerRecovery(peerId, 120, true);
+      }
+      throw error;
+    }
+  }
+
   private async retuneVoiceSenders(): Promise<void> {
     this.voiceTuneQueue = this.voiceTuneQueue
       .catch(() => undefined)
       .then(async () => {
         const targetBitrate = this.voiceBitrate();
+        if (this.voiceTransport === "sfu") {
+          const track = this.graph?.processedStream.getAudioTracks()[0];
+          if (track && this.active && !this.listeningOnly) {
+            await this.voiceSfu.publish(
+              track,
+              targetBitrate,
+              Boolean(this.accompanimentTrack),
+            );
+          }
+          this.emitState();
+          return;
+        }
         await Promise.allSettled(
           [...this.peers.entries()].flatMap(([peerId, peer]) => {
             const bitrate = Math.min(
@@ -2048,10 +2585,12 @@ export class VoiceMesh extends EventTarget {
               .getSenders()
               .filter((sender) => sender.track?.kind === "audio")
               .map((sender) =>
-                boundedVoiceOperation(
-                  tuneVoiceSender(sender, bitrate),
+                this.tunePeerVoiceSender(
+                  peerId,
+                  peer,
+                  sender,
+                  bitrate,
                   `调整 ${peerId} 的语音码率超时`,
-                  VOICE_RTC_TUNE_TIMEOUT_MS,
                 ),
               );
           }),
@@ -2141,7 +2680,11 @@ export class VoiceMesh extends EventTarget {
           }
         }),
       );
-      const changed: Array<{ peer: VoicePeer; bitrate: number }> = [];
+      const changed: Array<{
+        peerId: string;
+        peer: VoicePeer;
+        bitrate: number;
+      }> = [];
       for (const sample of samples) {
         if (!sample || this.peers.get(sample.peerId) !== sample.peer) continue;
         sample.peer.outboundVoiceSnapshot = sample.stats.snapshot;
@@ -2150,7 +2693,11 @@ export class VoiceMesh extends EventTarget {
           sample.stats,
         );
         if (sample.peer.appliedVoiceBitrate !== bitrate) {
-          changed.push({ peer: sample.peer, bitrate });
+          changed.push({
+            peerId: sample.peerId,
+            peer: sample.peer,
+            bitrate,
+          });
         }
       }
       if (!changed.length) return;
@@ -2158,16 +2705,18 @@ export class VoiceMesh extends EventTarget {
         .catch(() => undefined)
         .then(async () => {
           await Promise.allSettled(
-            changed.flatMap(({ peer, bitrate }) => {
+            changed.flatMap(({ peerId, peer, bitrate }) => {
               peer.appliedVoiceBitrate = bitrate;
               return peer.pc
                 .getSenders()
                 .filter((sender) => sender.track?.kind === "audio")
                 .map((sender) =>
-                  boundedVoiceOperation(
-                    tuneVoiceSender(sender, bitrate),
+                  this.tunePeerVoiceSender(
+                    peerId,
+                    peer,
+                    sender,
+                    bitrate,
                     "调整自适应语音码率超时",
-                    VOICE_RTC_TUNE_TIMEOUT_MS,
                   ),
                 );
             }),
@@ -2213,6 +2762,7 @@ export class VoiceMesh extends EventTarget {
       this.expectedPeers.delete(peerId);
       this.expectedPeerMuteStates.delete(peerId);
       this.clearPeerRetry(peerId);
+      this.removeSfuRemoteAudio(peerId);
       this.closePeer(peerId);
     }
     for (const participant of participants) {
@@ -2255,7 +2805,14 @@ export class VoiceMesh extends EventTarget {
   }
 
   private ensureMissingPeers(): void {
-    if (!this.active || this.destroyed) return;
+    if (
+      !this.active ||
+      this.destroyed ||
+      this.voiceTransport !== "mesh" ||
+      this.expectedPeers.size + 1 > MAX_VOICE_MESH_PARTICIPANTS
+    ) {
+      return;
+    }
     for (const peerId of this.expectedPeers) {
       if (!this.peers.has(peerId) && this.isRecoveryInitiator(peerId)) {
         this.schedulePeerRecovery(peerId, 120);
@@ -2371,6 +2928,8 @@ export class VoiceMesh extends EventTarget {
     if (
       !this.active ||
       this.destroyed ||
+      this.voiceTransport !== "mesh" ||
+      this.expectedPeers.size + 1 > MAX_VOICE_MESH_PARTICIPANTS ||
       !this.expectedPeers.has(peerId) ||
       this.peerRetryTimers.has(peerId)
     ) {
@@ -2380,6 +2939,7 @@ export class VoiceMesh extends EventTarget {
       this.peerRetryTimers.delete(peerId);
       if (
         !this.active ||
+        this.voiceTransport !== "mesh" ||
         !this.expectedPeers.has(peerId) ||
         this.destroyed
       ) {
@@ -2672,7 +3232,7 @@ export class VoiceMesh extends EventTarget {
       pc,
       relayOnly: useRelayOnly,
       candidates: [],
-      candidateApplyQueue: new SerialAsyncQueue(),
+      candidateApplyQueue: new SerialAsyncQueue(5_000),
       remoteDescriptionApplying: false,
       sessionId: normalizedSessionId,
       createdAt: performance.now(),
@@ -2833,6 +3393,8 @@ export class VoiceMesh extends EventTarget {
     if (
       !this.active ||
       this.destroyed ||
+      this.voiceTransport !== "mesh" ||
+      this.expectedPeers.size + 1 > MAX_VOICE_MESH_PARTICIPANTS ||
       !this.expectedPeers.has(peerId)
     ) {
       return;
@@ -2869,6 +3431,15 @@ export class VoiceMesh extends EventTarget {
         data: serializableSessionDescription(peer.pc.localDescription!),
       });
       this.flushLocalCandidates(peerId, peer);
+    } catch (error) {
+      if (this.peers.get(peerId) === peer) {
+        // RTCPeerConnection negotiation calls cannot be aborted. Retire the
+        // whole connection generation so a late result has no live state to
+        // mutate, then let the bounded recovery actor rebuild it.
+        this.closePeer(peerId);
+        this.schedulePeerRecovery(peerId, 120, true);
+      }
+      throw error;
     } finally {
       if (this.peers.get(peerId) === peer) {
         peer.makingOffer = false;
@@ -2882,6 +3453,13 @@ export class VoiceMesh extends EventTarget {
     sessionId?: string,
     iceMode?: "all" | "relay",
   ): Promise<void> {
+    if (
+      !this.active ||
+      this.destroyed ||
+      this.voiceTransport !== "mesh"
+    ) {
+      return;
+    }
     const normalizedSessionId =
       sessionId && /^[a-z0-9-]{8,64}$/i.test(sessionId)
         ? sessionId
@@ -3061,6 +3639,48 @@ export class VoiceMesh extends EventTarget {
     });
   }
 
+  private remoteVoiceStream(peerId: string): MediaStream | undefined {
+    return (
+      this.sfuRemoteStreams.get(peerId) ||
+      this.peers.get(peerId)?.remoteStream
+    );
+  }
+
+  private hasVoiceRoute(peerId: string): boolean {
+    return Boolean(this.remoteVoiceStream(peerId));
+  }
+
+  private removeSfuRemoteAudio(
+    peerId: string,
+    expectedTrack?: MediaStreamTrack,
+  ): void {
+    const stream = this.sfuRemoteStreams.get(peerId);
+    if (
+      !stream ||
+      (expectedTrack &&
+        !stream.getAudioTracks().includes(expectedTrack))
+    ) {
+      return;
+    }
+    this.sfuRemoteStreams.delete(peerId);
+    this.updateSpeakingState(peerId, 0, false);
+    this.speakingStates.delete(peerId);
+    this.clearPlaybackRepair(peerId);
+    this.disposePlaybackGraph(peerId);
+    const meshStream = this.peers.get(peerId)?.remoteStream;
+    if (meshStream) {
+      this.attachRemoteAudio(peerId, meshStream);
+    } else {
+      this.blockedPlaybackPeers.delete(peerId);
+      this.audioContainer
+        .querySelector<HTMLAudioElement>(
+          `audio[data-voice-peer="${CSS.escape(peerId)}"]`,
+        )
+        ?.remove();
+    }
+    this.emitState();
+  }
+
   private attachRemoteAudio(peerId: string, stream: MediaStream): void {
     let audio = this.audioContainer.querySelector<AudioWithSink>(
       `audio[data-voice-peer="${CSS.escape(peerId)}"]`,
@@ -3113,7 +3733,9 @@ export class VoiceMesh extends EventTarget {
     peerId: string,
     forceReattach: boolean,
   ): void {
-    if (!this.active || this.destroyed || !this.peers.has(peerId)) return;
+    if (!this.active || this.destroyed || !this.hasVoiceRoute(peerId)) {
+      return;
+    }
     const existing = this.playbackRepairTimers.get(peerId);
     if (existing) {
       window.clearTimeout(existing.timer);
@@ -3126,7 +3748,13 @@ export class VoiceMesh extends EventTarget {
     request.timer = window.setTimeout(() => {
       if (this.playbackRepairTimers.get(peerId) !== request) return;
       this.playbackRepairTimers.delete(peerId);
-      if (!this.active || this.destroyed || !this.peers.has(peerId)) return;
+      if (
+        !this.active ||
+        this.destroyed ||
+        !this.hasVoiceRoute(peerId)
+      ) {
+        return;
+      }
       void this.repairRemotePlayback(peerId, request.forceReattach);
     }, PLAYBACK_REPAIR_DEBOUNCE_MS);
     this.playbackRepairTimers.set(peerId, request);
@@ -3163,7 +3791,11 @@ export class VoiceMesh extends EventTarget {
           peerId,
           shouldForceReattach,
         );
-        if (!this.active || this.destroyed || !this.peers.has(peerId)) {
+        if (
+          !this.active ||
+          this.destroyed ||
+          !this.hasVoiceRoute(peerId)
+        ) {
           queue.rerun = false;
         }
       }
@@ -3180,9 +3812,8 @@ export class VoiceMesh extends EventTarget {
     peerId: string,
     forceReattach: boolean,
   ): Promise<void> {
-    const peer = this.peers.get(peerId);
-    const stream = peer?.remoteStream;
-    if (!peer || !stream || !this.active || this.destroyed) return;
+    const stream = this.remoteVoiceStream(peerId);
+    if (!stream || !this.active || this.destroyed) return;
     let audio = this.audioContainer.querySelector<AudioWithSink>(
       `audio[data-voice-peer="${CSS.escape(peerId)}"]`,
     );
@@ -3216,8 +3847,12 @@ export class VoiceMesh extends EventTarget {
   private async repairAllRemotePlayback(
     forceReattach = false,
   ): Promise<void> {
+    const peerIds = new Set([
+      ...this.peers.keys(),
+      ...this.sfuRemoteStreams.keys(),
+    ]);
     await Promise.allSettled(
-      [...this.peers.keys()].map((peerId) =>
+      [...peerIds].map((peerId) =>
         this.repairRemotePlayback(peerId, forceReattach),
       ),
     );
@@ -3320,7 +3955,7 @@ export class VoiceMesh extends EventTarget {
           this.destroyed ||
           !this.active ||
           !peerId ||
-          !this.peers.has(peerId)
+          !this.hasVoiceRoute(peerId)
         ) {
           return;
         }
@@ -3481,7 +4116,7 @@ export class VoiceMesh extends EventTarget {
   }
 
   private fallbackToDirectPlayback(peerId: string): void {
-    const stream = this.peers.get(peerId)?.remoteStream;
+    const stream = this.remoteVoiceStream(peerId);
     const audio = this.audioContainer.querySelector<HTMLAudioElement>(
       `audio[data-voice-peer="${CSS.escape(peerId)}"]`,
     );
@@ -3515,7 +4150,7 @@ export class VoiceMesh extends EventTarget {
     if (graph) {
       this.fallbackToDirectPlayback(peerId);
     } else {
-      const stream = this.peers.get(peerId)?.remoteStream;
+      const stream = this.remoteVoiceStream(peerId);
       if (stream && audio.srcObject !== stream) {
         audio.srcObject = stream;
       }
@@ -3538,8 +4173,10 @@ export class VoiceMesh extends EventTarget {
   }
 
   private closePeer(peerId: string, retireSession = true): void {
-    this.updateSpeakingState(peerId, 0, false);
-    this.speakingStates.delete(peerId);
+    if (!this.sfuRemoteStreams.has(peerId)) {
+      this.updateSpeakingState(peerId, 0, false);
+      this.speakingStates.delete(peerId);
+    }
     const peer = this.peers.get(peerId);
     if (peer) {
       this.peers.delete(peerId);
@@ -3559,11 +4196,18 @@ export class VoiceMesh extends EventTarget {
       this.disarmPlaybackGestureRetry();
     }
     this.disposePlaybackGraph(peerId);
-    this.audioContainer
-      .querySelector<HTMLAudioElement>(
+    if (!this.sfuRemoteStreams.has(peerId)) {
+      this.audioContainer
+        .querySelector<HTMLAudioElement>(
+          `audio[data-voice-peer="${CSS.escape(peerId)}"]`,
+        )
+        ?.remove();
+    } else {
+      const audio = this.audioContainer.querySelector<HTMLAudioElement>(
         `audio[data-voice-peer="${CSS.escape(peerId)}"]`,
-      )
-      ?.remove();
+      );
+      if (audio) this.applyPeerVolume(audio, peerId);
+    }
     void this.retuneVoiceSenders();
     this.emitState();
   }

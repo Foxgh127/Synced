@@ -2,6 +2,8 @@ const { contextBridge, ipcRenderer } = require("electron");
 
 const embyStreamListeners = new Set();
 let embyStreamPort;
+const processAudioListeners = new Set();
+let processAudioPort;
 
 function deliverEmbyStreamPayload(payload) {
   const normalized = {
@@ -39,6 +41,49 @@ ipcRenderer.on("emby:stream-event", (_event, payload) => {
   deliverEmbyStreamPayload(payload);
 });
 
+function deliverProcessAudioPacket(packet) {
+  const normalized = {
+    ...packet,
+    pcm:
+      packet?.pcm instanceof Uint8Array
+        ? packet.pcm
+        : new Uint8Array(packet?.pcm || 0),
+    sampleRate: Number(packet?.sampleRate),
+    capturedAtUnixMs: Number(packet?.capturedAtUnixMs),
+    devicePosition: Number(packet?.devicePosition),
+    captureId: Number(packet?.captureId),
+  };
+  for (const listener of processAudioListeners) {
+    try {
+      listener(normalized);
+    } catch {
+      // One audio consumer must not break delivery to another.
+    }
+  }
+}
+
+ipcRenderer.on("capture:audio-port", (event) => {
+  const port = event.ports?.[0];
+  if (!port) return;
+  try {
+    processAudioPort?.close();
+  } catch {
+    // Replacing a port after reload is best effort.
+  }
+  processAudioPort = port;
+  port.onmessage = (message) => {
+    try {
+      deliverProcessAudioPacket(message.data);
+    } finally {
+      port.postMessage({
+        type: "audio-consumed",
+        transportPacketId: Number(message.data?.transportPacketId),
+      });
+    }
+  };
+  port.start();
+});
+
 contextBridge.exposeInMainWorld("roomDesktop", {
   loadChannelOwnership: () =>
     ipcRenderer.sendSync("channel-owner:load"),
@@ -61,16 +106,8 @@ contextBridge.exposeInMainWorld("roomDesktop", {
   stopProcessAudio: (captureId) =>
     ipcRenderer.invoke("capture:stop-process-audio", captureId),
   onProcessAudioData: (callback) => {
-    const listener = (_event, packet) =>
-      callback({
-        pcm: new Uint8Array(packet.pcm),
-        sampleRate: Number(packet.sampleRate),
-        capturedAtUnixMs: Number(packet.capturedAtUnixMs),
-        devicePosition: Number(packet.devicePosition),
-        captureId: Number(packet.captureId),
-      });
-    ipcRenderer.on("capture:audio-data", listener);
-    return () => ipcRenderer.removeListener("capture:audio-data", listener);
+    processAudioListeners.add(callback);
+    return () => processAudioListeners.delete(callback);
   },
   onProcessAudioStatus: (callback) => {
     const listener = (_event, status) => callback(status);

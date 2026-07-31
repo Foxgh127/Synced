@@ -105,6 +105,17 @@ function Brand() {
   );
 }
 
+function LegacyNotice() {
+  return (
+    <aside className="legacy-notice" role="note" aria-label="项目状态说明">
+      <strong>Legacy / Experimental / Read-only maintenance</strong>
+      <span>
+        独立 VDO.Ninja 网页实验面；不是 Native 产品，也不是其可靠故障兜底。
+      </span>
+    </aside>
+  );
+}
+
 function BroadcastVisual() {
   return (
     <div className="broadcast-visual" aria-hidden="true">
@@ -139,6 +150,7 @@ function BroadcastVisual() {
 function LoadingScreen() {
   return (
     <div className="route-loading" role="status" aria-live="polite">
+      <LegacyNotice />
       <span className="loading-orbit" aria-hidden="true" />
       <span>正在准备放映室…</span>
     </div>
@@ -379,6 +391,7 @@ export default function Home() {
   if (invalidViewerLink) {
     return (
       <main className="page">
+        <LegacyNotice />
         <section className="app-shell compact-shell">
           <Brand />
           <div className="empty-state">
@@ -400,6 +413,7 @@ export default function Home() {
   if (viewerId) {
     return (
       <main className="viewer-page">
+        <LegacyNotice />
         <section className="viewer-shell" aria-labelledby="viewer-title">
           <header className="viewer-header">
             <Brand />
@@ -479,6 +493,7 @@ export default function Home() {
 
   return (
     <main className="page">
+      <LegacyNotice />
       <section
         className={`app-shell host-${hostStatus}`}
         aria-labelledby="hero-title"

@@ -26,7 +26,7 @@ const SIGNAL_FEATURES = Object.freeze([
   "resume-token",
   "server-capabilities",
   "server-time",
-  "voice-policy-v2",
+  "voice-policy-v3",
   "ice-restart",
   "turn-rest-credentials",
   "ice-credential-refresh",
@@ -245,6 +245,48 @@ function buildSfuAccess(room, state, env = process.env) {
       roomJoin: true,
       canPublish: state.canBroadcast === true,
       canPublishData: true,
+      canSubscribe: true,
+    },
+  });
+  const unsigned = `${header}.${payload}`;
+  const signature = createHmac("sha256", env.LIVEKIT_API_SECRET)
+    .update(unsigned)
+    .digest("base64url");
+  return {
+    url: normalizedSfuUrl(env.SFU_PUBLIC_URL),
+    room: sfuRoom,
+    token: `${unsigned}.${signature}`,
+    expiresAt,
+  };
+}
+
+function buildVoiceSfuAccess(room, state, env = process.env) {
+  if (!sfuEnabled(env)) return undefined;
+  const nowSeconds = Math.floor(Date.now() / 1_000);
+  const ttlSeconds = boundedInteger(
+    env.SFU_TOKEN_TTL_SECONDS,
+    45 * 60,
+    10 * 60,
+    6 * 60 * 60,
+  );
+  const expiresAt = (nowSeconds + ttlSeconds) * 1_000;
+  // Voice uses a dedicated LiveKit room so every participant may publish one
+  // microphone without granting screen/data publication in the media room or
+  // colliding with the participant's existing screen SFU connection.
+  const sfuRoom = `synced-${String(room).toLowerCase()}-voice`;
+  const header = base64UrlJson({ alg: "HS256", typ: "JWT" });
+  const payload = base64UrlJson({
+    iss: cleanText(env.LIVEKIT_API_KEY, 128),
+    sub: state.id,
+    name: cleanText(state.nickname, 64, "朋友"),
+    nbf: nowSeconds - 5,
+    exp: nowSeconds + ttlSeconds,
+    video: {
+      room: sfuRoom,
+      roomJoin: true,
+      canPublish: true,
+      canPublishData: false,
+      canPublishSources: ["microphone"],
       canSubscribe: true,
     },
   });
@@ -759,6 +801,7 @@ function reportedCapacityBps(_report, transportReports, direction) {
 }
 
 function voicePolicyFor(state, now = Date.now()) {
+  const policy = protocolPolicy.voice;
   const report = freshNetworkReport(state, now);
   const transportReports = freshTransportReports(state, now).filter(
     (candidate) => candidate.mediaKind === "voice",
@@ -768,16 +811,21 @@ function voicePolicyFor(state, now = Date.now()) {
     report?.networkType === "cellular" ||
     transportPenalty(transportReports) < 0.72;
   return {
-    version: 2,
-    sampleRate: 48_000,
-    channels: 2,
-    minimumBitrateBps: 96_000,
-    speechTargetBitrateBps: constrained ? 192_000 : 256_000,
-    musicTargetBitrateBps: constrained ? 256_000 : 320_000,
-    maximumBitrateBps: 320_000,
-    packetizationMs: 20,
+    version: 3,
+    sampleRate: policy.sampleRate,
+    channels: 1,
+    musicChannels: 2,
+    minimumBitrateBps: policy.minimumAdaptiveBitrateBps,
+    speechTargetBitrateBps: constrained
+      ? policy.speechBitrateBps.manyPeers
+      : policy.speechBitrateBps.onePeer,
+    musicTargetBitrateBps: constrained
+      ? policy.musicBitrateBps.manyPeers
+      : policy.musicBitrateBps.onePeer,
+    maximumBitrateBps: policy.maximumAdaptiveBitrateBps,
+    packetizationMs: policy.packetizationMs,
     inbandFec: true,
-    dtx: false,
+    dtx: true,
     constrained,
   };
 }
@@ -4272,6 +4320,25 @@ export function createSignalServer(options = {}) {
           return;
         }
         const wasVoiceActive = state.voiceActive;
+        const currentVoiceParticipants = getRoomParticipants(room).filter(
+          (participant) =>
+            participant.id !== clientId && participant.voiceActive,
+        );
+        if (
+          !wasVoiceActive &&
+          !sfuEnabled(env) &&
+          currentVoiceParticipants.length >=
+            protocolPolicy.voice.maxMeshParticipantsWithoutSfu
+        ) {
+          send(socket, {
+            type: "error",
+            code: "voice-sfu-required",
+            requestedType: "voice:join",
+            message:
+              `当前服务器未启用语音 SFU；为避免 full mesh 过载，连麦最多 ${protocolPolicy.voice.maxMeshParticipantsWithoutSfu} 人`,
+          });
+          return;
+        }
         state.voiceActive = true;
         if (!wasVoiceActive) {
           state.microphoneMuted = Boolean(state.microphoneDisabled);
@@ -4279,10 +4346,12 @@ export function createSignalServer(options = {}) {
         const voicePeers = getRoomParticipants(room).filter(
           (participant) => participant.id !== clientId && participant.voiceActive,
         );
+        const voiceSfu = buildVoiceSfuAccess(state.room, state, env);
         send(socket, {
           type: "voice:ready",
           participants: voicePeers,
           ...clientIceConfiguration(state),
+          ...(voiceSfu ? { voiceSfu } : {}),
           voicePolicy: voicePolicyFor(state, now),
           serverTime: now,
         });
@@ -4307,6 +4376,7 @@ export function createSignalServer(options = {}) {
         if (!room) {
           return;
         }
+        const voiceSfu = buildVoiceSfuAccess(state.room, state, env);
         send(socket, {
           type: "voice:peers",
           participants: getRoomParticipants(room).filter(
@@ -4314,6 +4384,7 @@ export function createSignalServer(options = {}) {
               participant.id !== clientId && participant.voiceActive,
           ),
           voicePolicy: voicePolicyFor(state, now),
+          ...(voiceSfu ? { voiceSfu } : {}),
           serverTime: now,
         });
         return;

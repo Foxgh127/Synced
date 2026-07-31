@@ -99,12 +99,45 @@ a:focus-visible {
   outline-offset: 4px;
 }
 
+.legacy-notice {
+  position: fixed;
+  top: 10px;
+  left: 50%;
+  z-index: 1000;
+  width: min(760px, calc(100vw - 24px));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 8px 14px;
+  color: #fff4d2;
+  text-align: center;
+  border: 1px solid rgba(255, 201, 106, 0.58);
+  border-radius: 999px;
+  background: rgba(45, 29, 4, 0.94);
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.34);
+  transform: translateX(-50%);
+  backdrop-filter: blur(14px);
+}
+
+.legacy-notice strong {
+  color: var(--amber);
+  font-size: 0.76rem;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+
+.legacy-notice span {
+  font-size: 0.78rem;
+}
+
 .page {
   width: 100%;
   min-height: 100vh;
   display: grid;
   place-items: center;
-  padding: clamp(24px, 5vw, 80px);
+  padding: max(58px, clamp(24px, 5vw, 80px)) clamp(24px, 5vw, 80px)
+    clamp(24px, 5vw, 80px);
 }
 
 .app-shell {
@@ -1186,7 +1219,8 @@ h1 {
 
 .viewer-page {
   min-height: 100vh;
-  padding: clamp(18px, 3.2vw, 48px);
+  padding: max(58px, clamp(18px, 3.2vw, 48px))
+    clamp(18px, 3.2vw, 48px) clamp(18px, 3.2vw, 48px);
 }
 
 .viewer-shell {
@@ -1489,7 +1523,22 @@ h1 {
 
 @media (max-width: 640px) {
   .page {
-    padding: 0;
+    padding: 72px 0 0;
+  }
+
+  .viewer-page {
+    padding-top: 72px;
+  }
+
+  .legacy-notice {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 2px;
+    border-radius: 14px;
+  }
+
+  .legacy-notice strong {
+    white-space: normal;
   }
 
   .app-shell {

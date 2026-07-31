@@ -8,7 +8,6 @@ export interface PlaybackControlState {
 interface PlaybackControlsPlugin {
   getState(): Promise<PlaybackControlState>;
   setBrightness(options: { value: number }): Promise<PlaybackControlState>;
-  setVolume(options: { value: number }): Promise<PlaybackControlState>;
   setPlaybackActive(options: {
     active: boolean;
     title?: string;
@@ -22,11 +21,15 @@ export function hasNativePlaybackControls(): boolean {
   return Capacitor.isNativePlatform() && Capacitor.getPlatform() === "android";
 }
 
-export async function getPlaybackControlState(): Promise<PlaybackControlState> {
+export async function getPlaybackControlState(
+  appVolume = 1,
+): Promise<PlaybackControlState> {
+  const volume = Math.max(0, Math.min(1, appVolume));
   if (!hasNativePlaybackControls()) {
-    return { brightness: 0.5, volume: 1 };
+    return { brightness: 0.5, volume };
   }
-  return PlaybackControls.getState();
+  const state = await PlaybackControls.getState();
+  return { ...state, volume };
 }
 
 export async function setPlaybackBrightness(
@@ -37,16 +40,6 @@ export async function setPlaybackBrightness(
     return { brightness: normalized, volume: 1 };
   }
   return PlaybackControls.setBrightness({ value: normalized });
-}
-
-export async function setPlaybackVolume(
-  value: number,
-): Promise<PlaybackControlState> {
-  const normalized = Math.max(0, Math.min(1, value));
-  if (!hasNativePlaybackControls()) {
-    return { brightness: 0.5, volume: normalized };
-  }
-  return PlaybackControls.setVolume({ value: normalized });
 }
 
 export async function setNativePlaybackActive(

@@ -48,6 +48,15 @@ let allowMainWindowMinimize = false;
 let preparingMainWindowMinimize = false;
 let embyAccounts;
 let embyStreamPort;
+let processAudioPort;
+const PROCESS_AUDIO_MAX_IN_FLIGHT = 4;
+const PROCESS_AUDIO_PENDING_CAPACITY = 20;
+let processAudioTransportSequence = 0;
+const processAudioInFlight = new Set();
+let processAudioPending = [];
+let processAudioTransportDropped = 0;
+let lastProcessAudioOverrunAt = 0;
+let processAudioPortRestartTimer;
 let shutdownInProgress = false;
 let shutdownComplete = false;
 let gameView;
@@ -106,6 +115,163 @@ function sendEmbyStreamEvent(payload) {
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send("emby:stream-event", payload);
   }
+}
+
+function closeProcessAudioPort() {
+  try {
+    processAudioPort?.close();
+  } catch {
+    // The renderer may already have closed its end during reload.
+  }
+  processAudioPort = undefined;
+  processAudioInFlight.clear();
+  processAudioPending = [];
+}
+
+function scheduleProcessAudioPortRestart() {
+  if (processAudioPortRestartTimer) return;
+  processAudioPortRestartTimer = setTimeout(() => {
+    processAudioPortRestartTimer = undefined;
+    if (
+      !processAudioPort &&
+      mainWindow &&
+      !mainWindow.isDestroyed() &&
+      !mainWindow.webContents.isDestroyed()
+    ) {
+      installProcessAudioPort();
+    }
+  }, 250);
+}
+
+function installProcessAudioPort() {
+  if (
+    !MessageChannelMain ||
+    !mainWindow ||
+    mainWindow.isDestroyed() ||
+    mainWindow.webContents.isDestroyed()
+  ) {
+    return;
+  }
+  closeProcessAudioPort();
+  const { port1, port2 } = new MessageChannelMain();
+  processAudioPort = port1;
+  processAudioInFlight.clear();
+  processAudioPending = [];
+  port1.on("message", (event) => {
+    if (
+      processAudioPort !== port1 ||
+      event.data?.type !== "audio-consumed"
+    ) {
+      return;
+    }
+    const transportPacketId = Number(event.data.transportPacketId);
+    if (
+      !Number.isSafeInteger(transportPacketId) ||
+      !processAudioInFlight.delete(transportPacketId)
+    ) {
+      return;
+    }
+    pumpProcessAudioPackets();
+  });
+  port1.on("close", () => {
+    if (processAudioPort !== port1) return;
+    const dropped =
+      processAudioPending.length + processAudioInFlight.size;
+    const captureId = audioCaptureState.captureId;
+    if (dropped > 0) processAudioTransportDropped += dropped;
+    closeProcessAudioPort();
+    if (dropped > 0) reportProcessAudioTransportOverrun(captureId);
+    scheduleProcessAudioPortRestart();
+  });
+  port1.start();
+  mainWindow.webContents.postMessage("capture:audio-port", null, [port2]);
+}
+
+function processAudioPayload(packet, captureId) {
+  // The packet decoder already owns an exact-sized Buffer. Expose a typed
+  // view and let structured clone perform the single main→renderer copy.
+  const pcm = new Uint8Array(
+    packet.pcm.buffer,
+    packet.pcm.byteOffset,
+    packet.pcm.byteLength,
+  );
+  return {
+    ...packet,
+    pcm,
+    captureId,
+  };
+}
+
+function reportProcessAudioTransportOverrun(captureId) {
+  const now = Date.now();
+  if (now - lastProcessAudioOverrunAt < 1_000) return;
+  lastProcessAudioOverrunAt = now;
+  audioCaptureState.transportDroppedPackets =
+    processAudioTransportDropped;
+  audioCaptureState.transportQueueDepth = processAudioPending.length;
+  const status = {
+    type: "overrun",
+    stage: "main-renderer",
+    captureId,
+    droppedPackets: processAudioTransportDropped,
+    queueDepth: processAudioPending.length,
+    queueCapacityPackets: PROCESS_AUDIO_PENDING_CAPACITY,
+    inFlightPackets: processAudioInFlight.size,
+  };
+  diagnostic("process-audio-overrun", status);
+  sendProcessAudioStatus(status);
+}
+
+function pumpProcessAudioPackets() {
+  while (
+    processAudioPort &&
+    processAudioInFlight.size < PROCESS_AUDIO_MAX_IN_FLIGHT &&
+    processAudioPending.length
+  ) {
+    const next = processAudioPending.shift();
+    const transportPacketId = ++processAudioTransportSequence;
+    const payload = {
+      ...processAudioPayload(next.packet, next.captureId),
+      transportPacketId,
+    };
+    try {
+      processAudioPort.postMessage(payload);
+      processAudioInFlight.add(transportPacketId);
+    } catch {
+      processAudioTransportDropped +=
+        1 + processAudioPending.length + processAudioInFlight.size;
+      closeProcessAudioPort();
+      reportProcessAudioTransportOverrun(next.captureId);
+      scheduleProcessAudioPortRestart();
+      return;
+    }
+  }
+  audioCaptureState.transportQueueDepth = processAudioPending.length;
+}
+
+function resetProcessAudioTransport() {
+  processAudioPending = [];
+  processAudioInFlight.clear();
+  processAudioTransportDropped = 0;
+  lastProcessAudioOverrunAt = 0;
+}
+
+function sendProcessAudioPacket(packet, captureId) {
+  if (processAudioPort) {
+    if (processAudioPending.length >= PROCESS_AUDIO_PENDING_CAPACITY) {
+      processAudioPending.shift();
+      processAudioTransportDropped += 1;
+      reportProcessAudioTransportOverrun(captureId);
+    }
+    processAudioPending.push({ packet, captureId });
+    pumpProcessAudioPackets();
+    return;
+  }
+  // A renderer without its acknowledged MessagePort is not a safe audio
+  // consumer. Drop the newest packet and report pressure instead of falling
+  // back to unbounded per-packet IPC.
+  processAudioTransportDropped += 1;
+  reportProcessAudioTransportOverrun(captureId);
 }
 const GAME_URL = "https://bluff.synced.com.cn/";
 const GAME_ORIGIN = new URL(GAME_URL).origin;
@@ -756,6 +922,7 @@ function createWindow() {
     }
   });
   mainWindow.webContents.on("did-finish-load", installEmbyStreamPort);
+  mainWindow.webContents.on("did-finish-load", installProcessAudioPort);
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
   mainWindow.on("move", updateOverlayBounds);
   mainWindow.on("focus", updateOverlayBounds);
@@ -835,6 +1002,7 @@ function createWindow() {
     }
     destroyGameView();
     closeEmbyStreamPort();
+    closeProcessAudioPort();
     mainWindow = undefined;
     miniWindowEnabled = false;
     allowMainWindowMinimize = false;
@@ -1544,6 +1712,7 @@ function stopProcessAudioCapture(captureId, reason = "requested") {
   }
   const processToStop = audioCaptureProcess;
   const stoppedCaptureId = audioCaptureState.captureId;
+  resetProcessAudioTransport();
   audioCaptureProcess = undefined;
   audioCaptureState = {
     ...audioCaptureState,
@@ -1568,6 +1737,7 @@ function stopProcessAudioCapture(captureId, reason = "requested") {
 
 async function startProcessAudioCapture() {
   stopProcessAudioCapture(undefined, "replaced");
+  resetProcessAudioTransport();
   const executable = audioHelperPath();
   if (!fs.existsSync(executable)) {
     throw new Error(
@@ -1588,6 +1758,9 @@ async function startProcessAudioCapture() {
     packetCount: 0,
     byteCount: 0,
     lastPacketAt: 0,
+    helperDroppedPackets: 0,
+    transportDroppedPackets: 0,
+    transportQueueDepth: 0,
     sourceHandle: captureTarget,
     startedAt: Date.now(),
   };
@@ -1628,10 +1801,7 @@ async function startProcessAudioCapture() {
           byteCount: audioCaptureState.byteCount,
         });
       }
-      mainWindow.webContents.send("capture:audio-data", {
-        ...packet,
-        captureId,
-      });
+      sendProcessAudioPacket(packet, captureId);
     }
   });
   child.stdout.on("data", (chunk) => {
@@ -1751,6 +1921,17 @@ async function startProcessAudioCapture() {
         if (status.type === "window") {
           latestCaptureWindow = enrichedStatus;
           updateOverlayBounds();
+        }
+        if (status.type === "overrun") {
+          const droppedPackets = Math.max(
+            0,
+            Number(status.droppedPackets) || 0,
+          );
+          audioCaptureState.helperDroppedPackets = droppedPackets;
+          diagnostic("process-audio-overrun", {
+            ...enrichedStatus,
+            droppedPackets,
+          });
         }
         if (status.type === "ready") {
           audioCaptureState = {
@@ -2475,33 +2656,59 @@ app.whenReady().then(() => {
     const virtualInterfaces = new Set();
     for (const [interfaceName, entries] of Object.entries(os.networkInterfaces())) {
       for (const entry of entries || []) {
-        if (entry.family === "IPv4" && !entry.internal && !entry.address.startsWith("169.254.")) {
+        const family = String(entry.family).toLowerCase();
+        const normalizedAddress = String(entry.address || "").split("%")[0];
+        const linkLocal =
+          normalizedAddress.startsWith("169.254.") ||
+          /^fe[89ab][0-9a-f]:/i.test(normalizedAddress);
+        if (
+          (family === "ipv4" || family === "ipv6") &&
+          !entry.internal &&
+          !linkLocal
+        ) {
           const virtual =
             /virtual|vmware|vethernet|hyper-v|wsl|loopback|wireguard|openvpn|sing-box|shadowsocks|(?:^|\b)(?:tun\d*|tap\d*|wg\d*|vpn|meta|clash|mihomo|wintun|tailscale|zerotier|v2ray|xray)(?:\b|$)/i.test(
               interfaceName,
             ) ||
-            /^198\.(?:18|19)\./.test(entry.address);
+            /^198\.(?:18|19)\./.test(normalizedAddress);
           if (virtual) {
             virtualInterfaces.add(interfaceName);
-            continue;
           }
           const privateLan =
-            entry.address.startsWith("192.168.") ||
-            entry.address.startsWith("10.") ||
-            /^172\.(1[6-9]|2\d|3[01])\./.test(entry.address);
+            normalizedAddress.startsWith("192.168.") ||
+            normalizedAddress.startsWith("10.") ||
+            /^172\.(1[6-9]|2\d|3[01])\./.test(normalizedAddress) ||
+            /^100\.(6[4-9]|[789]\d|1[01]\d|12[0-7])\./.test(
+              normalizedAddress,
+            ) ||
+            /^f[cd][0-9a-f]{2}:/i.test(normalizedAddress);
           addresses.push({
-            address: entry.address,
-            rank: (virtual ? 10 : 0) + (privateLan ? 0 : 2),
+            address: normalizedAddress,
+            family,
+            interfaceName,
+            tunnel: virtual,
+            private: privateLan,
+            privacySensitive: !privateLan,
+            publishable: privateLan,
+            directHintEligible: true,
+            rank: (virtual ? 2 : 0) + (privateLan ? 0 : 1),
           });
         }
       }
     }
     addresses.sort((left, right) => left.rank - right.rank);
-    const lanAddresses = [...new Set(addresses.map((entry) => entry.address))];
+    const lanAddresses = [
+      ...new Set(
+        addresses
+          .filter((entry) => entry.directHintEligible)
+          .map((entry) => entry.address),
+      ),
+    ];
     return {
       lanAddresses,
       hasVirtualTunnel: virtualInterfaces.size > 0,
       virtualInterfaces: [...virtualInterfaces],
+      allAddresses: addresses.map(({ rank: _rank, ...entry }) => entry),
     };
   });
 

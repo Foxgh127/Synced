@@ -1,3 +1,8 @@
+import {
+  loadSecureChannelOwnership,
+  saveSecureChannelOwnership,
+} from "./secure-credentials";
+
 export interface RecentChannel {
   room: string;
   name: string;
@@ -127,15 +132,16 @@ function loadDesktopOwnership(): HostChannelOwnership | undefined {
   }
 }
 
-function persistHostOwnership(ownership: HostChannelOwnership): void {
+async function persistHostOwnership(
+  ownership: HostChannelOwnership,
+): Promise<void> {
   volatileOwnership = ownership;
   try {
     window.roomDesktop?.saveChannelOwnership(ownership);
   } catch {
-    // Browsers and Android keep this credential only in the current process
-    // until a Keystore-backed bridge is available; never downgrade to clear
-    // localStorage persistence.
+    // Continue to the Android secure bridge.
   }
+  await saveSecureChannelOwnership(ownership);
   for (const key of [
     HOST_CHANNEL_OWNER_KEY,
     LEGACY_HOST_CHANNEL_OWNER_KEY,
@@ -156,6 +162,7 @@ function persistHostOwnership(ownership: HostChannelOwnership): void {
 export async function getHostChannelOwnership(): Promise<HostChannelOwnership> {
   const candidates: unknown[] = [
     loadDesktopOwnership(),
+    await loadSecureChannelOwnership(),
     volatileOwnership,
   ];
   for (const key of [HOST_CHANNEL_OWNER_KEY, LEGACY_HOST_CHANNEL_OWNER_KEY]) {
@@ -179,7 +186,7 @@ export async function getHostChannelOwnership(): Promise<HostChannelOwnership> {
           room: await roomForOwnerBytes(bytes),
           ownerToken: (saved as HostChannelOwnership).ownerToken,
         };
-        persistHostOwnership(ownership);
+        await persistHostOwnership(ownership);
         return ownership;
       }
     } catch {
@@ -192,7 +199,7 @@ export async function getHostChannelOwnership(): Promise<HostChannelOwnership> {
     room: await roomForOwnerBytes(bytes),
     ownerToken: ownerTokenForBytes(bytes),
   };
-  persistHostOwnership(ownership);
+  await persistHostOwnership(ownership);
   return ownership;
 }
 

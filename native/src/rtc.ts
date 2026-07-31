@@ -5,6 +5,7 @@ import type {
   NetworkReport,
 } from "./network-quality";
 import type { SfuAccess } from "./sfu";
+import protocolPolicy from "../server/protocol-policy.json";
 
 const SIGNAL_OPEN_TIMEOUT_MS = 15_000;
 const SIGNAL_HEARTBEAT_INTERVAL_MS = 10_000;
@@ -20,6 +21,7 @@ const LOW_PRIORITY_OUTBOUND_TYPES = new Set([
   "voice:sync",
   "ping",
 ]);
+const voicePolicy = protocolPolicy.voice;
 
 export interface RoomParticipant {
   id: string;
@@ -107,6 +109,7 @@ export interface SignalEnvelope {
   iceExpiresAt?: number;
   iceRefreshToken?: string;
   sfu?: SfuAccess;
+  voiceSfu?: SfuAccess;
   segmentRelay?: SegmentRelayAccess;
   message?: string;
   messageId?: string;
@@ -1677,12 +1680,15 @@ export function tuneMovieSdp(
 export function tuneVoiceOpus(
   description: RTCSessionDescriptionInit,
 ): RTCSessionDescriptionInit {
-  return tuneMovieOpus(description);
+  return tuneOpusSettings(
+    description,
+    `minptime=10;useinbandfec=1;stereo=1;sprop-stereo=1;maxplaybackrate=${voicePolicy.sampleRate};sprop-maxcapturerate=${voicePolicy.sampleRate};maxaveragebitrate=${voicePolicy.maximumAdaptiveBitrateBps};usedtx=0;cbr=0`,
+  );
 }
 
 export async function tuneVoiceSender(
   sender: RTCRtpSender,
-  maxBitrate = 256_000,
+  maxBitrate = voicePolicy.speechBitrateBps.onePeer,
 ): Promise<void> {
   const parameters = sender.getParameters();
   if (!parameters.encodings?.length) {
@@ -1693,8 +1699,11 @@ export async function tuneVoiceSender(
     networkPriority?: RTCPriorityType;
   };
   const clampedBitrate = Number.isFinite(maxBitrate)
-    ? Math.max(112_000, Math.min(320_000, maxBitrate))
-    : 256_000;
+    ? Math.max(
+        voicePolicy.minimumAdaptiveBitrateBps,
+        Math.min(voicePolicy.maximumAdaptiveBitrateBps, maxBitrate),
+      )
+    : voicePolicy.speechBitrateBps.onePeer;
   encoding.maxBitrate = clampedBitrate;
   encoding.priority = "high";
   encoding.networkPriority = "high";

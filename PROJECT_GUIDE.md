@@ -17,7 +17,8 @@ Android 成员本地解码观看，所有成员还能连麦和发弹幕。
 - Emby：放映端生成共享时间轴的多档 CMAF，通过短期签名 HTTPS 上传；观看端各自
   ABR 下载和缓存。LiveKit/P2P 平时只传播放控制、房间时钟和清单刷新；HTTPS
   数据面连续失败时，指定观看端会临时启用部分可靠 P2P 媒体通道。
-- 连麦语音：优先成员之间直连；复杂 NAT、公司网或代理环境下可以回退到 TURN。
+- 连麦语音：配置 LiveKit 时使用独立、仅允许麦克风发布的语音 SFU；仅在不超过
+  3 人且 SFU 不可用时回退到 P2P/TURN，4–8 人不会退回 full mesh。
 - 频道状态、SDP/ICE、聊天文字：通过 WSS 信令服务器传递。
 - 服务器不保存电影、声音或聊天历史，频道内存状态在最后一人离开后删除。
 
@@ -44,7 +45,11 @@ Android 成员本地解码观看，所有成员还能连麦和发弹幕。
 - `worker/index.ts` 是 Cloudflare/vinext Worker 入口。
 - `.openai/hosting.json` 是该网页的 Sites 项目标识。
 
-这套网页与 `native/` 的频道协议、信令服务器、频道码和窗口音频助手彼此独立。修改 Native 产品时，通常不需要改根目录网页；修改网页也不会自动进入 EXE 或 APK。
+这套网页与 `native/` 的频道协议、信令服务器、频道码和窗口音频助手彼此独立。
+其产品状态固定为 **legacy / experimental / read-only maintenance**：只做必要的
+安全与兼容性维护，不承诺与 Native 功能对齐，也不能作为 Native 的可靠故障兜底。
+修改 Native 产品时，通常不需要改根目录网页；修改网页也不会自动进入 EXE 或 APK。
+Native 架构债务和退出条件见 [`native/ARCHITECTURE_ROADMAP.md`](./native/ARCHITECTURE_ROADMAP.md)。
 
 ## 3. 总体架构
 
@@ -69,7 +74,7 @@ flowchart LR
 
     subgraph Android["Android 客户端（Capacitor）"]
         AR["同一套 Vite 渲染器"]
-        AP["原生插件：沉浸、音频路由、网络、亮度/音量"]
+        AP["原生插件：沉浸、音频路由、网络/功耗、亮度、安全存储"]
         AR <-->|"Capacitor Bridge"| AP
     end
 
@@ -101,7 +106,7 @@ flowchart LR
     LK -->|"逐观看者分层转发"| AR
     WR -.->|"STUN / 必要时 TURN"| ST
     AR -.->|"STUN / 必要时 TURN"| ST
-    WR <-->|"SFU 故障时屏幕 P2P；语音 Mesh"| AR
+    WR <-->|"SFU 故障时：屏幕有界 P2P；≤3 人语音 Mesh"| AR
     EF -->|"多档 CMAF 上传"| SR
     SR -->|"独立 ABR / Range 下载"| WR
     SR -->|"独立 ABR / Range 下载"| AR
@@ -111,11 +116,14 @@ flowchart LR
 
 这里不使用数据库；媒体只进入受身份签名保护、按容量和 LRU 淘汰的临时分片缓存：
 
-- LiveKit 是普通屏幕主链路；一位放映者发布显式 1440p/1080p/720p simulcast
-  与独立 480p 应急轨，SFU 按观看者选择层并用 dynacast 停掉无人订阅的层。
-- Emby 主数据面是 HTTPS CMAF；默认生产 1080p8/720p4，原画和 480p18 按真实观看
-  需求启停。每位观看者自行 ABR、Range 重试与磁盘缓存，单个弱端不会改变全房间质量。
-- 8 人全部连麦时，语音仍采用点对点 Mesh，每个成员最多连接另外 7 人。
+- LiveKit 是普通屏幕主链路；一位放映者只发布一条带 1440p/1080p、720p、480p
+  层的 simulcast publication，层数受设备资源预算约束，SFU 用 dynacast 停掉无人
+  订阅的层，不再维护永久独立的 480p 轨。
+- Emby 主数据面是 HTTPS CMAF；默认只启动一个共享 720p 辅助 rendition，资源和
+  真实观看需求允许时最多再启动一个 original/high/low 档。每位观看者自行 ABR、
+  Range 重试与磁盘缓存，单个弱端不会改变全房间质量。
+- 语音使用独立 LiveKit 房间和 microphone-only token；SFU 不可用时仅允许最多
+  3 人 Mesh，4–8 人会等待 SFU，而不是建立 `O(n²)` 连接。
 - Node 服务器处理频道状态并签发临时 TURN、LiveKit 与 CMAF 凭据，同时保存有界、
   可淘汰的不可变 CMAF 对象；它不持有 Emby 令牌，不解析影片语义。
 - LiveKit 建连、发布或运行失败时，客户端自动启用 P2P；严格 NAT 下可使用腾讯云
@@ -177,9 +185,12 @@ flowchart LR
 1. `native/audio-helper/Program.cs` 根据窗口句柄取得进程 ID。
 2. NAudio 的 Process Loopback 以 `IncludeTargetProcessTree` 方式采集该进程树。
 3. 输出固定为 48 kHz、双声道、16-bit PCM。
-4. PCM 从助手的标准输出流进入 Electron。
-5. Electron 通过 IPC 送给 `native/src/process-audio.ts`。
-6. 渲染器中的 AudioWorklet 把 PCM 变成 `MediaStreamTrack`。
+4. 20 ms 回调只复制到 50 包、丢旧优先的有界 channel；独立 writer 异步写标准输出，
+   不在 MMCSS 回调中写管道或逐包 `Flush()`。
+5. Electron 解析后经带 ACK 的 MessagePort 发送，主进程最多保留 20 包、4 包
+   in-flight；端口不可用时有界丢包并上报，不退回逐包 IPC。
+6. 渲染器把固定 PCM block 转成左右声道后，以 transferable ArrayBuffer 送进
+   AudioWorklet 有界 ring，最终生成 `MediaStreamTrack`。
 7. 该音轨与窗口视频轨一起放入电影 `MediaStream`。
 
 这不会采集系统所有声音，也不会把“同频”自己的连麦声再次混入电影。受 DRM 保护的内容仍可能被 Windows 或播放器阻止。
@@ -187,11 +198,11 @@ flowchart LR
 ### 4.5 建立电影 WebRTC
 
 观看端先使用入房响应中的短期 LiveKit 凭据连接腾讯云 SFU；普通屏幕放映端向同一
-房间发布显式 1440p/1080p/720p simulcast 和 480p 应急轨。观看端通过
+房间发布一条带资源预算层数的 1440p/1080p、720p、480p simulcast。观看端通过
 `RemoteTrackPublication.setVideoQuality()`、`setVideoDimensions()` 与
 `setVideoFPS()` 改变自己的订阅，不要求放映端重建全局流。只有 SFU 建连、发布
-或运行失败时，观看者才发送 `broadcast:watch-ready`，放映端为至多两个故障观看者
-创建有 1080p8/720p4 总预算的 P2P `RTCPeerConnection`。
+或运行失败时，观看者才发送 `broadcast:watch-ready`；放映端只为设备资源预算
+允许的故障观看者创建有界 P2P `RTCPeerConnection`。
 
 可靠性措施包括：
 
@@ -204,7 +215,9 @@ flowchart LR
 - 只有真正解码出第一帧后，观看端才发送 `media:ready`。
 - 信令重连不主动销毁仍健康的 SFU 或 P2P 观看链路；回切 SFU 使用
   make-before-break，稳定 7 秒后才关闭 P2P。
-- ICE 只接受可用的直连候选；虚拟网卡、TUN/VPN 和隐私化 mDNS 候选会按策略处理。
+- ICE direct hint 同时覆盖 IPv4/IPv6 与 Tailscale、ZeroTier、WireGuard 等 overlay；
+  `physicalNetwork`、`defaultRoutedNetwork`、`vpnActive` 和路由依据分别报告。实际
+  地址只在房间媒体协商中使用，结构化诊断仅记录 family/count，不把地址写入日志。
 - 便携版可添加仅针对本程序的 Windows TCP/UDP 入站防火墙规则。
 
 P2P 是普通屏幕故障备用而不是默认分发拓扑；直连失败时允许使用腾讯云 TURN。服务器不设置
@@ -252,11 +265,11 @@ Windows 成员打开“开始放映”后可以在普通屏幕共享与 Emby 高
    媒体。代理的 AbortController 保持到正文结束，正文 15 秒无字节会真正中止，
    Range 请求按预算重试；停止时有界关闭现有连接和空闲连接。
 5. `CmafRelayCoordinator` 生成共享时间轴、约 2 秒 GOP 对齐的多档媒体。默认只启动
-   1080p8/720p4；桌面高速观看端需要时启动 original，持续弱网端需要时启动 480p18，
-   无订阅 30 秒后正常停止可选 FFmpeg 并从服务表删除。再次有需求时使用新的 rendition
+   一个共享 720p 辅助档；资源预算允许且观看端确有需求时，再从 original/high/low
+   中选择最多一个附加档。无订阅 30 秒后正常停止可选 FFmpeg 并从服务表删除。再次有需求时使用新的 rendition
    epoch 从当前播放锚点启动；init 路径按 epoch 隔离，segment 使用跨重启单调递增的
-   全局序号。所有辅助 FFmpeg 都由 `-readrate` 限速；共享上传 token bucket 最多使用
-   测速后剩余上行的 65%。
+   全局序号。DirectPlay/remux 不再使用固定 `-readrate`，而由前向缓存、上传 token、
+   内存与磁盘水位驱动；CPU 本地转码仍采用保守节奏。共享上传最多使用测速后剩余上行的 65%。
 6. 同一 rendition 的 init/segment 严格串行上传，不同 rendition 间最多三路并发。
    清单只公布 `contiguousUploadedSequence` 之前的连续前缀；单片三次短重试失败后进入
    独立的 1/2/4/8/15/30 秒抖动退避 actor，网络恢复不依赖令牌轮换。越过播放保留窗的
@@ -370,22 +383,26 @@ Windows 放映端和观看端都在全屏按钮旁常驻显示“小窗模式”
 
 - 点击画面：显示或隐藏播放器控件。
 - 左侧上下滑：调当前应用窗口亮度。
-- 右侧上下滑：调 `STREAM_MUSIC` 音量。
+- 右侧上下滑：只调本应用的 `<video>/<audio>` 音量，不修改系统 `STREAM_MUSIC`。
 - 全屏：原生锁定传感器横屏并隐藏系统栏，系统栏仍可通过边缘滑动临时唤出。
 
 ## 6. 连麦技术原理与本轮稳定性设计
 
 ### 6.1 语音网络拓扑
 
-语音由 `native/src/voice.ts` 的 `VoiceMesh` 管理：
+语音由 `native/src/voice.ts` 的 `VoiceMesh` 与 `VoiceSfuSession` 协同管理：
 
-- 所有已连麦成员两两建立连接。
-- 初次尝试允许 host/srflx 等直连候选。
-- 连接失败后，如果服务器提供 TURN，则重建为 `relayOnly`。
+- 服务器配置 LiveKit 时，每位成员进入独立的语音 SFU 房间，JWT 只允许发布
+  microphone，不允许 data 或屏幕轨。
+- SFU 不可用且总人数不超过 3 人时，才建立 Mesh；初次允许 host/srflx 等直连
+  候选，失败后若服务器提供 TURN，则重建为 `relayOnly`。
+- 4–8 人从不退回 full mesh；没有可用 SFU 时明确停止/等待恢复。
 - 每条语音协商有独立 `sessionId`。
 - offer 碰撞按 polite/impolite 规则处理，必要时 rollback。
-- Opus 使用 48 kHz 立体声协商、带 FEC、关闭 DTX；纯语音按降噪档位使用
-  224–256 kbps，伴奏场景使用 256–320 kbps。
+- 所有串行设备、采集、协商和 SFU 操作都有 deadline、AbortSignal 与 generation；
+  不可取消的 WebRTC 晚到结果通过关闭旧 PeerConnection/房间代次隔离。
+- Opus 使用 48 kHz、带内 FEC；纯语音目标为 48–64 kbps，伴奏为 72–96 kbps，
+  自适应边界统一为 32–128 kbps。
 
 ### 6.2 麦克风处理链
 
@@ -412,6 +429,8 @@ getUserMedia 麦克风
 - 浏览器自动增益 AGC 默认关闭，靠固定增益、压缩和限幅防爆音。
 - 已移除 100/120 Hz 双陷波和激进的 -18 dB、4:1 压缩，避免振铃、抽吸和底噪抬升。
 - 强力模式才加载本地 DeepFilterNet3 模型；加载或运行失败时回到系统实时通话降噪。
+- 温度、电量、省电/后台状态进入统一资源预算；受限时会释放 DeepFilterNet3，
+  恢复余量后按用户原有“强力消噪”偏好重建。
 - 模型、WASM 和运行时均随应用打包，连不上外网也可使用。
 
 ### 6.3 为什么会出现“刚连上，突然没声音”
@@ -464,7 +483,8 @@ wss://synced.com.cn/signal
 
 阿里云 `wss://47.98.173.139/signal` 是运维手动选择的备用信令。旧的明文
 `ws://47.98.173.139:8787` 会迁移到腾讯云主入口。生产地址必须使用受信任的 WSS；
-Android Manifest 禁止任意明文网络。
+Android Manifest 禁止任意明文网络，自建 RFC1918/LAN 信令在 Android 上也必须提供
+有效 TLS 并使用 `wss://`，不会为整个应用或任意私网地址放开 cleartext。
 
 ### 7.2 公网请求路径
 
@@ -626,7 +646,7 @@ credential = HMAC-SHA1(TURN_SECRET, username)
 | `emby-player.ts` | fMP4 MSE 播放器、有界 Quota recovery、同步纠偏和文本字幕 |
 | `video-enhancement.ts` | WebGL2 视频纹理空间增强、GPU p95/丢帧压力和自动冷却策略 |
 | `room-companion.ts` | 成员列表、连麦控制、设备设置、聊天记录与时间戳 |
-| `voice.ts` | 语音 Mesh、降噪图、协商、统计、设备/播放/断流恢复 |
+| `voice.ts` / `voice-sfu.ts` | 语音 SFU、≤3 人 Mesh 回退、降噪图、generation/timeout、设备/播放恢复 |
 | `rtc.ts` | SignalClient、PeerConnection 工厂、ICE 策略、SDP/Opus 调优、统计读取 |
 | `process-audio.ts` | 把 .NET 助手 PCM 转成电影 Web Audio 音轨 |
 | `deepfilter-noise-suppressor.ts` | DeepFilterNet3 AudioWorklet、本地模型路径和 bypass |
@@ -635,7 +655,7 @@ credential = HMAC-SHA1(TURN_SECRET, username)
 | `capture-resolution.ts` | Windows 高 DPI 逻辑像素到物理捕获尺寸的恢复计算 |
 | `video-presentation.ts` | 黑边检测、稳定采样、智能居中裁剪和真实源尺寸格式化 |
 | `playback-continuity.ts` | 判断信令重连时是否保留现有观看 PeerConnection |
-| `playback-controls.ts` | Android 亮度和媒体音量桥 |
+| `playback-controls.ts` | Android 亮度、前台播放通知；媒体音量保持在应用元素内 |
 | `immersive.ts` | 浏览器 Fullscreen 与 Android 原生沉浸模式统一入口 |
 | `audio-route.ts` | Android AudioRoute Capacitor 插件的 TypeScript 包装 |
 | `native-network.ts` | Android 物理网卡地址和网络变化桥 |
@@ -667,8 +687,8 @@ Electron 保持 `contextIsolation: true`、`nodeIntegration: false`、`sandbox: 
 | `MainActivity.java` | 注册原生插件、硬件加速、保持亮屏、媒体免二次手势 |
 | `AudioRoutePlugin.java` | 通信音频模式、AudioFocus、蓝牙/有线/扬声器选择和设备变化恢复 |
 | `ImmersiveModePlugin.java` | 横屏与系统栏沉浸 |
-| `NetworkBridgePlugin.java` | 识别物理网络和 IPv4，避免把 VPN/TUN 误当局域网 |
-| `PlaybackControlsPlugin.java` | 应用窗口亮度和音乐流音量 |
+| `NetworkBridgePlugin.java` | 同时报 physical/default/VPN/socket path、IPv4/IPv6 与 overlay 隐私属性 |
+| `PlaybackControlsPlugin.java` | 应用窗口亮度、Android 13+ 通知授权和播放前台服务 |
 | `NativeClipboardPlugin.java` | Android 剪贴板，仅写入邀请信息，不回读用户剪贴板 |
 | `AndroidManifest.xml` | 网络、录音、音频设置、蓝牙权限与 `synced://join` 深链 |
 | `network_security_config.xml` | Android 网络安全策略 |
@@ -978,7 +998,7 @@ journalctl -u coturn -f           # 仅腾讯云
 3. `native/src/main.ts`，看应用怎么进入频道。
 4. `native/src/channel-session.ts` 的 DOM 模板、观看/放映和消息处理。
 5. `native/src/rtc.ts`，理解 P2P、候选过滤与统计。
-6. `native/src/voice.ts`，理解独立的语音 Mesh。
+6. `native/src/voice.ts` 与 `native/src/voice-sfu.ts`，理解语音 SFU 和 ≤3 人 Mesh 回退。
 7. `native/server/index.mjs`，沿 `message.type` 逐个看协议。
 8. `native/electron/main.cjs` 和 Android 插件，理解系统能力边界。
 9. 先跑 `npm run check` 和四个核心 smoke，再开始改动。
@@ -996,7 +1016,7 @@ journalctl -u coturn -f           # 仅腾讯云
 | TURN | 直连失败时转发媒体 |
 | WSS | TLS 加密的 WebSocket |
 | P2P | 媒体直接在两台客户端间传输 |
-| Mesh | 每位语音成员与其他成员两两连接 |
+| Mesh | 最多 3 人时，每位语音成员与其他成员两两连接的 SFU 回退 |
 | AEC | Acoustic Echo Cancellation，回声消除 |
 | AGC | Automatic Gain Control，自动增益 |
 | DeepFilterNet3 | 更重的全频段神经降噪模型 |

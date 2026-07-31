@@ -50,6 +50,23 @@ test("does not rewrite a user-provided development server", async () => {
   );
 });
 
+test("Android policy rejects every cleartext signalling endpoint explicitly", async () => {
+  const { normalizeSignalUrl } = await loadModule();
+  assert.throws(
+    () =>
+      normalizeSignalUrl("ws://192.168.1.8:8787", {
+        allowInsecure: false,
+      }),
+    /Android 仅支持加密的 wss:\/\//,
+  );
+  assert.equal(
+    normalizeSignalUrl("wss://192.168.1.8:8787", {
+      allowInsecure: false,
+    }),
+    "wss://192.168.1.8:8787/signal",
+  );
+});
+
 test("rejects signalling URLs that embed credentials", async () => {
   const { normalizeSignalUrl, parseJoinLink } = await loadModule();
   assert.throws(

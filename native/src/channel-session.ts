@@ -65,6 +65,7 @@ import {
   isNativeAndroid,
 } from "./immersive";
 import { ProcessAudioCapture } from "./process-audio";
+import { ResourceBudgetMonitor } from "./resource-monitor";
 import {
   ChannelMusicController,
   channelMusicRailButtonMarkup,
@@ -93,7 +94,6 @@ import {
   getPlaybackControlState,
   setNativePlaybackActive,
   setPlaybackBrightness,
-  setPlaybackVolume,
   type PlaybackControlState,
 } from "./playback-controls";
 import {
@@ -730,6 +730,8 @@ export async function openChannelSession(
     localStorage.getItem("synced:video-enhancement") === "off"
       ? "off"
       : "auto";
+  const resourceBudgetMonitor = new ResourceBudgetMonitor();
+  let resourceBudget = resourceBudgetMonitor.budget;
   const resumeTokenKey = `synced:resume-token:${room}`;
   let resumeToken =
     sessionStorage.getItem(resumeTokenKey) ||
@@ -757,7 +759,7 @@ export async function openChannelSession(
   let playbackControlFrame: number | undefined;
   let playbackControlState: PlaybackControlState = {
     brightness: 0.5,
-    volume: 1,
+    volume: movieVolume,
   };
   let pendingPlaybackControl:
     | { kind: "brightness" | "volume"; value: number }
@@ -1488,6 +1490,31 @@ export async function openChannelSession(
       }
     });
   }
+  resourceBudgetMonitor.addEventListener("change", (event) => {
+    resourceBudget = (
+      event as CustomEvent<typeof resourceBudget>
+    ).detail;
+    reportPlaybackDiagnostic("resource-budget-changed", {
+      pressure: resourceBudget.pressure,
+      reason: resourceBudget.reason,
+      allowGpuEnhancement: resourceBudget.allowGpuEnhancement,
+      allowDeepPrefetch: resourceBudget.allowDeepPrefetch,
+      maxConcurrentProducers: resourceBudget.maxConcurrentProducers,
+      maxSfuLayers: resourceBudget.maxSfuLayers,
+      maxP2pFallbacks: resourceBudget.maxP2pFallbacks,
+    });
+    syncVideoEnhancement();
+    rebalanceScreenP2pFallbackBudgets();
+    updateEmbySegmentRenditionDemand();
+    if (
+      broadcasterId === selfId &&
+      broadcastCapabilities?.mode !== "emby" &&
+      mediaStream
+    ) {
+      void publishBroadcastToSfu().catch(() => undefined);
+    }
+  });
+  void resourceBudgetMonitor.start().catch(() => undefined);
 
   function openDialog(dialog: HTMLDialogElement): void {
     if (dialog.open) return;
@@ -2017,6 +2044,7 @@ export async function openChannelSession(
 
   function applyMovieVolume(value: number, persist = true): void {
     movieVolume = Math.max(0, Math.min(1, Number(value) || 0));
+    playbackControlState.volume = movieVolume;
     if (movieVolume > 0) lastAudibleMovieVolume = movieVolume;
     if (persist) {
       localStorage.setItem("synced:movie-volume", String(movieVolume));
@@ -2363,7 +2391,9 @@ export async function openChannelSession(
     );
     videoEnhancement.setPressure(
       remoteEmbyVisible
-        ? videoEnhancementAdaptivePressure
+        ? resourceBudget.allowGpuEnhancement
+          ? videoEnhancementAdaptivePressure
+          : "render-limited"
         : "healthy",
     );
     videoEnhancement.refresh();
@@ -2537,18 +2567,21 @@ export async function openChannelSession(
       const pending = pendingPlaybackControl;
       pendingPlaybackControl = undefined;
       if (!pending) return;
-      const operation =
-        pending.kind === "brightness"
-          ? setPlaybackBrightness(pending.value)
-          : setPlaybackVolume(pending.value);
+      if (pending.kind === "volume") {
+        applyMovieVolume(pending.value);
+        return;
+      }
+      const operation = setPlaybackBrightness(pending.value);
       void operation
         .then((state) => {
-          playbackControlState = state;
+          playbackControlState = {
+            ...state,
+            volume: movieVolume,
+          };
         })
         .catch(() => {
-          if (pending.kind === "volume" && video) {
-            video.volume = pending.value;
-          }
+          // Brightness remains best effort; playback volume is application
+          // local and was applied synchronously above.
         });
     });
   }
@@ -4883,7 +4916,7 @@ export async function openChannelSession(
       .sort()
       .join(",");
     return tracks
-      ? `screen:${tracks}:${activePreset.width}x${activePreset.height}@${activePreset.frameRate}`
+      ? `screen:${tracks}:${activePreset.width}x${activePreset.height}@${activePreset.frameRate}:layers=${resourceBudget.maxSfuLayers}`
       : "";
   }
 
@@ -5270,6 +5303,7 @@ export async function openChannelSession(
         player,
         signalUrl,
         access: segmentRelayAccess,
+        allowDeepPrefetch: () => resourceBudget.allowDeepPrefetch,
         onTokenExpiring: requestSegmentRelayTokenRefresh,
         onMediaFallbackNeeded: (fallback) => {
           if (!isActive() || embyAbrViewer !== abr || leaving) return;
@@ -5754,6 +5788,7 @@ export async function openChannelSession(
         await sfuSession.publishScreen(expectedStream, {
           maxBitrate: expectedPreset.maxBitrate,
           frameRate: expectedPreset.frameRate,
+          maxLayers: resourceBudget.maxSfuLayers,
           contentMode: screenContentMode,
         });
       }
@@ -6563,7 +6598,23 @@ export async function openChannelSession(
     const screenPeers = [...outboundPeers.entries()].filter(
       ([, peer]) => peer.mode === "screen",
     );
+    const maximumFallbacks = Math.min(
+      MAX_SCREEN_P2P_FALLBACK_VIEWERS,
+      sfuSession.publishing
+        ? resourceBudget.maxP2pFallbacks
+        : Math.max(1, resourceBudget.maxP2pFallbacks),
+    );
     for (const [index, [viewerId, peer]] of screenPeers.entries()) {
+      if (index >= maximumFallbacks) {
+        outboundPeers.delete(viewerId);
+        peer.pc.close();
+        reportPlaybackDiagnostic("p2p-fallback-resource-released", {
+          viewerId,
+          maximumFallbacks,
+          pressure: resourceBudget.pressure,
+        });
+        continue;
+      }
       const budget =
         SCREEN_P2P_FALLBACK_BUDGETS[
           Math.min(index, SCREEN_P2P_FALLBACK_BUDGETS.length - 1)
@@ -6598,18 +6649,24 @@ export async function openChannelSession(
       const existingScreenFallbacks = [...outboundPeers.entries()].filter(
         ([id, peer]) => id !== viewerId && peer.mode === "screen",
       ).length;
-      if (existingScreenFallbacks >= MAX_SCREEN_P2P_FALLBACK_VIEWERS) {
+      const maximumFallbacks = Math.min(
+        MAX_SCREEN_P2P_FALLBACK_VIEWERS,
+        sfuSession.publishing
+          ? resourceBudget.maxP2pFallbacks
+          : Math.max(1, resourceBudget.maxP2pFallbacks),
+      );
+      if (existingScreenFallbacks >= maximumFallbacks) {
         window.roomDesktop?.reportDiagnostic("p2p-fallback-budget-rejected", {
           viewerId,
           activeFallbacks: existingScreenFallbacks,
-          maximumFallbacks: MAX_SCREEN_P2P_FALLBACK_VIEWERS,
+          maximumFallbacks,
           totalBudgetBps: SCREEN_P2P_FALLBACK_BUDGETS.reduce(
             (sum, budget) => sum + budget.bitrate,
             0,
           ),
         });
         notify(
-          `${participants.get(viewerId)?.nickname || "一位观众"}未建立 P2P 备用链路：回退上行预算已满`,
+          `${participants.get(viewerId)?.nickname || "一位观众"}未建立 P2P 备用链路：当前设备资源预算已满`,
           "warn",
         );
         return;
@@ -10566,6 +10623,7 @@ export async function openChannelSession(
       1,
       Math.min(
         3,
+        resourceBudget.maxConcurrentProducers,
         Number(broadcastCapabilities?.maxActiveRenditions) || 3,
       ),
     );
@@ -12651,6 +12709,7 @@ export async function openChannelSession(
   async function leaveSession(): Promise<void> {
     if (leaving) return;
     leaving = true;
+    resourceBudgetMonitor.destroy();
     signalMessageScheduler.close();
     videoEnhancement?.destroy();
     videoEnhancement = undefined;
@@ -13755,7 +13814,7 @@ export async function openChannelSession(
   }
 
   if (nativeAndroid) {
-    void getPlaybackControlState()
+    void getPlaybackControlState(movieVolume)
       .then((state) => {
         playbackControlState = state;
       })

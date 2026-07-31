@@ -38,6 +38,8 @@ test("server-renders the branded entry page and metadata", async () => {
   assert.match(html, /<title>同频｜一键分享，同频观影<\/title>/i);
   assert.match(html, /同频/);
   assert.match(html, /一键分享，同频观影/);
+  assert.match(html, /Legacy \/ Experimental \/ Read-only maintenance/);
+  assert.match(html, /不是 Native 产品/);
   assert.match(html, /https:\/\/synced\.test\/og\.png/);
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape/i);
 });
@@ -57,6 +59,8 @@ test("keeps the VDO wrapper focused and secure by default", async () => {
   assert.match(page, /selfbrowsersurface:\s*"exclude"/);
   assert.match(page, /crypto\.getRandomValues/);
   assert.match(page, /event\.origin !== VDO_ORIGIN/);
+  assert.match(page, /Legacy \/ Experimental \/ Read-only maintenance/);
+  assert.match(page, /不是 Native 产品，也不是其可靠故障兜底/);
   assert.doesNotMatch(page, /dangerouslySetInnerHTML|eval\(/);
 
   assert.match(layout, /generateMetadata/);

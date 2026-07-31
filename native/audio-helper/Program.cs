@@ -6,6 +6,7 @@ using System.Runtime.InteropServices.Marshalling;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Threading.Channels;
 using NAudio.CoreAudioApi;
 using NAudio.CoreAudioApi.Interfaces;
 using NAudio.Wave;
@@ -29,7 +30,19 @@ internal sealed class StatusPayload
     public bool? Visible { get; init; }
     public bool? Foreground { get; init; }
     public bool? Minimized { get; init; }
+    public string? Stage { get; init; }
+    public long? DroppedPackets { get; init; }
+    public int? QueueDepth { get; init; }
+    public int? QueueCapacityPackets { get; init; }
+    public int? BlockDurationMs { get; init; }
 }
+
+internal sealed record AudioPacket(
+    byte[] Pcm,
+    long DevicePosition,
+    long QpcPosition,
+    long Sequence
+);
 
 internal sealed class WindowProcessPayload
 {
@@ -132,6 +145,8 @@ internal static class Program
     private const int BitsPerSample = 16;
     private const ushort AudioPacketVersion = 1;
     private const ushort AudioPacketHeaderBytes = 32;
+    private const int AudioBlockDurationMs = 20;
+    private const int AudioQueueCapacityPackets = 50;
     private static readonly byte[] AudioPacketMagic = "YQAP"u8.ToArray();
     private static readonly long QpcToUnix100Nanoseconds =
         DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 10_000L -
@@ -317,23 +332,38 @@ internal static class Program
                 using var recorder = await new WasapiRecorderBuilder()
                     .WithProcessLoopback(processId, ProcessLoopbackMode.IncludeTargetProcessTree)
                     .WithFormat(new WaveFormat(SampleRate, BitsPerSample, Channels))
-                    .WithBufferLength(20)
+                    .WithBufferLength(AudioBlockDurationMs)
                     .WithMmcssThreadPriority("Audio")
                     .BuildAsync();
 
                 using var output = Console.OpenStandardOutput();
+                var audioQueue = Channel.CreateBounded<AudioPacket>(
+                    new BoundedChannelOptions(AudioQueueCapacityPackets)
+                    {
+                        FullMode = BoundedChannelFullMode.DropOldest,
+                        SingleReader = true,
+                        SingleWriter = true,
+                        AllowSynchronousContinuations = false,
+                    }
+                );
                 var stopped = new TaskCompletionSource(
                     TaskCreationOptions.RunContinuationsAsynchronously
                 );
+                long packetSequence = 0;
                 recorder.DataAvailable += (buffer, _, devicePosition, qpcPosition) =>
                 {
                     if (!buffer.IsEmpty)
                     {
-                        WriteAudioPacket(
-                            output,
-                            buffer,
-                            devicePosition,
-                            qpcPosition
+                        // The MMCSS capture callback only copies one bounded
+                        // block into a fixed-capacity channel. It never
+                        // writes to stdout, waits on a lock, or flushes a pipe.
+                        audioQueue.Writer.TryWrite(
+                            new AudioPacket(
+                                buffer.ToArray(),
+                                devicePosition,
+                                qpcPosition,
+                                Interlocked.Increment(ref packetSequence)
+                            )
                         );
                     }
                 };
@@ -350,6 +380,10 @@ internal static class Program
                 };
 
                 using var cancellation = new CancellationTokenSource();
+                using var writerCancellation =
+                    CancellationTokenSource.CreateLinkedTokenSource(
+                        cancellation.Token
+                    );
                 Console.CancelKeyPress += (_, eventArgs) =>
                 {
                     eventArgs.Cancel = true;
@@ -359,6 +393,11 @@ internal static class Program
                     windowHandle,
                     processId,
                     cancellation.Token
+                );
+                var writer = WriteAudioPacketsAsync(
+                    output,
+                    audioQueue.Reader,
+                    writerCancellation.Token
                 );
 
                 recorder.StartRecording();
@@ -370,6 +409,8 @@ internal static class Program
                     Channels = recorder.WaveFormat.Channels,
                     BitsPerSample = recorder.WaveFormat.BitsPerSample,
                     LatencyMs = recorder.LatencyMilliseconds,
+                    QueueCapacityPackets = AudioQueueCapacityPackets,
+                    BlockDurationMs = AudioBlockDurationMs,
                 });
 
                 var cancelled = Task.Delay(Timeout.Infinite, cancellation.Token);
@@ -377,10 +418,22 @@ internal static class Program
                     stopped.Task,
                     cancelled,
                     windowMonitor,
-                    endpointChanged.Task
+                    endpointChanged.Task,
+                    writer
                 );
                 recorder.StopRecording();
                 await stopped.Task;
+                audioQueue.Writer.TryComplete();
+                try
+                {
+                    await writer.WaitAsync(TimeSpan.FromSeconds(2));
+                }
+                catch (TimeoutException)
+                {
+                    writerCancellation.Cancel();
+                    await writer.WaitAsync(TimeSpan.FromMilliseconds(500))
+                        .ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+                }
                 if (completed == endpointChanged.Task)
                 {
                     throw new InvalidOperationException(
@@ -650,33 +703,99 @@ internal static class Program
         );
     }
 
-    private static void WriteAudioPacket(
+    private static async Task WriteAudioPacketsAsync(
         Stream output,
-        ReadOnlySpan<byte> pcm,
-        long devicePosition,
-        long qpcPosition
+        ChannelReader<AudioPacket> reader,
+        CancellationToken cancellationToken
     )
     {
-        Span<byte> header = stackalloc byte[AudioPacketHeaderBytes];
-        AudioPacketMagic.CopyTo(header);
-        BinaryPrimitives.WriteUInt16LittleEndian(header[4..6], AudioPacketVersion);
-        BinaryPrimitives.WriteUInt16LittleEndian(header[6..8], AudioPacketHeaderBytes);
-        BinaryPrimitives.WriteUInt32LittleEndian(header[8..12], checked((uint)pcm.Length));
-        BinaryPrimitives.WriteUInt32LittleEndian(header[12..16], SampleRate);
+        long expectedSequence = 1;
+        long droppedPackets = 0;
+        long reportedDroppedPackets = 0;
+        var lastOverrunReport = Stopwatch.StartNew();
+        try
+        {
+            await foreach (
+                var packet in reader.ReadAllAsync(cancellationToken)
+            )
+            {
+                if (packet.Sequence > expectedSequence)
+                {
+                    droppedPackets += packet.Sequence - expectedSequence;
+                }
+                expectedSequence = packet.Sequence + 1;
+                await WriteAudioPacketAsync(
+                    output,
+                    packet.Pcm,
+                    packet.DevicePosition,
+                    packet.QpcPosition,
+                    cancellationToken
+                );
+                if (
+                    droppedPackets > reportedDroppedPackets &&
+                    lastOverrunReport.ElapsedMilliseconds >= 1_000
+                )
+                {
+                    reportedDroppedPackets = droppedPackets;
+                    lastOverrunReport.Restart();
+                    WriteStatus(new StatusPayload
+                    {
+                        Type = "overrun",
+                        Stage = "helper-writer",
+                        DroppedPackets = droppedPackets,
+                        QueueDepth = reader.CanCount ? reader.Count : null,
+                        QueueCapacityPackets = AudioQueueCapacityPackets,
+                    });
+                }
+            }
+            if (droppedPackets > reportedDroppedPackets)
+            {
+                WriteStatus(new StatusPayload
+                {
+                    Type = "overrun",
+                    Stage = "helper-writer",
+                    DroppedPackets = droppedPackets,
+                    QueueDepth = reader.CanCount ? reader.Count : null,
+                    QueueCapacityPackets = AudioQueueCapacityPackets,
+                });
+            }
+            await output.FlushAsync(cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            // The process is stopping or stdout stayed blocked after capture
+            // ended. Cancellation must never propagate back to the MMCSS
+            // callback because that callback owns no pipe operation.
+        }
+    }
+
+    private static async Task WriteAudioPacketAsync(
+        Stream output,
+        ReadOnlyMemory<byte> pcm,
+        long devicePosition,
+        long qpcPosition,
+        CancellationToken cancellationToken
+    )
+    {
+        var header = new byte[AudioPacketHeaderBytes];
+        AudioPacketMagic.CopyTo(header, 0);
+        BinaryPrimitives.WriteUInt16LittleEndian(header.AsSpan(4, 2), AudioPacketVersion);
+        BinaryPrimitives.WriteUInt16LittleEndian(header.AsSpan(6, 2), AudioPacketHeaderBytes);
+        BinaryPrimitives.WriteUInt32LittleEndian(header.AsSpan(8, 4), checked((uint)pcm.Length));
+        BinaryPrimitives.WriteUInt32LittleEndian(header.AsSpan(12, 4), SampleRate);
         var safeQpcPosition = qpcPosition > 0
             ? qpcPosition
             : CurrentQpc100Nanoseconds();
         BinaryPrimitives.WriteInt64LittleEndian(
-            header[16..24],
+            header.AsSpan(16, 8),
             checked(safeQpcPosition + QpcToUnix100Nanoseconds)
         );
         BinaryPrimitives.WriteUInt64LittleEndian(
-            header[24..32],
+            header.AsSpan(24, 8),
             checked((ulong)devicePosition)
         );
-        output.Write(header);
-        output.Write(pcm);
-        output.Flush();
+        await output.WriteAsync(header, cancellationToken);
+        await output.WriteAsync(pcm, cancellationToken);
     }
 
     private static int Fail(string message)

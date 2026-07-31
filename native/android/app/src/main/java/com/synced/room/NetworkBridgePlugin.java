@@ -6,6 +6,7 @@ import android.net.LinkAddress;
 import android.net.LinkProperties;
 import android.net.Network;
 import android.net.NetworkCapabilities;
+import android.net.NetworkRequest;
 import android.util.Log;
 
 import com.getcapacitor.JSArray;
@@ -16,14 +17,16 @@ import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
 
 import java.net.Inet4Address;
+import java.net.Inet6Address;
 import java.net.InetAddress;
 import java.net.NetworkInterface;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.LinkedHashSet;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
-import java.util.Set;
+import java.util.Map;
 
 @CapacitorPlugin(name = "NetworkBridge")
 public class NetworkBridgePlugin extends Plugin {
@@ -77,7 +80,10 @@ public class NetworkBridgePlugin extends Plugin {
                     emitNetworkChanged();
                 }
             };
-        manager.registerDefaultNetworkCallback(networkCallback);
+        NetworkRequest request = new NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .build();
+        manager.registerNetworkCallback(request, networkCallback);
     }
 
     private synchronized void emitNetworkChanged() {
@@ -91,78 +97,48 @@ public class NetworkBridgePlugin extends Plugin {
     }
 
     /**
-     * Android reports capability changes for ordinary Wi-Fi RSSI, validation
-     * and metering updates. None of those changes invalidate a WebRTC route.
-     * Only network identity, physical transport, interface or IPv4 changes are
-     * included here, so a harmless callback can never restart movie playback.
+     * The app does not bind its process or sockets to a physical interface.
+     * WebView, WebRTC and HTTPS therefore follow Android's default-routed
+     * network, including an always-on VPN. The signature includes both that
+     * routed path and the best physical underlay so either real change can
+     * trigger media recovery.
      */
     private String buildNetworkSignature() {
-        if (manager == null) return "offline";
-        Network active = bestPhysicalNetwork();
-        if (active == null) return "offline";
-        LinkProperties properties = manager.getLinkProperties(active);
-        NetworkCapabilities capabilities =
-            manager.getNetworkCapabilities(active);
-        List<String> addresses = new ArrayList<>();
-        if (properties != null) {
-            for (LinkAddress linkAddress : properties.getLinkAddresses()) {
-                InetAddress address = linkAddress.getAddress();
-                if (
-                    address instanceof Inet4Address &&
-                    !address.isAnyLocalAddress() &&
-                    !address.isLoopbackAddress() &&
-                    !address.isLinkLocalAddress()
-                ) {
-                    addresses.add(address.getHostAddress());
-                }
-            }
+        if (manager == null || manager.getActiveNetwork() == null) {
+            return "offline";
         }
-        Collections.sort(addresses);
-        String transport = "other";
-        if (capabilities != null) {
-            if (
-                capabilities.hasTransport(
-                    NetworkCapabilities.TRANSPORT_ETHERNET
-                )
-            ) {
-                transport = "ethernet";
-            } else if (
-                capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
-            ) {
-                transport = "wifi";
-            } else if (
-                capabilities.hasTransport(
-                    NetworkCapabilities.TRANSPORT_CELLULAR
-                )
-            ) {
-                transport = "cellular";
-            } else if (
-                capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
-            ) {
-                transport = "vpn";
-            }
-        }
-        String interfaceName =
-            properties == null || properties.getInterfaceName() == null
-                ? ""
-                : properties.getInterfaceName();
+        Network defaultNetwork = manager.getActiveNetwork();
+        Network physicalNetwork = bestPhysicalNetwork();
         return (
-            active.toString() +
-            "|" +
-            transport +
-            "|" +
-            interfaceName +
-            "|" +
+            networkSignature(defaultNetwork) +
+            "|physical=" +
+            networkSignature(physicalNetwork) +
+            "|vpn=" +
+            vpnActive()
+        );
+    }
+
+    private String networkSignature(Network network) {
+        if (network == null) return "none";
+        LinkProperties properties = manager.getLinkProperties(network);
+        NetworkCapabilities capabilities =
+            manager.getNetworkCapabilities(network);
+        List<String> addresses = addressStrings(properties);
+        return (
+            network.toString() +
+            ":" +
+            primaryTransport(capabilities) +
+            ":" +
+            (
+                properties == null || properties.getInterfaceName() == null
+                    ? ""
+                    : properties.getInterfaceName()
+            ) +
+            ":" +
             String.join(",", addresses)
         );
     }
 
-    /**
-     * Use the same physical route as MainActivity instead of Android's
-     * default network, which is often a VPN/TUN interface. Otherwise a proxy
-     * refresh changes the VPN capabilities and looks like a real route
-     * switch even though the WebRTC path never changed.
-     */
     private Network bestPhysicalNetwork() {
         if (manager == null) return null;
         Network active = manager.getActiveNetwork();
@@ -170,40 +146,38 @@ public class NetworkBridgePlugin extends Plugin {
             active == null ? null : manager.getNetworkCapabilities(active);
         if (isUsablePhysical(activeCapabilities)) return active;
 
-        Network validatedCellular = null;
-        Network fallback = null;
-        for (Network network : manager.getAllNetworks()) {
-            NetworkCapabilities capabilities =
-                manager.getNetworkCapabilities(network);
-            if (!isUsablePhysical(capabilities)) continue;
-            if (fallback == null) fallback = network;
-            boolean validated = capabilities.hasCapability(
-                NetworkCapabilities.NET_CAPABILITY_VALIDATED
-            );
-            if (
-                validated &&
-                (
-                    capabilities.hasTransport(
-                        NetworkCapabilities.TRANSPORT_WIFI
-                    ) ||
-                    capabilities.hasTransport(
-                        NetworkCapabilities.TRANSPORT_ETHERNET
-                    )
-                )
-            ) {
+        List<Network> candidates = new ArrayList<>();
+        Collections.addAll(candidates, manager.getAllNetworks());
+        candidates.sort(
+            Comparator.comparingInt(network ->
+                physicalNetworkRank(manager.getNetworkCapabilities(network))
+            )
+        );
+        for (Network network : candidates) {
+            if (isUsablePhysical(manager.getNetworkCapabilities(network))) {
                 return network;
             }
-            if (
-                validatedCellular == null &&
-                validated &&
-                capabilities.hasTransport(
-                    NetworkCapabilities.TRANSPORT_CELLULAR
-                )
-            ) {
-                validatedCellular = network;
-            }
         }
-        return validatedCellular != null ? validatedCellular : fallback;
+        return null;
+    }
+
+    private int physicalNetworkRank(NetworkCapabilities capabilities) {
+        if (capabilities == null) return 100;
+        int rank = capabilities.hasCapability(
+            NetworkCapabilities.NET_CAPABILITY_VALIDATED
+        )
+            ? 0
+            : 10;
+        if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) {
+            return rank;
+        }
+        if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+            return rank + 1;
+        }
+        if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) {
+            return rank + 2;
+        }
+        return rank + 5;
     }
 
     private boolean isUsablePhysical(NetworkCapabilities capabilities) {
@@ -214,6 +188,21 @@ public class NetworkBridgePlugin extends Plugin {
             ) &&
             !capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
         );
+    }
+
+    private boolean vpnActive() {
+        if (manager == null) return false;
+        for (Network network : manager.getAllNetworks()) {
+            NetworkCapabilities capabilities =
+                manager.getNetworkCapabilities(network);
+            if (
+                capabilities != null &&
+                capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+            ) {
+                return true;
+            }
+        }
+        return false;
     }
 
     @Override
@@ -232,58 +221,155 @@ public class NetworkBridgePlugin extends Plugin {
     @PluginMethod
     public void getLocalAddresses(PluginCall call) {
         try {
-            Set<String> addresses = new LinkedHashSet<>();
-            ConnectivityManager manager = this.manager != null
+            ConnectivityManager connectivity = this.manager != null
                 ? this.manager
                 : (ConnectivityManager) getContext().getSystemService(
                     Context.CONNECTIVITY_SERVICE
                 );
-            Network active = bestPhysicalNetwork();
-            LinkProperties properties =
-                active == null ? null : manager.getLinkProperties(active);
-            if (properties != null && !isVirtualInterface(properties.getInterfaceName())) {
-                for (LinkAddress linkAddress : properties.getLinkAddresses()) {
-                    addAddress(addresses, linkAddress.getAddress());
-                }
-            }
+            this.manager = connectivity;
+            Network defaultNetwork = connectivity.getActiveNetwork();
+            Network physicalNetwork = bestPhysicalNetwork();
+            Network boundNetwork = connectivity.getBoundNetworkForProcess();
+            Network socketNetwork =
+                boundNetwork == null ? defaultNetwork : boundNetwork;
 
-            if (addresses.isEmpty()) {
-                for (
-                    NetworkInterface networkInterface :
-                    Collections.list(NetworkInterface.getNetworkInterfaces())
-                ) {
-                    if (
-                        !networkInterface.isUp() ||
-                        networkInterface.isLoopback() ||
-                        isVirtualInterface(networkInterface.getName())
-                    ) {
-                        continue;
-                    }
-                    for (
-                        InetAddress address :
-                        Collections.list(networkInterface.getInetAddresses())
-                    ) {
-                        addAddress(addresses, address);
-                    }
+            Map<String, JSObject> addressRecords = new LinkedHashMap<>();
+            for (Network network : connectivity.getAllNetworks()) {
+                addNetworkAddresses(
+                    addressRecords,
+                    network,
+                    network.equals(defaultNetwork),
+                    network.equals(physicalNetwork)
+                );
+            }
+            addUnmappedInterfaceAddresses(addressRecords);
+
+            List<String> directHints = new ArrayList<>();
+            for (JSObject record : addressRecords.values()) {
+                if (record.optBoolean("directHintEligible", false)) {
+                    directHints.add(record.optString("address", ""));
                 }
             }
+            directHints.removeIf(String::isEmpty);
+            Collections.sort(directHints);
 
             JSArray values = new JSArray();
-            for (String address : addresses) {
-                values.put(address);
+            for (String address : directHints) values.put(address);
+            JSArray allAddresses = new JSArray();
+            for (JSObject record : addressRecords.values()) {
+                allAddresses.put(record);
             }
+
+            JSObject socketPath = new JSObject();
+            socketPath.put(
+                "selection",
+                boundNetwork == null ? "system-default" : "process-bound"
+            );
+            socketPath.put("processBound", boundNetwork != null);
+            // Android does not expose the selected route of arbitrary
+            // WebView/WebRTC sockets here. This is the routing basis, not a
+            // fabricated per-socket observation; selected ICE-pair telemetry
+            // is reported separately by the renderer.
+            socketPath.put("observed", false);
+            socketPath.put(
+                "basis",
+                boundNetwork == null
+                    ? "system-default-route"
+                    : "process-network-binding"
+            );
+            socketPath.put(
+                "network",
+                describeNetwork(socketNetwork, "socket-selected")
+            );
+
             JSObject result = new JSObject();
             result.put("addresses", values);
+            result.put("allAddresses", allAddresses);
+            result.put(
+                "physicalNetwork",
+                describeNetwork(physicalNetwork, "physical")
+            );
+            result.put(
+                "defaultRoutedNetwork",
+                describeNetwork(defaultNetwork, "default-routed")
+            );
+            result.put("vpnActive", vpnActive());
+            result.put("socketSelectedPath", socketPath);
             result.put("signature", buildNetworkSignature());
             call.resolve(result);
         } catch (Exception error) {
-            call.reject("无法读取当前网络地址", error);
+            call.reject("无法读取当前网络地址与路由", error);
         }
     }
 
-    private void addAddress(Set<String> addresses, InetAddress address) {
+    private void addNetworkAddresses(
+        Map<String, JSObject> records,
+        Network network,
+        boolean isDefault,
+        boolean isPhysical
+    ) {
+        LinkProperties properties = manager.getLinkProperties(network);
+        NetworkCapabilities capabilities =
+            manager.getNetworkCapabilities(network);
+        if (properties == null) return;
+        String interfaceName = properties.getInterfaceName();
+        boolean tunnel =
+            (
+                capabilities != null &&
+                capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+            ) ||
+            isVirtualInterface(interfaceName);
+        for (LinkAddress linkAddress : properties.getLinkAddresses()) {
+            addAddressRecord(
+                records,
+                linkAddress.getAddress(),
+                interfaceName,
+                network.toString(),
+                isDefault,
+                isPhysical,
+                tunnel
+            );
+        }
+    }
+
+    private void addUnmappedInterfaceAddresses(
+        Map<String, JSObject> records
+    ) throws Exception {
+        for (
+            NetworkInterface networkInterface :
+            Collections.list(NetworkInterface.getNetworkInterfaces())
+        ) {
+            if (!networkInterface.isUp() || networkInterface.isLoopback()) {
+                continue;
+            }
+            for (
+                InetAddress address :
+                Collections.list(networkInterface.getInetAddresses())
+            ) {
+                addAddressRecord(
+                    records,
+                    address,
+                    networkInterface.getName(),
+                    "",
+                    false,
+                    false,
+                    isVirtualInterface(networkInterface.getName())
+                );
+            }
+        }
+    }
+
+    private void addAddressRecord(
+        Map<String, JSObject> records,
+        InetAddress address,
+        String interfaceName,
+        String networkId,
+        boolean isDefault,
+        boolean isPhysical,
+        boolean tunnel
+    ) {
         if (
-            !(address instanceof Inet4Address) ||
+            address == null ||
             address.isAnyLocalAddress() ||
             address.isLoopbackAddress() ||
             address.isLinkLocalAddress() ||
@@ -291,16 +377,135 @@ public class NetworkBridgePlugin extends Plugin {
         ) {
             return;
         }
-        String value = address.getHostAddress();
-        if (
-            value == null ||
-            value.startsWith("169.254.") ||
-            value.startsWith("198.18.") ||
-            value.startsWith("198.19.")
-        ) {
-            return;
+        String value = normalizedAddress(address);
+        if (value.isEmpty()) return;
+        String key = (interfaceName == null ? "" : interfaceName) + "|" + value;
+        boolean privateAddress = isPrivateAddress(address, value);
+        JSObject record = new JSObject();
+        record.put("address", value);
+        record.put(
+            "family",
+            address instanceof Inet6Address ? "ipv6" : "ipv4"
+        );
+        record.put("interfaceName", interfaceName == null ? "" : interfaceName);
+        record.put("networkId", networkId);
+        record.put("defaultRouted", isDefault);
+        record.put("physical", isPhysical);
+        record.put("tunnel", tunnel);
+        record.put("private", privateAddress);
+        record.put("privacySensitive", !privateAddress);
+        record.put("directHintEligible", true);
+        // Overlay networks are not discarded: their RFC1918, CGNAT or ULA
+        // address may be the room's best direct route. Globally routable host
+        // addresses remain visible to diagnostics but require a future,
+        // explicit disclosure grant before being advertised as a direct hint.
+        record.put("publishable", privateAddress);
+        records.put(key, record);
+    }
+
+    private JSObject describeNetwork(Network network, String role) {
+        if (network == null || manager == null) return null;
+        LinkProperties properties = manager.getLinkProperties(network);
+        NetworkCapabilities capabilities =
+            manager.getNetworkCapabilities(network);
+        JSObject result = new JSObject();
+        result.put("id", network.toString());
+        result.put("role", role);
+        result.put("transport", primaryTransport(capabilities));
+        result.put(
+            "interfaceName",
+            properties == null || properties.getInterfaceName() == null
+                ? ""
+                : properties.getInterfaceName()
+        );
+        result.put(
+            "vpn",
+            capabilities != null &&
+                capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+        );
+        result.put(
+            "validated",
+            capabilities != null &&
+                capabilities.hasCapability(
+                    NetworkCapabilities.NET_CAPABILITY_VALIDATED
+                )
+        );
+        result.put(
+            "metered",
+            capabilities == null ||
+                !capabilities.hasCapability(
+                    NetworkCapabilities.NET_CAPABILITY_NOT_METERED
+                )
+        );
+        JSArray addresses = new JSArray();
+        for (String address : addressStrings(properties)) {
+            addresses.put(address);
         }
-        addresses.add(value);
+        result.put("addresses", addresses);
+        return result;
+    }
+
+    private List<String> addressStrings(LinkProperties properties) {
+        List<String> addresses = new ArrayList<>();
+        if (properties == null) return addresses;
+        for (LinkAddress linkAddress : properties.getLinkAddresses()) {
+            InetAddress address = linkAddress.getAddress();
+            if (
+                address == null ||
+                address.isAnyLocalAddress() ||
+                address.isLoopbackAddress() ||
+                address.isLinkLocalAddress() ||
+                address.isMulticastAddress()
+            ) {
+                continue;
+            }
+            addresses.add(normalizedAddress(address));
+        }
+        addresses.removeIf(String::isEmpty);
+        Collections.sort(addresses);
+        return addresses;
+    }
+
+    private String normalizedAddress(InetAddress address) {
+        String value = address.getHostAddress();
+        if (value == null) return "";
+        int zone = value.indexOf('%');
+        return zone >= 0 ? value.substring(0, zone) : value;
+    }
+
+    private boolean isPrivateAddress(InetAddress address, String value) {
+        if (address instanceof Inet4Address) {
+            return (
+                value.startsWith("10.") ||
+                value.startsWith("192.168.") ||
+                value.matches("^172\\.(1[6-9]|2\\d|3[01])\\..*") ||
+                value.matches("^100\\.(6[4-9]|[789]\\d|1[01]\\d|12[0-7])\\..*") ||
+                value.startsWith("198.18.") ||
+                value.startsWith("198.19.")
+            );
+        }
+        byte[] bytes = address.getAddress();
+        return bytes.length == 16 && (bytes[0] & 0xFE) == 0xFC;
+    }
+
+    private String primaryTransport(NetworkCapabilities capabilities) {
+        if (capabilities == null) return "unknown";
+        if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
+            return "vpn";
+        }
+        if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) {
+            return "ethernet";
+        }
+        if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+            return "wifi";
+        }
+        if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) {
+            return "cellular";
+        }
+        if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_BLUETOOTH)) {
+            return "bluetooth";
+        }
+        return "other";
     }
 
     private boolean isVirtualInterface(String name) {

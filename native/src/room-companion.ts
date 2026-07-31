@@ -1207,6 +1207,10 @@ export class RoomCompanion {
       );
     }
     if (quality) {
+      const transportLabel =
+        state.transport === "sfu"
+          ? "语音 SFU"
+          : "≤3 人直连/中继";
       const suppressionLabel =
         state.noiseProcessorName === "DeepFilterNet3"
           ? "强力消噪 · DeepFilterNet3 深度滤波"
@@ -1220,10 +1224,10 @@ export class RoomCompanion {
       quality.hidden = !state.active;
       quality.textContent = state.active
         ? state.listeningOnly
-          ? `正在收听共享伴奏 · 无需麦克风权限 · ${state.connectedPeers ? `已连通 ${state.connectedPeers} 位好友` : "正在建立音频连接"}`
+          ? `正在收听共享伴奏 · 无需麦克风权限 · ${transportLabel} · ${state.connectedPeers ? `已连通 ${state.connectedPeers} 位好友` : "正在建立音频连接"}`
           : `${state.connectedPeers ? `已连通 ${state.connectedPeers} 位好友` : "等待好友加入连麦"} · ${
               suppressionLabel
-            } · ${state.relayedPeers ? `${state.relayedPeers} 路服务器中继` : "自动直连/中继"} · ${state.echoCancellation ? "AEC 回声消除" : "建议佩戴耳机"} · ${state.autoGainControl ? "设备强制 AGC（已二次限幅）" : "固定输入余量 + 防爆音限幅"} · Opus 48 kHz · ${Math.round(state.bitrate / 1_000)} kbps`
+            } · ${state.relayedPeers ? `${state.relayedPeers} 路服务器中继` : transportLabel} · ${state.echoCancellation ? "AEC 回声消除" : "建议佩戴耳机"} · ${state.autoGainControl ? "设备强制 AGC（已二次限幅）" : "固定输入余量 + 防爆音限幅"} · Opus 48 kHz · ${Math.round(state.bitrate / 1_000)} kbps`
         : "";
     }
     if (

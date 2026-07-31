@@ -178,7 +178,19 @@ export const HOME_SIGNAL_URL = `wss://${HOME_SIGNAL_HOST}/signal`;
 export const STANDBY_SIGNAL_HOST = "47.98.173.139";
 export const STANDBY_SIGNAL_URL = `wss://${STANDBY_SIGNAL_HOST}/signal`;
 
-export function normalizeSignalUrl(input: string): string {
+export interface SignalUrlPolicy {
+  /**
+   * Browser/Electron development may opt into a local ws:// endpoint.
+   * Android must leave this false because its Network Security Config rejects
+   * all cleartext sockets.
+   */
+  allowInsecure?: boolean;
+}
+
+export function normalizeSignalUrl(
+  input: string,
+  policy: SignalUrlPolicy = { allowInsecure: true },
+): string {
   const value = input.trim();
   const url = new URL(value);
   if (url.protocol !== "ws:" && url.protocol !== "wss:") {
@@ -201,6 +213,11 @@ export function normalizeSignalUrl(input: string): string {
   ) {
     url.protocol = "wss:";
     url.port = "";
+  }
+  if (url.protocol === "ws:" && policy.allowInsecure === false) {
+    throw new Error(
+      "Android 仅支持加密的 wss:// 信令服务器；请为局域网服务配置 TLS",
+    );
   }
   if (url.pathname === "/") {
     url.pathname = "/signal";

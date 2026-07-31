@@ -1160,6 +1160,7 @@ export class EmbyAbrSegmentClient {
       access: SegmentRelayAccess;
       fetchImpl?: typeof fetch;
       cache?: SegmentCacheLike;
+      allowDeepPrefetch?: () => boolean;
       onTokenExpiring?: () => void;
       onDiagnostic?: (diagnostics: EmbyAbrDiagnostics) => void;
       onMediaFallbackNeeded?: (detail: {
@@ -2207,6 +2208,7 @@ export class EmbyAbrSegmentClient {
       this.options.player.bufferedAhead >= 10 &&
       this.throughputBps >= rendition.bitrate * 1.2;
     const prefetchAllowed =
+      this.options.allowDeepPrefetch?.() !== false &&
       performance.now() - this.lastRebufferAt >= 20_000 &&
       this.throughputBps >= rendition.bitrate * 1.5 &&
       this.connectionAllowsPrefetch();

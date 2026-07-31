@@ -15,6 +15,8 @@ public class MainActivity extends BridgeActivity {
         registerPlugin(NetworkBridgePlugin.class);
         registerPlugin(NativeClipboardPlugin.class);
         registerPlugin(PlaybackControlsPlugin.class);
+        registerPlugin(DeviceResourcePlugin.class);
+        registerPlugin(SecureCredentialsPlugin.class);
         // Keep WebSocket and TURN traffic on Android's selected default
         // network. Binding the whole process to Wi-Fi bypassed global VPNs
         // and black-holed the app when "block connections without VPN" was
@@ -25,7 +27,7 @@ public class MainActivity extends BridgeActivity {
         bridge.getWebView().getSettings().setMediaPlaybackRequiresUserGesture(false);
         bridge
             .getWebView()
-            .setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false);
+            .setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_BOUND, true);
         WebView.setWebContentsDebuggingEnabled(
             (getApplicationInfo().flags & ApplicationInfo.FLAG_DEBUGGABLE) != 0
         );
