@@ -15,10 +15,9 @@ export interface SfuScreenSubscriptionTarget {
 }
 
 /**
- * Resolves a viewer-local LiveKit subscription request. A 1440p source maps
- * to high/medium/low at 1440p/1080p/720p, while 480p uses the separately
- * published emergency track so it remains available even if simulcast only
- * exposes three encodings.
+ * Resolves a viewer-local LiveKit subscription request. Sources above 1080p
+ * map to high/medium/low at source/1080p/720p. Lower sources keep their own
+ * source/720p/480p ladder where those encodings are available.
  */
 export function resolveSfuScreenSubscription(
   preference: SfuScreenSubscriptionPreference,

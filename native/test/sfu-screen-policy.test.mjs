@@ -129,18 +129,150 @@ test("SFU emergency publication requires verified 480p track settings", async ()
   );
 });
 
-test("SFU publication constraints align non-standard source rasters", async () => {
+test("SFU publication constraints preserve 4K and align non-standard source rasters", async () => {
   const { safeSfuScreenDimensions } = await loadModule("src/sfu.ts");
   const target = safeSfuScreenDimensions(3_618, 2_160);
   assert.equal(target.width % 16, 0);
   assert.equal(target.height % 2, 0);
-  assert.ok(target.width <= 2_560);
-  assert.ok(target.height <= 1_440);
+  assert.ok(target.width <= 3_618);
+  assert.ok(target.height <= 2_160);
   assert.ok(Math.abs(target.width / target.height - 3_618 / 2_160) < 0.01);
+  assert.deepEqual(safeSfuScreenDimensions(3_840, 2_160), {
+    width: 3_840,
+    height: 2_160,
+  });
+  assert.deepEqual(
+    safeSfuScreenDimensions(3_840, 2_160, 1_920, 1_080),
+    { width: 1_920, height: 1_080 },
+  );
   assert.deepEqual(safeSfuScreenDimensions(2_560, 1_440), {
     width: 2_560,
     height: 1_440,
   });
+});
+
+test("4K SFU viewers request the full high simulcast layer", async () => {
+  const { resolveSfuScreenSubscription } = await loadModule(
+    "src/sfu-screen-policy.ts",
+  );
+  assert.deepEqual(
+    resolveSfuScreenSubscription({
+      sourceWidth: 3_840,
+      sourceHeight: 2_160,
+      width: 3_840,
+      height: 2_160,
+      frameRate: 30,
+    }),
+    {
+      width: 3_840,
+      height: 2_160,
+      frameRate: 30,
+      quality: "high",
+      emergency: false,
+    },
+  );
+  assert.deepEqual(
+    resolveSfuScreenSubscription({
+      sourceWidth: 3_840,
+      sourceHeight: 2_160,
+      height: 1_080,
+    }),
+    {
+      width: 1_920,
+      height: 1_080,
+      frameRate: 30,
+      quality: "medium",
+      emergency: false,
+    },
+  );
+  assert.deepEqual(
+    resolveSfuScreenSubscription({
+      sourceWidth: 3_840,
+      sourceHeight: 2_160,
+      height: 720,
+    }),
+    {
+      width: 1_280,
+      height: 720,
+      frameRate: 30,
+      quality: "low",
+      emergency: false,
+    },
+  );
+});
+
+test("SFU data-track writes do not release app backpressure before RTC flush", async () => {
+  const { pushAndFlushSfuDataTrack, SfuDataTrackWriteGate } =
+    await loadModule("src/sfu.ts");
+  const calls = [];
+  const track = {
+    async tryPush(frame) {
+      calls.push(["push", frame.payload.byteLength]);
+    },
+    async flush() {
+      calls.push(["flush"]);
+    },
+  };
+  await pushAndFlushSfuDataTrack(
+    track,
+    new Uint8Array(1_024),
+    new AbortController().signal,
+  );
+  assert.deepEqual(calls, [["push", 1_024], ["flush"]]);
+
+  const cancelled = new AbortController();
+  cancelled.abort();
+  await assert.rejects(
+    pushAndFlushSfuDataTrack(
+      track,
+      new Uint8Array(1),
+      cancelled.signal,
+    ),
+    (error) => error?.name === "AbortError",
+  );
+
+  const serializedCalls = [];
+  let releaseFirstFlush;
+  const firstTrack = {
+    async tryPush() {
+      serializedCalls.push("first-push");
+    },
+    flush() {
+      serializedCalls.push("first-flush");
+      return new Promise((resolve) => {
+        releaseFirstFlush = resolve;
+      });
+    },
+  };
+  const secondTrack = {
+    async tryPush() {
+      serializedCalls.push("second-push");
+    },
+    async flush() {
+      serializedCalls.push("second-flush");
+    },
+  };
+  const gate = new SfuDataTrackWriteGate();
+  const firstWrite = gate.write(
+    firstTrack,
+    new Uint8Array(1),
+    new AbortController().signal,
+  );
+  const secondWrite = gate.write(
+    secondTrack,
+    new Uint8Array(1),
+    new AbortController().signal,
+  );
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(serializedCalls, ["first-push", "first-flush"]);
+  releaseFirstFlush();
+  await Promise.all([firstWrite, secondWrite]);
+  assert.deepEqual(serializedCalls, [
+    "first-push",
+    "first-flush",
+    "second-push",
+    "second-flush",
+  ]);
 });
 
 test("one weak viewer degrades within two seconds without changing peers", async () => {

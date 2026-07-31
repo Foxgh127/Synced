@@ -65,6 +65,8 @@ export interface SfuAccess {
 }
 
 export interface SfuPublishPreset {
+  width?: number;
+  height?: number;
   maxBitrate: number;
   frameRate: number;
   maxLayers?: number;
@@ -74,13 +76,23 @@ export interface SfuPublishPreset {
 export function safeSfuScreenDimensions(
   sourceWidthInput: number,
   sourceHeightInput: number,
+  maximumWidthInput = sourceWidthInput,
+  maximumHeightInput = sourceHeightInput,
 ): { width: number; height: number } {
-  const sourceWidth = Math.max(16, Math.round(sourceWidthInput || 2_560));
-  const sourceHeight = Math.max(2, Math.round(sourceHeightInput || 1_440));
+  const sourceWidth = Math.max(16, Math.round(sourceWidthInput || 3_840));
+  const sourceHeight = Math.max(2, Math.round(sourceHeightInput || 2_160));
+  const maximumWidth = Math.max(
+    16,
+    Math.round(maximumWidthInput || sourceWidth),
+  );
+  const maximumHeight = Math.max(
+    2,
+    Math.round(maximumHeightInput || sourceHeight),
+  );
   const sourceScale = Math.min(
     1,
-    2_560 / sourceWidth,
-    1_440 / sourceHeight,
+    maximumWidth / sourceWidth,
+    maximumHeight / sourceHeight,
   );
   const requestedHeight = Math.max(
     2,
@@ -92,8 +104,8 @@ export function safeSfuScreenDimensions(
     requestedHeight,
   );
   return {
-    width: safeTarget?.width ?? Math.min(2_560, sourceWidth),
-    height: safeTarget?.height ?? Math.min(1_440, sourceHeight),
+    width: safeTarget?.width ?? Math.min(maximumWidth, sourceWidth),
+    height: safeTarget?.height ?? Math.min(maximumHeight, sourceHeight),
   };
 }
 
@@ -104,11 +116,19 @@ async function preparePrimaryScreenTrack(
   track.contentHint =
     preset.contentMode === "motion" ? "motion" : "detail";
   const settings = track.getSettings();
-  const sourceWidth = Math.max(1, Number(settings.width) || 2_560);
-  const sourceHeight = Math.max(1, Number(settings.height) || 1_440);
+  const sourceWidth = Math.max(
+    1,
+    Number(settings.width) || preset.width || 2_560,
+  );
+  const sourceHeight = Math.max(
+    1,
+    Number(settings.height) || preset.height || 1_440,
+  );
   const safeDimensions = safeSfuScreenDimensions(
     sourceWidth,
     sourceHeight,
+    preset.width || sourceWidth,
+    preset.height || sourceHeight,
   );
   await track.applyConstraints({
     width: {
@@ -133,8 +153,8 @@ async function preparePrimaryScreenTrack(
     actualHeight,
   );
   if (
-    actualWidth > 2_560 ||
-    actualHeight > 1_440 ||
+    actualWidth > safeDimensions.width ||
+    actualHeight > safeDimensions.height ||
     Number(actual.frameRate) > Math.min(30, preset.frameRate) + 0.5 ||
     !verifiedTarget ||
     verifiedTarget.width !== actualWidth ||
@@ -145,6 +165,46 @@ async function preparePrimaryScreenTrack(
     );
   }
   return actual;
+}
+
+/**
+ * A LiveKit data-track push only packetizes and schedules a frame. Waiting for
+ * flush is what makes the promise represent the actual RTC data-channel send,
+ * so the synthetic RTCDataChannel exposes honest bufferedAmount pressure to
+ * the CMAF sender instead of accepting an entire startup cache at once.
+ */
+export async function pushAndFlushSfuDataTrack(
+  track: Pick<LocalDataTrack, "tryPush" | "flush">,
+  payload: Uint8Array<ArrayBuffer>,
+  signal: AbortSignal,
+): Promise<void> {
+  if (signal.aborted) {
+    throw new DOMException("SFU data writer was cancelled", "AbortError");
+  }
+  await track.tryPush({ payload });
+  await track.flush();
+  if (signal.aborted) {
+    throw new DOMException("SFU data writer was cancelled", "AbortError");
+  }
+}
+
+export class SfuDataTrackWriteGate {
+  private tail: Promise<void> = Promise.resolve();
+
+  write(
+    track: Pick<LocalDataTrack, "tryPush" | "flush">,
+    payload: Uint8Array<ArrayBuffer>,
+    signal: AbortSignal,
+  ): Promise<void> {
+    // LiveKit 2.21 reports flush-state changes through one room-level manager.
+    // Keep the media and control publications mutually exclusive so a control
+    // packet cannot release a media flush while its packet is still in flight.
+    const operation = this.tail.then(() =>
+      pushAndFlushSfuDataTrack(track, payload, signal),
+    );
+    this.tail = operation.catch(() => undefined);
+    return operation;
+  }
 }
 
 export interface SfuScreenReceiverStats {
@@ -768,13 +828,8 @@ export class SfuSession {
       const candidateLayers =
         sourceHeight > 1_080
           ? [
-              new VideoPreset(
-                EMERGENCY_VIDEO_WIDTH,
-                EMERGENCY_VIDEO_HEIGHT,
-                2_200_000,
-                24,
-              ),
               new VideoPreset(1_280, 720, 5_000_000, 30),
+              new VideoPreset(1_920, 1_080, 10_000_000, 30),
             ]
           : sourceHeight > 720
             ? [
@@ -817,12 +872,11 @@ export class SfuSession {
                 maxBitrate: Math.max(500_000, preset.maxBitrate),
                 maxFramerate: Math.max(1, Math.min(30, preset.frameRate)),
               },
-              degradationPreference:
-                preset.contentMode === "motion"
-                  ? ("maintain-framerate" as const)
-                  : preset.contentMode === "detail"
-                    ? ("maintain-resolution" as const)
-                    : ("balanced" as const),
+              // The selected raster is authoritative. Congestion control may
+              // reduce encoded bits or delay frames, but it must not silently
+              // substitute a lower spatial layer for a user-selected 2K/4K
+              // screen publication.
+              degradationPreference: "maintain-resolution" as const,
             }
           : {
               forceStereo: true,
@@ -951,6 +1005,7 @@ export class SfuSession {
       throw new DOMException("SFU publication was replaced", "AbortError");
     }
     this.localControlTrack = controlTrack;
+    const writeGate = new SfuDataTrackWriteGate();
     const fatal = (error: unknown) => {
       this.options.onDiagnostic?.("sfu-data-track-failed", {
         message: error instanceof Error ? error.message : String(error),
@@ -961,19 +1016,7 @@ export class SfuSession {
       SFU_EMBY_MEDIA_TRACK,
       mediaTrack
         ? async (payload, signal) => {
-            if (signal.aborted) {
-              throw new DOMException(
-                "SFU media writer was cancelled",
-                "AbortError",
-              );
-            }
-            await mediaTrack!.tryPush({ payload });
-            if (signal.aborted) {
-              throw new DOMException(
-                "SFU media writer was cancelled",
-                "AbortError",
-              );
-            }
+            await writeGate.write(mediaTrack!, payload, signal);
           }
         : undefined,
       fatal,
@@ -984,19 +1027,7 @@ export class SfuSession {
     const controlChannel = new SfuRtcDataChannel(
       SFU_EMBY_CONTROL_TRACK,
       async (payload, signal) => {
-        if (signal.aborted) {
-          throw new DOMException(
-            "SFU control writer was cancelled",
-            "AbortError",
-          );
-        }
-        await controlTrack.tryPush({ payload });
-        if (signal.aborted) {
-          throw new DOMException(
-            "SFU control writer was cancelled",
-            "AbortError",
-          );
-        }
+        await writeGate.write(controlTrack, payload, signal);
       },
       fatal,
       () => {

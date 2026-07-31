@@ -121,3 +121,24 @@ test("boosted playback never drives the limiter above 1.5x gain", async () => {
   assert.equal(boostedPlaybackGain(1.25), 1.25);
   assert.equal(boostedPlaybackGain(2), 1.5);
 });
+
+test("system playback loopback inputs are rejected from the voice microphone path", async () => {
+  const { isSystemAudioLoopbackInput } = await loadModule();
+
+  for (const label of [
+    "Stereo Mix (Realtek(R) Audio)",
+    "立体声混音 (Realtek High Definition Audio)",
+    "What U Hear",
+    "Wave Out Mix",
+    "System Loopback",
+    "系统回环",
+    "VB-Audio Virtual Cable Output",
+    "VoiceMeeter Output",
+    "OBS Virtual Audio",
+    "Remote Audio",
+  ]) {
+    assert.equal(isSystemAudioLoopbackInput(label), true, label);
+  }
+  assert.equal(isSystemAudioLoopbackInput("Microphone Array (Intel Smart Sound)"), false);
+  assert.equal(isSystemAudioLoopbackInput("麦克风 (USB Audio Device)"), false);
+});

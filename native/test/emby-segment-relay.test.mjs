@@ -274,6 +274,51 @@ test("ABR downgrades immediately but upgrades one rung after 20 seconds and 1.5x
   );
 });
 
+test("an explicit viewer resolution stays locked even when throughput telemetry is low", async () => {
+  const { selectEmbyAbrRendition } = await loadModule();
+  const renditions = [
+    rendition("480p18", 480, 1_800_000),
+    rendition("720p4", 720, 4_000_000),
+    rendition("1080p8", 1080, 8_000_000),
+    rendition("1440p18", 1440, 18_000_000),
+  ];
+
+  assert.equal(
+    selectEmbyAbrRendition(renditions, {
+      throughputBps: 900_000,
+      preferredHeight: 1080,
+      currentId: "480p18",
+      bufferAheadSeconds: 0.5,
+      stableForMs: 0,
+      upgradeHoldRemainingMs: 60_000,
+      lockPreferredHeight: true,
+    }).id,
+    "1080p8",
+  );
+});
+
+test("an explicit original selection chooses the original rendition without an ABR gate", async () => {
+  const { selectEmbyAbrRendition } = await loadModule();
+  const renditions = [
+    rendition("480p18", 480, 1_800_000),
+    rendition("1080p8", 1080, 8_000_000),
+    rendition("original", 2160, 60_000_000),
+  ];
+
+  assert.equal(
+    selectEmbyAbrRendition(renditions, {
+      throughputBps: 500_000,
+      currentId: "480p18",
+      bufferAheadSeconds: 0,
+      stableForMs: 0,
+      upgradeHoldRemainingMs: 60_000,
+      lockPreferredHeight: true,
+      preferOriginal: true,
+    }).id,
+    "original",
+  );
+});
+
 test("original rendition requires both a 20 second buffer and 1.5x measured throughput", async () => {
   const { selectEmbyAbrRendition } = await loadModule();
   const renditions = [

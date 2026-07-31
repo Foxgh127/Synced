@@ -442,6 +442,28 @@ function recentHomeMarkup(): string {
     .join("");
 }
 
+function mobileRecentJoinMarkup(): string {
+  const recent = getRecentChannels().slice(0, 4);
+  if (!recent.length) return "";
+  return recent
+    .map(
+      (channel) => `
+        <button class="mobile-recent-join-item" type="button"
+                data-mobile-recent-room="${escapeHtml(channel.room)}"
+                data-mobile-recent-signal="${escapeHtml(channel.signalUrl)}"
+                aria-label="继续加入 ${escapeHtml(channel.name)}，频道 ${escapeHtml(displayRoomCode(channel.room))}">
+          <span class="mobile-recent-avatar" aria-hidden="true">${escapeHtml(channelInitial(channel.name))}</span>
+          <span class="mobile-recent-copy">
+            <strong>${escapeHtml(channel.name)}</strong>
+            <small><span class="tnum">${escapeHtml(displayRoomCode(channel.room))}</span> · ${escapeHtml(formatLastJoined(channel.lastJoinedAt))}</small>
+          </span>
+          <i data-lucide="chevron-right" aria-hidden="true"></i>
+        </button>
+      `,
+    )
+    .join("");
+}
+
 function railMarkup(): string {
   return `
     <aside class="channel-rail" aria-label="主导航">
@@ -1098,6 +1120,7 @@ async function renderViewer(options: ViewerOptions = {}): Promise<void> {
   );
   let nickname = getNickname();
   let joinAbortController: AbortController | undefined;
+  const mobileRecentChannels = desktop ? "" : mobileRecentJoinMarkup();
 
   const querySignal = new URLSearchParams(location.search).get("signal");
   if (querySignal) {
@@ -1123,6 +1146,14 @@ async function renderViewer(options: ViewerOptions = {}): Promise<void> {
             <h1>加入朋友的频道</h1>
             <p>输入 8 位频道码、粘贴邀请链接，或从最近频道继续。</p>
           </div>
+          ${
+            mobileRecentChannels
+              ? `<section class="mobile-recent-join" aria-labelledby="mobile-recent-heading">
+                   <header><h2 id="mobile-recent-heading">最近加入</h2><small>仅保存在这台设备</small></header>
+                   <div class="mobile-recent-join-list">${mobileRecentChannels}</div>
+                 </section>`
+              : ""
+          }
           <form id="join-channel-form" class="join-card join-form material-card" novalidate>
             <div class="room-code-wrap">
             <label class="field">
@@ -1143,7 +1174,7 @@ async function renderViewer(options: ViewerOptions = {}): Promise<void> {
                   : ""
               }
               ${
-                getRecentChannels().length
+                desktop && getRecentChannels().length
                   ? `<label class="field recent-select"><span>最近频道</span><select id="recent-room-select"><option value="">选择最近频道</option>${getRecentChannels()
                       .map(
                         (channel) =>
@@ -1232,6 +1263,20 @@ async function renderViewer(options: ViewerOptions = {}): Promise<void> {
           document.querySelector<HTMLInputElement>("#viewer-signal-url");
         if (input) input.value = signalUrl;
       }
+    });
+  document
+    .querySelectorAll<HTMLButtonElement>("[data-mobile-recent-room]")
+    .forEach((button) => {
+      button.addEventListener("click", () => {
+        applyInvitationText(button.dataset.mobileRecentRoom || "");
+        if (button.dataset.mobileRecentSignal) {
+          signalUrl = button.dataset.mobileRecentSignal;
+          const input =
+            document.querySelector<HTMLInputElement>("#viewer-signal-url");
+          if (input) input.value = signalUrl;
+        }
+        void joinRoom();
+      });
     });
   document
     .querySelector<HTMLButtonElement>("#scan-room-qr")

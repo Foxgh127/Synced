@@ -2,6 +2,7 @@ type VoiceTrackConstraints = MediaTrackConstraints & {
   latency?: ConstrainDouble;
   voiceIsolation?: ConstrainBoolean;
   googEchoCancellation?: boolean;
+  googEchoCancellation2?: boolean;
   googExperimentalEchoCancellation?: boolean;
   googAutoGainControl?: boolean;
   googAutoGainControl2?: boolean;
@@ -115,6 +116,15 @@ export const VOICE_PEER_MEDIA_STALL_MS = 12_000;
 export const VOICE_RECENT_UNMUTE_MEDIA_STALL_MS = 5_000;
 export const MAX_BOOSTED_PLAYBACK_GAIN = 1.5;
 
+const SYSTEM_AUDIO_LOOPBACK_INPUT_PATTERN =
+  /stereo mix|立体声混音|what u hear|wave out mix|loopback|回环|virtual audio|虚拟(?:音频|声卡)|vb-audio|voicemeeter|blackhole|soundflower|obs virtual|cable (?:input|output)|steam streaming|remote audio|远程音频/iu;
+
+export function isSystemAudioLoopbackInput(label: string): boolean {
+  return SYSTEM_AUDIO_LOOPBACK_INPUT_PATTERN.test(
+    String(label || "").normalize("NFKC").trim(),
+  );
+}
+
 export function voicePeerMediaStallTimeout(
   recentlyUnmuted: boolean,
 ): number {
@@ -151,6 +161,7 @@ export function buildVoiceCaptureConstraints(
     voiceIsolation:
       useBrowserNoiseSuppression && browserVoiceIsolation,
     googEchoCancellation: true,
+    googEchoCancellation2: true,
     googExperimentalEchoCancellation: true,
     googAutoGainControl: false,
     googAutoGainControl2: false,

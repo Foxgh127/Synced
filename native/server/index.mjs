@@ -4242,15 +4242,10 @@ export function createSignalServer(options = {}) {
         const originalDemand =
           message.originalDemand === true &&
           policy?.mode === "emby" &&
-          policy.allowOriginalRendition !== false &&
-          Number.isFinite(verifiedDownloadBps) &&
-          verifiedDownloadBps >=
-            Math.max(20_000_000, Number(policy.bitrate) * 1.35);
+          policy.allowOriginalRendition !== false;
         const highDemand =
           !originalDemand &&
-          message.highDemand === true &&
-          Number.isFinite(verifiedDownloadBps) &&
-          verifiedDownloadBps >= 12_000_000;
+          message.highDemand === true;
         const lowDemand =
           !originalDemand &&
           !highDemand &&

@@ -875,7 +875,7 @@ test("optional rendition idle expiry stops and removes the child before an ancho
   );
 });
 
-test("CMAF starts one default auxiliary and allows only one demanded extra", async () => {
+test("CMAF prioritizes explicit original demand and ignores legacy probe caps", async () => {
   const cacheDir = await mkdtemp(path.join(tmpdir(), "synced-cmaf-demand-"));
   const coordinator = new CmafRelayCoordinator(
     {
@@ -894,24 +894,24 @@ test("CMAF starts one default auxiliary and allows only one demanded extra", asy
       availableUploadBps: 20_000_000,
     });
     assert.deepEqual(initial.active, ["720p4"]);
-    assert.equal(initial.uploadBudgetBps, 13_000_000);
+    assert.equal(initial.uploadBudgetBps, Number.POSITIVE_INFINITY);
     const expanded = service.updateRenditionDemand({
       original: true,
       low: true,
       availableUploadBps: 20_000_000,
     });
-    assert.deepEqual(new Set(expanded.active), new Set(["720p4", "480p18"]));
-    assert.equal(coordinator.renditions.has("original"), false);
-    assert.equal(coordinator.renditions.get("480p18").demandPaused, false);
+    assert.deepEqual(new Set(expanded.active), new Set(["720p4", "original"]));
+    assert.equal(coordinator.renditions.get("original").demandPaused, false);
+    assert.equal(coordinator.renditions.has("480p18"), false);
     const exhausted = service.updateRenditionDemand({
       availableUploadBps: 100_000,
     });
-    assert.equal(exhausted.uploadBudgetBps, 0);
-    assert.equal(coordinator.renditions.get("720p4").budgetPaused, true);
+    assert.equal(exhausted.uploadBudgetBps, Number.POSITIVE_INFINITY);
+    assert.equal(coordinator.renditions.get("720p4").budgetPaused, false);
     const restored = service.updateRenditionDemand({
       availableUploadBps: 20_000_000,
     });
-    assert.equal(restored.uploadBudgetBps, 13_000_000);
+    assert.equal(restored.uploadBudgetBps, Number.POSITIVE_INFINITY);
     assert.equal(coordinator.renditions.get("720p4").budgetPaused, false);
   } finally {
     await coordinator.close();

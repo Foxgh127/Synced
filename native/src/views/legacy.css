@@ -7192,34 +7192,35 @@ body.native-android .dock-chat-composer .dock-chat-close {
     aspect-ratio: 16 / 9;
   }
 
-  /* Keep the essential five actions visible without horizontal scrolling.
-   * Low-frequency picture controls remain available outside portrait playback. */
-  #dock-rewind,
-  #dock-forward,
-  #dock-quality,
-  #dock-emby-settings,
-  #dock-smart-crop,
-  #dock-pip {
-    display: none !important;
-  }
-
+  /* Every action exposed by runtime capability checks remains reachable on
+   * phones through one horizontally scrollable, touch-safe 44px toolbar. */
   .dock {
     left: 50%;
-    width: max-content;
+    width: calc(
+      100% - 24px - env(safe-area-inset-left) -
+        env(safe-area-inset-right)
+    );
     max-width: calc(
       100% - 24px - env(safe-area-inset-left) -
         env(safe-area-inset-right)
     );
-    justify-content: center;
+    box-sizing: border-box;
+    justify-content: flex-start;
     gap: var(--s-2);
     padding-inline: var(--s-2);
-    overflow: visible;
+    overflow-x: auto;
+    overflow-y: hidden;
+    overscroll-behavior-inline: contain;
+    scroll-padding-inline: var(--s-2);
+    touch-action: pan-x;
   }
 
   .dock .btn,
   .dock .btn-icon {
     min-width: 44px;
     min-height: 44px;
+    pointer-events: auto;
+    touch-action: manipulation;
   }
 
   #dock-fullscreen {

@@ -3,9 +3,11 @@ import { detectVideoEnhancementCapabilities } from "./video-enhancement";
 export const EMBY_DATA_CHANNEL_LABEL = "synced-emby-v1";
 export const EMBY_CONTROL_CHANNEL_LABEL = "synced-emby-control-v1";
 export const EMBY_PROTOCOL_VERSION = 1;
-// Smaller SCTP messages recover much faster on lossy mobile/TURN routes and
-// avoid monopolizing the association behind one large fragment.
-export const EMBY_CHUNK_BYTES = 16 * 1024;
+// Stay below LiveKit data-track's 15,988-byte payload budget after our 64-byte
+// envelope and one-byte SFU framing marker. A 16 KiB application chunk was
+// split into two independently lossy packets, doubling loss amplification and
+// preventing otherwise healthy viewers from completing their first fragment.
+export const EMBY_CHUNK_BYTES = 12 * 1024;
 export const EMBY_BUFFER_HIGH_WATER = 2 * 1024 * 1024;
 export const EMBY_BUFFER_LOW_WATER = 512 * 1024;
 export const EMBY_INITIAL_MEDIA_BYTES_PER_MS = 2_500_000 / 8 / 1_000;

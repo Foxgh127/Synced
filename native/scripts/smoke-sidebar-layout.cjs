@@ -1300,7 +1300,9 @@ async function main() {
     !mobileLayout.obsoletePanelToggleAbsent ||
     mobileLayout.chatTop < mobileLayout.stageBottom - 1 ||
     mobileLayout.membersTop < mobileLayout.chatBottom - 1 ||
-    mobileLayout.dockOverflowX !== "visible" ||
+    mobileLayout.dockOverflowX !== "auto" ||
+    mobileLayout.dockLeft < -1 ||
+    mobileLayout.dockRight > mobileLayout.viewportWidth + 1 ||
     mobileLayout.fullscreenLeft < -1 ||
     mobileLayout.fullscreenRight > mobileLayout.viewportWidth + 1 ||
     mobileLayout.fullscreenWidth < 44 ||
@@ -1322,7 +1324,7 @@ async function main() {
     mobileLayout.quickChatSendHeight < 43 ||
     mobileLayout.quickChatCloseWidth < 43 ||
     mobileLayout.quickChatCloseHeight < 43 ||
-    !mobileLayout.lowPriorityDockControlsHidden ||
+    mobileLayout.lowPriorityDockControlsHidden ||
     mobileLayout.touchTargetHeight < 43 ||
     !mobileInlineAfterToggleLayout.bodyClasses.includes("panel-inline") ||
     !mobileInlineAfterToggleLayout.bodyClasses.includes("panel-open") ||

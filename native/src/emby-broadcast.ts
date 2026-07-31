@@ -323,7 +323,6 @@ export class EmbyBroadcastController {
     original?: boolean;
     high?: boolean;
     low?: boolean;
-    availableUploadBps?: number;
   }): void {
     if (!this.segmentRelayActive || !this.bridge.embyUpdateRenditionDemand) {
       return;
@@ -332,10 +331,6 @@ export class EmbyBroadcastController {
       original: input.original === true,
       high: input.high === true,
       low: input.low === true,
-      ...(Number.isFinite(Number(input.availableUploadBps)) &&
-      Number(input.availableUploadBps) >= 0
-        ? { availableUploadBps: Number(input.availableUploadBps) }
-        : {}),
     };
     const signature = JSON.stringify(normalized);
     if (signature === this.segmentRenditionDemandSignature) return;

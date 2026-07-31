@@ -45,6 +45,10 @@ test("chunks carry complete identity, timing, length, and CRC metadata", async (
   const chunks = transport.chunkEmbyFragment(fragment);
   assert.equal(chunks.length, Math.ceil(data.length / transport.EMBY_CHUNK_BYTES));
   for (const { header, packet } of chunks) {
+    assert.ok(
+      packet.byteLength + 1 <= 15_988,
+      "an Emby packet plus SFU framing must fit one LiveKit data-track packet",
+    );
     const decoded = transport.decodeEmbyChunk(packet);
     assert.deepEqual(decoded.header, header);
     assert.equal(header.roomId, fragment.roomId);

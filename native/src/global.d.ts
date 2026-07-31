@@ -174,7 +174,6 @@ declare global {
         original?: boolean;
         high?: boolean;
         low?: boolean;
-        availableUploadBps?: number;
       }) => Promise<{
         updated: boolean;
         active: string[];

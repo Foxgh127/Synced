@@ -36,6 +36,7 @@ import {
   VOICE_CAPTURE_AUDIO_PROFILE,
   boostedPlaybackGain,
   buildVoiceCaptureConstraints,
+  isSystemAudioLoopbackInput,
   normalizeVoiceProcessingMode,
   voiceCaptureProfileForMode,
   voicePeerMediaStallTimeout,
@@ -2001,12 +2002,73 @@ export class VoiceMesh extends EventTarget {
         throw fallbackError;
       }
     }
-    const sourceTrack = sourceStream.getAudioTracks()[0];
+    let sourceTrack = sourceStream.getAudioTracks()[0];
     if (!sourceTrack) {
       sourceStream.getTracks().forEach((track) => track.stop());
       noiseProcessor?.dispose();
       await closeVoiceAudioContext(context);
       throw new Error("没有找到可用的麦克风");
+    }
+    const currentDeviceId = sourceTrack.getSettings().deviceId || "";
+    const knownAudioInputs = (
+      await navigator.mediaDevices.enumerateDevices().catch(() => [])
+    ).filter((candidate) => candidate.kind === "audioinput");
+    const resolvedInputLabel =
+      knownAudioInputs.find(
+        (candidate) => candidate.deviceId === currentDeviceId,
+      )?.label || "";
+    if (
+      isSystemAudioLoopbackInput(sourceTrack.label) ||
+      isSystemAudioLoopbackInput(resolvedInputLabel)
+    ) {
+      const physicalFallback = knownAudioInputs
+        .filter(
+          (candidate) =>
+            candidate.deviceId !== "default" &&
+            candidate.deviceId !== "communications" &&
+            candidate.deviceId !== currentDeviceId &&
+            Boolean(candidate.deviceId && candidate.label.trim()) &&
+            !isSystemAudioLoopbackInput(candidate.label),
+        )
+        .sort(
+          (left, right) =>
+            devicePreferenceRank(left.label, "audioinput") -
+              devicePreferenceRank(right.label, "audioinput") ||
+            left.label.localeCompare(right.label, "zh-CN"),
+        )[0];
+      sourceStream.getTracks().forEach((track) => track.stop());
+      if (!physicalFallback) {
+        noiseProcessor?.dispose();
+        await closeVoiceAudioContext(context);
+        throw new Error(
+          "当前输入设备是系统回环/立体声混音，会把影片声音发送到连麦；请连接或选择真实麦克风。",
+        );
+      }
+      audio.deviceId = { exact: physicalFallback.deviceId };
+      selectedDeviceId = physicalFallback.deviceId;
+      try {
+        sourceStream = await requestVoiceUserMedia(
+          { audio, video: false },
+          cancellationSignal,
+        );
+      } catch (error) {
+        noiseProcessor?.dispose();
+        await closeVoiceAudioContext(context);
+        throw error;
+      }
+      sourceTrack = sourceStream.getAudioTracks()[0];
+      if (
+        !sourceTrack ||
+        isSystemAudioLoopbackInput(sourceTrack.label) ||
+        isSystemAudioLoopbackInput(physicalFallback.label)
+      ) {
+        sourceStream.getTracks().forEach((track) => track.stop());
+        noiseProcessor?.dispose();
+        await closeVoiceAudioContext(context);
+        throw new Error(
+          "无法把语音输入从系统回环切换到真实麦克风，已阻止影片声音进入连麦。",
+        );
+      }
     }
     sourceTrack.contentHint = "speech";
     await sourceTrack

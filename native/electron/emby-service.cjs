@@ -5685,20 +5685,21 @@ class EmbyService {
         uploadBudgetBps: Number.POSITIVE_INFINITY,
       };
     }
-    const uploadBudgetBps =
-      Number.isFinite(Number(input.availableUploadBps)) &&
-      Number(input.availableUploadBps) >= 0
-        ? coordinator.setUploadBudget(input.availableUploadBps)
-        : coordinator.uploadBudgetBps;
+    // Legacy renderers may still send a speed-test estimate here. It is not an
+    // admission signal: the broadcaster's selected rendition is authoritative
+    // and transport backpressure already bounds memory and disk queues.
+    const uploadBudgetBps = coordinator.setUploadBudget(
+      Number.POSITIVE_INFINITY,
+    );
     const nextDemand = new Set(
       CMAF_AUXILIARY_RENDITIONS.filter(
         (rendition) => rendition.defaultActive,
       ).map((rendition) => rendition.id),
     );
     const requestedExtras = [
-      ...(input.low === true ? ["480p18"] : []),
-      ...(input.high === true ? ["1080p8"] : []),
       ...(input.original === true ? ["original"] : []),
+      ...(input.high === true ? ["1080p8"] : []),
+      ...(input.low === true ? ["480p18"] : []),
     ];
     const maximumAuxiliaryRenditions =
       CMAF_MAX_TOTAL_RENDITIONS - 1;

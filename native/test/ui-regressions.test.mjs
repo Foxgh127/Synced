@@ -495,27 +495,28 @@ test("the idle playback HUD is content-sized while active playback remains flexi
   );
 });
 
-test("mobile dock keeps fullscreen visible and reserves a safe quick-chat card", () => {
+test("mobile dock keeps every supported action touch-reachable", () => {
   const styles = readStyles();
   const mobileStart = styles.indexOf(
-    "/* Keep the essential five actions visible",
+    "/* Every action exposed by runtime capability checks",
   );
   const mobileEnd = styles.indexOf(
     "@media (prefers-reduced-motion: reduce)",
     mobileStart,
   );
   const mobile = styles.slice(mobileStart, mobileEnd);
-  for (const id of [
-    "dock-rewind",
-    "dock-forward",
-    "dock-quality",
-    "dock-emby-settings",
-    "dock-smart-crop",
-    "dock-pip",
-  ]) {
-    assert.match(mobile, new RegExp(`#${id}`));
-  }
-  assert.match(mobile, /\.dock\s*\{[\s\S]*?overflow:\s*visible;/);
+  assert.ok(mobileStart > 0);
+  assert.doesNotMatch(
+    mobile,
+    /#dock-(?:rewind|forward|quality|emby-settings|smart-crop|pip)[\s\S]{0,120}?display:\s*none/,
+  );
+  assert.match(mobile, /\.dock\s*\{[\s\S]*?overflow-x:\s*auto;/);
+  assert.match(mobile, /overflow-y:\s*hidden/);
+  assert.match(mobile, /touch-action:\s*pan-x/);
+  assert.match(
+    mobile,
+    /\.dock \.btn,[\s\S]*?min-width:\s*44px;[\s\S]*?min-height:\s*44px;[\s\S]*?pointer-events:\s*auto;/,
+  );
   assert.match(
     mobile,
     /#dock-fullscreen\s*\{[\s\S]*?width:\s*44px;[\s\S]*?height:\s*44px;/,
@@ -623,7 +624,7 @@ test("Emby account recovery is bounded, race-safe, and always restores its start
   assert.match(prepare, /重试恢复 Emby 账户/);
 });
 
-test("Emby auto quality bounds incompatible HEVC/HDR sources and library searches", () => {
+test("Emby auto quality follows source compatibility and never network probes", () => {
   const source = fs.readFileSync(
     new URL("../src/channel-session.ts", import.meta.url),
     "utf8",
@@ -633,8 +634,9 @@ test("Emby auto quality bounds incompatible HEVC/HDR sources and library searche
   const automatic = source.slice(autoStart, autoEnd);
   assert.match(automatic, /embySourceCanUseOriginal\(source,\s*allowHevc\)/);
   assert.match(automatic, /return "1080p-12"/);
-  assert.match(source, /"1440p-18"/);
-  assert.doesNotMatch(automatic, /return "4k-(?:12|18)"/);
+  assert.match(automatic, /height >= 2_160[\s\S]*?return "4k-18"/);
+  assert.match(automatic, /height >= 1_440[\s\S]*?return "1440p-18"/);
+  assert.doesNotMatch(automatic, /embyBudget\(|networkReport|networkAdvice|available/);
   const budgetEnd = source.indexOf("function updateEmbyBudget", autoEnd);
   const budgetSafe = source.slice(autoEnd, budgetEnd);
   assert.match(
@@ -643,7 +645,7 @@ test("Emby auto quality bounds incompatible HEVC/HDR sources and library searche
   );
   assert.match(
     budgetSafe,
-    /Network measurements are recommendations for Auto[\s\S]*?return requested/,
+    /Network measurements are[\s\S]*?diagnostics only[\s\S]*?return requested/,
   );
   assert.doesNotMatch(
     budgetSafe,
@@ -703,7 +705,7 @@ test("Android screen sharing uses a dedicated self-healing movie audio element",
   assert.match(source, /totalSamplesDuration/);
 });
 
-test("Emby frame rate and shared viewer quality requests have a real debounced pipeline path", () => {
+test("Emby viewer preferences stay per-viewer and cannot rebuild the host-selected stream", () => {
   const source = fs.readFileSync(
     new URL("../src/channel-session.ts", import.meta.url),
     "utf8",
@@ -714,23 +716,25 @@ test("Emby frame rate and shared viewer quality requests have a real debounced p
     source,
     /frameRate:\s*Math\.max\(1,\s*detail\.plan\.frameRate\)/,
   );
-  assert.match(
-    source,
-    /function scheduleEmbyViewerPreference[\s\S]*?setPlaybackProfile[\s\S]*?}, 450\)/,
+  const viewerPreferenceStart = source.indexOf(
+    "function scheduleEmbyViewerPreference",
   );
+  const viewerPreferenceEnd = source.indexOf(
+    "function handleEmbyNetworkPressure",
+    viewerPreferenceStart,
+  );
+  const viewerPreference = source.slice(
+    viewerPreferenceStart,
+    viewerPreferenceEnd,
+  );
+  assert.match(viewerPreference, /receiverPreferences\.set\(viewerId, preference\)/);
+  assert.match(viewerPreference, /updateEmbySegmentRenditionDemand\(\)/);
+  assert.doesNotMatch(viewerPreference, /setPlaybackProfile|setQuality/);
   assert.match(
     source,
     /message\.type === "quality:request"[\s\S]*?scheduleEmbyViewerPreference/,
   );
-  const sharedStart = source.indexOf("function sharedEmbyViewerPreference");
-  const sharedEnd = source.indexOf("function embyViewerCount", sharedStart);
-  const shared = source.slice(sharedStart, sharedEnd);
-  assert.match(shared, /Math\.floor\(heights\.length \/ 2\)/);
-  assert.doesNotMatch(shared, /Math\.min\(\.\.\.heights\)/);
-  assert.match(
-    source,
-    /requiredAffectedViewers[\s\S]*?activePressures\.length < requiredAffectedViewers/,
-  );
+  assert.doesNotMatch(source, /sharedEmbyViewerPreference|pressureSafeEmbyQuality/);
 });
 
 test("network probing follows channel membership instead of broadcast dialog clicks", () => {
@@ -780,10 +784,7 @@ test("watch recovery is bounded and timer callbacks use safe signaling", () => {
   assert.match(source, /function queuePendingWatcherSignal/);
   assert.doesNotMatch(source, /watcherCandidates\.push\(/);
   assert.doesNotMatch(source, /peer\.candidates\.push\(/);
-  assert.match(
-    source,
-    /receiverPreferences\.size === 0[\s\S]*?clearTimeout\(embyViewerPreferenceTimer\)/,
-  );
+  assert.doesNotMatch(source, /embyViewerPreferenceTimer/);
 });
 
 test("stopping or failing a broadcast preserves the active Emby library session", () => {
@@ -1372,4 +1373,126 @@ test("HTTPS CMAF viewer stats and liveness remain independent from the control p
   );
   assert.match(liveness, /mediaTransport: independentHttpsMedia \? "https-cmaf"/);
   assert.match(liveness, /!independentHttpsMedia &&[\s\S]*?shouldRestartIce/);
+});
+
+test("user-selected screen and Emby quality is never overwritten by probes or stats", () => {
+  const session = fs.readFileSync(
+    new URL("../src/channel-session.ts", import.meta.url),
+    "utf8",
+  );
+  const server = fs.readFileSync(
+    new URL("../server/index.mjs", import.meta.url),
+    "utf8",
+  );
+  const recommendationStart = session.indexOf(
+    "function applyBandwidthRecommendation",
+  );
+  const recommendationEnd = session.indexOf(
+    "function scheduleNetworkAdviceExpiry",
+    recommendationStart,
+  );
+  const recommendation = session.slice(
+    recommendationStart,
+    recommendationEnd,
+  );
+  const preferenceStart = session.indexOf(
+    "function currentSfuScreenPreference",
+  );
+  const preferenceEnd = session.indexOf(
+    "function sendViewerQualityPreference",
+    preferenceStart,
+  );
+  const preference = session.slice(preferenceStart, preferenceEnd);
+
+  assert.match(recommendation, /仅供诊断，不会修改你的选择/);
+  assert.doesNotMatch(recommendation, /resolutionKey\s*=|frameRate\s*=/);
+  assert.doesNotMatch(session, /adaptivePlayback\.forceDegrade/);
+  assert.doesNotMatch(session, /screen-startup-quality-down|自动降至/);
+  assert.match(preference, /preferredHeight \|\| capabilities\.height/);
+  assert.match(preference, /preferredFrameRate \|\| capabilities\.frameRate/);
+  assert.match(
+    session,
+    /function effectiveEmbyViewerHeight\(\)[\s\S]{0,120}?return preferredHeight \|\| undefined/,
+  );
+  assert.doesNotMatch(session, /automaticEmbyViewerHeight|embyAdaptiveHeight/);
+  const rampStart = session.indexOf("new VideoBitrateRampController");
+  const rampEnd = session.indexOf("codecAttempt:", rampStart);
+  const ramp = session.slice(rampStart, rampEnd);
+  assert.doesNotMatch(ramp, /networkAdvice\.routeMode|2_000_000|3_000_000|4_000_000/);
+  assert.doesNotMatch(
+    session,
+    /pressureSafeEmbyQuality|activeEmbyPressureCeiling|embyPressureQualityByViewer/,
+  );
+  assert.match(
+    session,
+    /setPreferredHeight\([\s\S]{0,140}?true,[\s\S]{0,100}?requestedHeight === undefined/,
+  );
+  assert.match(
+    server,
+    /const originalDemand =[\s\S]{0,220}?policy\.allowOriginalRendition !== false/,
+  );
+  assert.doesNotMatch(
+    server.slice(
+      server.indexOf("const originalDemand ="),
+      server.indexOf("send(broadcaster.socket", server.indexOf("const originalDemand =")),
+    ),
+    /verifiedDownloadBps\s*>?=/,
+  );
+});
+
+test("Emby transport recovery preserves an already attached MSE timeline", () => {
+  const session = fs.readFileSync(
+    new URL("../src/channel-session.ts", import.meta.url),
+    "utf8",
+  );
+  const waitingStart = session.indexOf("function hasRenderableEmbyFrame");
+  const waitingEnd = session.indexOf("function showLocalStage", waitingStart);
+  const waiting = session.slice(waitingStart, waitingEnd);
+  const p2pStart = session.indexOf("async function beginP2PWatching");
+  const p2pEnd = session.indexOf("async function handleWatcherSignal", p2pStart);
+  const p2p = session.slice(p2pStart, p2pEnd);
+
+  assert.match(waiting, /preserveEmbyMediaSource/);
+  assert.match(waiting, /embyViewer\?\.activeSession/);
+  assert.match(waiting, /hasRenderableEmbyFrame\(\)/);
+  assert.match(waiting, /video\.readyState >= 2/);
+  assert.match(waiting, /confirmEmbyPlaybackReady\(\)/);
+  assert.match(waiting, /clearSfuEmbyStartupDeadline\(\)/);
+  assert.match(waiting, /keepEmbyFrameVisible[\s\S]*?showRemoteStage\(\)/);
+  assert.match(
+    waiting,
+    /if \(!preserveEmbyMediaSource\)[\s\S]*?video\.removeAttribute\("src"\)/,
+  );
+  assert.match(p2p, /const preserveEmbyPlayback/);
+  assert.match(p2p, /if \(!preserveLastFrame\) remoteFirstFrame = false/);
+});
+
+test("Android exposes recent channels and a complete touch-scrollable toolbar", () => {
+  const main = fs.readFileSync(
+    new URL("../src/main.ts", import.meta.url),
+    "utf8",
+  );
+  const session = fs.readFileSync(
+    new URL("../src/channel-session.ts", import.meta.url),
+    "utf8",
+  );
+  const styles = readStyles();
+
+  assert.match(main, /function mobileRecentJoinMarkup/);
+  assert.match(main, /data-mobile-recent-room/);
+  assert.match(main, /mobileRecentChannels[\s\S]*?最近加入/);
+  assert.match(main, /\[data-mobile-recent-room\][\s\S]*?void joinRoom\(\)/);
+  assert.match(styles, /\.mobile-recent-join-item\s*\{[\s\S]*?min-height:\s*68px/);
+  assert.match(styles, /\.mobile-recent-join-item\s*\{[\s\S]*?touch-action:\s*manipulation/);
+  assert.match(
+    session,
+    /if \(nativeAndroid && !isImmersivePlayback\(\)\)[\s\S]{0,260}?stageDock\.classList\.remove/,
+  );
+  const phoneDock = styles.slice(styles.indexOf("@media (max-width: 599px)"));
+  assert.match(phoneDock, /\.dock\s*\{[\s\S]*?overflow-x:\s*auto/);
+  assert.match(phoneDock, /touch-action:\s*pan-x/);
+  assert.doesNotMatch(
+    phoneDock.slice(0, phoneDock.indexOf(".dock {")),
+    /#dock-quality|#dock-emby-settings/,
+  );
 });

@@ -582,6 +582,8 @@ export function selectEmbyAbrRendition(
     stableForMs: number;
     upgradeHoldRemainingMs: number;
     upgradeFailureCount?: number;
+    lockPreferredHeight?: boolean;
+    preferOriginal?: boolean;
   },
 ): EmbyRenditionManifest {
   const ordered = [...renditions].sort(
@@ -589,6 +591,25 @@ export function selectEmbyAbrRendition(
       left.bitrate - right.bitrate || left.height - right.height,
   );
   const current = ordered.find((item) => item.id === input.currentId);
+  if (input.lockPreferredHeight) {
+    const locked = input.preferOriginal
+      ? ordered.find((item) => item.id === "original") || ordered.at(-1)!
+      : [...ordered]
+          .filter(
+            (item) =>
+              item.height <=
+              Math.max(
+                1,
+                finite(input.preferredHeight, Number.POSITIVE_INFINITY),
+              ),
+          )
+          .sort(
+            (left, right) =>
+              left.height - right.height || left.bitrate - right.bitrate,
+          )
+          .at(-1) || ordered[0];
+    return current?.id === locked.id ? current : locked;
+  }
   const preferredHeight = Math.max(
     1,
     finite(input.preferredHeight, Number.POSITIVE_INFINITY),
@@ -1070,6 +1091,8 @@ export class EmbyAbrSegmentClient {
   private fetchGeneration = 0;
   private currentRendition?: EmbyRenditionManifest;
   private preferredHeight?: number;
+  private preferredHeightLocked = false;
+  private preferOriginal = false;
   private throughputBps =
     Math.max(
       2_000_000,
@@ -1259,11 +1282,17 @@ export class EmbyAbrSegmentClient {
     );
   }
 
-  setPreferredHeight(height?: number): void {
+  setPreferredHeight(
+    height?: number,
+    locked = false,
+    preferOriginal = false,
+  ): void {
     this.preferredHeight =
       Number.isFinite(height) && Number(height) > 0
         ? Number(height)
         : undefined;
+    this.preferredHeightLocked = locked;
+    this.preferOriginal = locked && preferOriginal;
   }
 
   matchesSession(
@@ -1785,8 +1814,14 @@ export class EmbyAbrSegmentClient {
       stableForMs: now - this.stableSince,
       upgradeHoldRemainingMs: Math.max(0, this.upgradeHoldUntil - now),
       upgradeFailureCount: this.upgradeFailures,
+      lockPreferredHeight: this.preferredHeightLocked,
+      preferOriginal: this.preferOriginal,
     });
-    if (mediaBudgetPressured && this.currentRendition) {
+    if (
+      mediaBudgetPressured &&
+      !this.preferredHeightLocked &&
+      this.currentRendition
+    ) {
       const ordered = [...supportedRenditions].sort(
         (left, right) =>
           left.bitrate - right.bitrate || left.height - right.height,

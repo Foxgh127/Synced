@@ -178,6 +178,10 @@ test("SFU publication, data sends, and teardown are bounded and stale-safe", () 
     sfu,
     /SFU_DATA_OUTSTANDING_BYTES[\s\S]*?QuotaExceededError/,
   );
+  assert.match(
+    sfu,
+    /pushAndFlushSfuDataTrack[\s\S]*?tryPush\([\s\S]*?\.flush\(\)/,
+  );
   assert.match(sfu, /async closeGracefully[\s\S]*?this\.drain\(\)/);
   assert.doesNotMatch(
     sfu.slice(sfu.indexOf("private async pump()"), sfu.indexOf("private drain()")),
@@ -217,6 +221,52 @@ test("P2P fallback periodically returns to SFU and detects silent SFU media", ()
   assert.match(channel, /sfuPublishPromise: Promise<boolean>/);
   assert.match(player, /EMBY_TRANSPORT_SILENCE_TIMEOUT_MS/);
   assert.match(player, /"transport-silent"/);
+});
+
+test("selected 4K remains available on SFU and the primary direct fallback", () => {
+  const channel = source("src/channel-session.ts");
+  const preferenceStart = channel.indexOf(
+    "function currentSfuScreenPreference()",
+  );
+  const preferenceEnd = channel.indexOf(
+    "function sendViewerQualityPreference",
+    preferenceStart,
+  );
+  const preference = channel.slice(preferenceStart, preferenceEnd);
+  const fallbackStart = channel.indexOf("function screenP2pFallbackBudget");
+  const fallbackEnd = channel.indexOf(
+    "function rebalanceScreenP2pFallbackBudgets",
+    fallbackStart,
+  );
+  const fallback = channel.slice(fallbackStart, fallbackEnd);
+
+  assert.ok(preferenceStart > 0);
+  assert.doesNotMatch(preference, /2_560|1_440/);
+  assert.match(
+    channel,
+    /publishScreen\(expectedStream, \{[\s\S]{0,160}?width: expectedPreset\.width,[\s\S]{0,80}?height: expectedPreset\.height/,
+  );
+  assert.ok(fallbackStart > 0);
+  assert.match(fallback, /if \(activePreset\)/);
+  assert.match(fallback, /height: activePreset\.height/);
+  assert.match(fallback, /bitrate: activePreset\.maxBitrate/);
+  assert.doesNotMatch(channel, /adaptivePlayback\.forceDegrade/);
+  assert.match(channel, /degradationPreference: "maintain-resolution"/);
+  assert.match(
+    source("src/sfu.ts"),
+    /sourceHeight > 1_080[\s\S]{0,180}?new VideoPreset\(1_280, 720, 5_000_000, 30\),[\s\S]{0,100}?new VideoPreset\(1_920, 1_080, 10_000_000, 30\)/,
+  );
+});
+
+test("SFU Emby startup has a terminal fallback deadline", () => {
+  const channel = source("src/channel-session.ts");
+  assert.match(channel, /function armSfuEmbyStartupDeadline/);
+  assert.match(channel, /elapsedMs < 30_000/);
+  assert.match(channel, /"sfu-emby-startup-deadline"/);
+  assert.match(
+    channel,
+    /SFU Emby 首屏片段未能及时组装，正在切换 P2P 备用链路/,
+  );
 });
 
 test("P2P peers are created only after an explicit fallback watch request", () => {
@@ -266,15 +316,13 @@ test("dynamic membership isolates late joins and departed viewer state", () => {
   assert.match(cleanup, /peer\.pc\.close\(\)/);
   assert.match(cleanup, /failedVideoCodecsByViewer\.delete\(viewerId\)/);
   assert.match(cleanup, /receiverPreferences\.delete\(viewerId\)/);
-  assert.match(cleanup, /embyPressureQualityByViewer\.delete\(viewerId\)/);
+  assert.match(cleanup, /updateEmbySegmentRenditionDemand\(\)/);
+  assert.doesNotMatch(cleanup, /pressure|setQuality|setPlaybackProfile/);
   assert.match(
     channel,
     /message\.type === "participant:left"[\s\S]*?forgetDepartedViewer\(message\.participantId\)/,
   );
-  assert.match(
-    channel,
-    /const majorityHeight = heights\[Math\.floor\(heights\.length \/ 2\)\]/,
-  );
+  assert.doesNotMatch(channel, /sharedEmbyViewerPreference/);
   assert.match(publicSmoke, /lateViewerJoined:\s*true/);
   assert.match(publicSmoke, /viewerLeaveIsolated:\s*true/);
   assert.match(publicSmoke, /RoomEvent\.ParticipantDisconnected/);

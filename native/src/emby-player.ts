@@ -48,6 +48,8 @@ const EMBY_CATCH_UP_MIN_INTERVAL_MS = 1_200;
 const EMBY_CATCH_UP_MAX_INTERVAL_MS = 8_000;
 const EMBY_CATCH_UP_HEALTHY_RESET_SAMPLES = 12;
 const EMBY_END_REPAIR_TIMEOUT_MS = 90_000;
+const EMBY_HISTORY_TRIM_MIN_INTERVAL_MS = 15_000;
+const EMBY_HISTORY_TRIM_MIN_ADVANCE_SECONDS = 8;
 // Keep a generous margin below the three-second product ceiling. Once the
 // desired timestamp is 1.8 s ahead of available media, pause stale playback
 // and request a fresh keyframe window instead of letting drift keep growing.
@@ -294,6 +296,32 @@ export function evaluateEmbyBufferPolicy(
     pausedForFlow: ahead >= maximum,
     urgent: ahead < 8,
   };
+}
+
+export function shouldAttemptEmbyHistoryTrim(input: {
+  force?: boolean;
+  now: number;
+  removeEnd: number;
+  bufferedStart: number;
+  lastAttemptAt?: number;
+  lastBoundary?: number;
+}): boolean {
+  const removeEnd = Math.max(0, finite(input.removeEnd));
+  const bufferedStart = Math.max(0, finite(input.bufferedStart));
+  if (removeEnd <= bufferedStart + 0.5) return false;
+  if (input.force === true) return true;
+  const lastAttemptAt = Math.max(0, finite(input.lastAttemptAt));
+  if (
+    lastAttemptAt > 0 &&
+    finite(input.now) - lastAttemptAt < EMBY_HISTORY_TRIM_MIN_INTERVAL_MS
+  ) {
+    return false;
+  }
+  const lastBoundary = Math.max(0, finite(input.lastBoundary));
+  return (
+    lastBoundary === 0 ||
+    removeEnd >= lastBoundary + EMBY_HISTORY_TRIM_MIN_ADVANCE_SECONDS
+  );
 }
 
 export function shouldReportEmbyBuffer(
@@ -801,6 +829,8 @@ export class EmbyMsePlayer extends EventTarget {
   private invalidPacketUpdatedAt = performance.now();
   private invalidPacketCount = 0;
   private lastBufferReportAt = 0;
+  private lastHistoryTrimAt = 0;
+  private lastHistoryTrimBoundary = 0;
   private lastCatchUpRequestAt = 0;
   private catchUpCooldownMs = EMBY_CATCH_UP_MIN_INTERVAL_MS;
   private healthyCatchUpSamples = 0;
@@ -3501,14 +3531,26 @@ export class EmbyMsePlayer extends EventTarget {
     }
     const removeEnd = Math.max(0, this.video.currentTime - (force ? 8 : 30));
     const start = sourceBuffer.buffered.start(0);
-    if (removeEnd <= start + 0.5) {
+    const now = performance.now();
+    if (!shouldAttemptEmbyHistoryTrim({
+      force,
+      now,
+      removeEnd,
+      bufferedStart: start,
+      lastAttemptAt: this.lastHistoryTrimAt,
+      lastBoundary: this.lastHistoryTrimBoundary,
+    })) {
       // A deep forward buffer can reach the browser quota before enough media
-      // exists behind currentTime to remove. Synchronous retries used to spin
-      // the renderer and made seek/rebuild appear frozen.
+      // exists behind currentTime to remove. Proactive trims are also
+      // deliberately spaced out: updateend immediately calls inspectBuffer,
+      // and repeatedly removing the same GOP range used to empty a healthy
+      // MSE timeline around the 70-second mark.
       if (this.pendingQuotaRecovery) this.scheduleQuotaRecovery();
       return;
     }
     try {
+      this.lastHistoryTrimAt = now;
+      this.lastHistoryTrimBoundary = removeEnd;
       this.appendBusy = true;
       sourceBuffer.remove(start, removeEnd);
     } catch {
@@ -3941,6 +3983,8 @@ export class EmbyMsePlayer extends EventTarget {
     this.invalidPacketCount = 0;
     this.lastHardSeekAt = 0;
     this.lastStartupAnchorAt = undefined;
+    this.lastHistoryTrimAt = 0;
+    this.lastHistoryTrimBoundary = 0;
     this.pendingCatchUpTarget = undefined;
     this.syncHeld = false;
     this.awaitingResyncEpoch = undefined;

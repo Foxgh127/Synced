@@ -322,6 +322,51 @@ test("uses the configured 8/24/32 second buffer policy", async () => {
   assert.equal(evaluateEmbyBufferPolicy(32.01, 0).shouldTrim, true);
 });
 
+test("proactive MSE history trimming cannot repeat on every updateend", async () => {
+  const { shouldAttemptEmbyHistoryTrim } = await loadModule();
+  const first = {
+    now: 73_000,
+    removeEnd: 43,
+    bufferedStart: 0,
+    lastAttemptAt: 0,
+    lastBoundary: 0,
+  };
+  assert.equal(shouldAttemptEmbyHistoryTrim(first), true);
+  assert.equal(
+    shouldAttemptEmbyHistoryTrim({
+      ...first,
+      now: 73_010,
+      bufferedStart: 12,
+      lastAttemptAt: 73_000,
+      lastBoundary: 43,
+    }),
+    false,
+    "the updateend inspection must not remove the same GOP window again",
+  );
+  assert.equal(
+    shouldAttemptEmbyHistoryTrim({
+      ...first,
+      now: 89_000,
+      removeEnd: 51.2,
+      bufferedStart: 12,
+      lastAttemptAt: 73_000,
+      lastBoundary: 43,
+    }),
+    true,
+  );
+  assert.equal(
+    shouldAttemptEmbyHistoryTrim({
+      ...first,
+      force: true,
+      now: 73_010,
+      lastAttemptAt: 73_000,
+      lastBoundary: 43,
+    }),
+    true,
+    "quota recovery remains able to reclaim history immediately",
+  );
+});
+
 test("adaptive Emby buffering uses bitrate and device memory as a hard byte budget", async () => {
   const { planEmbyAdaptiveBufferProfile } = await loadModule();
   const ordinaryViewer = planEmbyAdaptiveBufferProfile({
