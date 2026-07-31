@@ -1,0 +1,195 @@
+body.mode-lobby .viewer-stage {
+  background:
+    radial-gradient(circle at 50% 35%, var(--accent-bg), transparent 40%),
+    var(--canvas-0);
+}
+
+.channel-lobby {
+  position: relative;
+  display: grid;
+  width: min(680px, calc(100% - 32px));
+  min-height: min(520px, calc(100% - 40px));
+  place-content: center;
+  justify-items: center;
+  padding: clamp(var(--s-8), 6vw, var(--s-12));
+  overflow: hidden;
+  border: 1px solid var(--stroke-subtle);
+  border-radius: var(--r-2xl);
+  background: var(--material-l1);
+  box-shadow: var(--e-card);
+  text-align: center;
+}
+
+.channel-lobby > :not(.lobby-light-field) {
+  position: relative;
+  z-index: var(--z-bbf0bd5a18);
+}
+
+.channel-lobby h2 {
+  margin: var(--s-4) 0 var(--s-2);
+  font: 650 var(--t-page) / var(--lh-page) var(--font-display);
+  letter-spacing: -0.02em;
+}
+
+.channel-lobby > p {
+  margin: var(--s-3) 0 0;
+  color: var(--text-secondary);
+}
+
+.lobby-light-field {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.lobby-light-field::before {
+  position: absolute;
+  width: 60%;
+  aspect-ratio: 1;
+  border-radius: var(--radius-8ec82c689f);
+  background: var(--accent-bg);
+  content: "";
+  filter: blur(var(--blur-52686b14ab));
+  inset: 8% 20% auto;
+  opacity: 0.72;
+}
+
+.lobby-light-field i {
+  position: absolute;
+  width: 7px;
+  height: 7px;
+  border-radius: var(--radius-8ec82c689f);
+  background: var(--accent-2);
+  box-shadow: var(--shadow-7956de19a5);
+  opacity: 0.42;
+  animation: lobby-drift 12s var(--ease-in-out) infinite alternate;
+}
+
+.lobby-light-field i:nth-child(1) {
+  top: 24%;
+  left: 22%;
+}
+
+.lobby-light-field i:nth-child(2) {
+  top: 36%;
+  right: 18%;
+  animation-delay: -4s;
+  animation-duration: 15s;
+}
+
+.lobby-light-field i:nth-child(3) {
+  right: 34%;
+  bottom: 18%;
+  animation-delay: -8s;
+  animation-duration: 18s;
+}
+
+body:not(.mode-lobby) .lobby-light-field i,
+html[data-effects-quality="minimal"] .lobby-light-field i,
+html[data-motion="reduced"] .lobby-light-field i {
+  animation: none;
+}
+
+.lobby-room-code {
+  display: inline-flex;
+  min-height: var(--control-min);
+  align-items: center;
+  justify-content: center;
+  gap: var(--s-4);
+  padding: var(--s-2) var(--s-5);
+  border-radius: var(--r-full);
+  color: var(--text-secondary);
+  font: 650 var(--t-body-lg) / 1 var(--font-mono);
+  letter-spacing: 0.12em;
+}
+
+.lobby-room-code:hover,
+.lobby-room-code:focus-visible {
+  background: var(--accent-bg);
+  color: var(--accent-text);
+}
+
+.lobby-participants {
+  display: flex;
+  min-height: 56px;
+  align-items: center;
+  justify-content: center;
+  margin-block: var(--s-7) var(--s-3);
+  padding-inline: var(--s-4);
+}
+
+.lobby-avatar {
+  display: grid;
+  width: 52px;
+  height: 52px;
+  place-items: center;
+  border: 2px solid var(--canvas-0);
+  border-radius: var(--radius-8ec82c689f);
+  background: var(--surface-2);
+  box-shadow: var(--e-1);
+  color: var(--text-primary);
+  font-weight: 650;
+  transition: border-color var(--dur-control) var(--ease-out);
+}
+
+.lobby-avatar + .lobby-avatar {
+  margin-left: -10px;
+}
+
+.lobby-avatar.is-voice-active {
+  border-color: var(--voice-bg);
+}
+
+.lobby-avatar.is-speaking[data-speaking-level="low"] {
+  border-width: 1px;
+  border-color: var(--voice);
+}
+
+.lobby-avatar.is-speaking[data-speaking-level="medium"] {
+  border-width: 2px;
+  border-color: var(--voice);
+}
+
+.lobby-avatar.is-speaking[data-speaking-level="high"] {
+  border-color: var(--voice);
+  box-shadow: var(--shadow-53cf947b85);
+}
+
+.lobby-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: var(--s-4);
+  margin-top: var(--s-7);
+}
+
+.lobby-waiting-note,
+.lobby-voice-summary {
+  color: var(--text-tertiary);
+  font-size: var(--t-small);
+}
+
+@keyframes lobby-drift {
+  from {
+    transform: translate3d(-4px, 3px, 0);
+  }
+
+  to {
+    transform: translate3d(6px, -5px, 0);
+  }
+}
+
+@container theater (max-width: 520px) {
+  .channel-lobby {
+    width: calc(100% - 20px);
+    min-height: calc(100% - 20px);
+    padding: var(--s-7);
+    border-radius: var(--r-xl);
+  }
+
+  .lobby-avatar {
+    width: 44px;
+    height: 44px;
+  }
+}

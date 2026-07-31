@@ -1,0 +1,144 @@
+:is(
+  .btn,
+  .primary-button,
+  .ghost-button,
+  .delete-confirm-button,
+  .rail-add,
+  .profile-action,
+  .chat-send-btn,
+  .voice-join-btn,
+  .mute-btn,
+  .device-refresh-button
+) {
+  position: relative;
+  display: inline-flex;
+  min-height: var(--control-min);
+  align-items: center;
+  justify-content: center;
+  gap: var(--s-4);
+  padding: 0 var(--s-6);
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  color: var(--text-primary);
+  font-weight: 600;
+  text-decoration: none;
+  transition: color var(--dur-micro) var(--ease-out), background-color var(--dur-micro) var(--ease-out), border-color var(--dur-micro) var(--ease-out), opacity var(--dur-micro) var(--ease-out), transform var(--dur-instant) var(--ease-out);
+}
+
+:is(
+  .btn,
+  .primary-button,
+  .ghost-button,
+  .delete-confirm-button,
+  .rail-add,
+  .profile-action,
+  .chat-send-btn,
+  .voice-join-btn,
+  .mute-btn,
+  .device-refresh-button
+):active:not(:disabled) {
+  transform: scale(0.98);
+}
+
+:is(
+  .btn,
+  .primary-button,
+  .ghost-button,
+  .delete-confirm-button,
+  .rail-add,
+  .profile-action,
+  .chat-send-btn,
+  .voice-join-btn,
+  .mute-btn,
+  .device-refresh-button
+):disabled {
+  opacity: 0.42;
+  transform: none;
+}
+
+.btn-primary,
+.primary-button,
+.chat-send-btn {
+  background: var(--accent-gradient);
+  color: var(--accent-ink);
+  box-shadow: var(--shadow-5981132aee);
+}
+
+.btn-primary:hover:not(:disabled),
+.primary-button:hover:not(:disabled),
+.chat-send-btn:hover:not(:disabled) {
+  background: var(--accent-gradient-hover);
+  transform: translateY(-1px);
+}
+
+.btn-secondary,
+.ghost-button,
+.device-refresh-button {
+  border-color: var(--stroke-default);
+  background: var(--palette-05a7ad3542);
+  color: var(--text-secondary);
+}
+
+.btn-secondary:hover:not(:disabled),
+.ghost-button:hover:not(:disabled),
+.device-refresh-button:hover:not(:disabled) {
+  border-color: var(--stroke-strong);
+  background: var(--palette-48efceec8f);
+  color: var(--text-primary);
+}
+
+.btn-subtle,
+.voice-join-btn {
+  border-color: var(--accent-border);
+  background: var(--accent-bg);
+  color: var(--accent-text);
+}
+
+.btn-danger,
+.delete-confirm-button {
+  border-color: var(--palette-fbf917fdbe);
+  background: var(--danger-bg);
+  color: var(--danger-text);
+}
+
+.btn-ghost {
+  background: transparent;
+  color: var(--text-secondary);
+}
+
+.btn-ghost:hover:not(:disabled) {
+  background: var(--palette-7408cbcebd);
+  color: var(--text-primary);
+}
+
+.btn-icon {
+  width: var(--control-min);
+  min-width: var(--control-min);
+  height: var(--control-min);
+  padding: 0;
+}
+
+.btn-icon svg,
+.lucide {
+  width: 20px;
+  height: 20px;
+  flex: 0 0 auto;
+  stroke-width: 1.8;
+}
+
+.btn-sm {
+  min-height: var(--control-min);
+  padding-inline: var(--s-5);
+  font-size: var(--t-small);
+}
+
+.btn-lg {
+  min-height: 50px;
+  padding-inline: var(--s-8);
+}
+
+.icon-label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-4);
+}

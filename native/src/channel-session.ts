@@ -1,6 +1,5 @@
 import { App } from "@capacitor/app";
 import type { PluginListenerHandle } from "@capacitor/core";
-import QRCode from "qrcode";
 import {
   AdaptivePlaybackController,
   type AdaptivePressure,
@@ -106,6 +105,16 @@ import {
   shouldReplaceWatcherForRouteAdvice,
 } from "./playback-continuity";
 import { RoomCompanion, roomSidebarMarkup } from "./room-companion";
+import { AmbientLightController } from "./ui/ambient-light";
+import { dialogController } from "./ui/dialog-controller";
+import {
+  closeTopmostFloatingSurface,
+  FloatingSurface,
+} from "./ui/floating-surface";
+import { hydrateIcons } from "./ui/icons";
+import { animateElement } from "./ui/motion-controller";
+import { PresenceController } from "./ui/presence-controller";
+import { VirtualGrid } from "./ui/virtual-grid";
 import {
   isVerifiedEmergencyTrackSettings,
   SfuSession,
@@ -172,6 +181,8 @@ export interface ChannelSessionOptions {
     type?: boolean | "info" | "warn" | "danger",
   ) => void;
   onLeave: () => void | Promise<void>;
+  showInviteOnStart?: boolean;
+  operationSignal?: AbortSignal;
 }
 
 interface OutboundPeer {
@@ -344,7 +355,10 @@ function embyEndpointRowMarkup(
       <label class="emby-endpoint-path"><span>路径</span>
         <input data-emby-endpoint-path type="text" value="${escapeHtml(draft.path)}" placeholder="/emby（可选）" />
       </label>
-      <button data-remove-emby-endpoint class="emby-endpoint-remove" type="button" aria-label="删除此备用线路" ${primary ? "hidden" : ""}>×</button>
+      <button data-remove-emby-endpoint class="emby-endpoint-remove" type="button"
+              aria-label="删除此备用线路" ${primary ? "hidden" : ""}>
+        <i data-lucide="x"></i>
+      </button>
     </div>
   `;
 }
@@ -354,7 +368,9 @@ function embyEndpointEditorMarkup(context: "login" | "manage", initial = ""): st
     <section class="emby-endpoint-editor" data-emby-endpoint-editor="${context}">
       <header>
         <div><strong>服务器线路</strong><span>每台服务器一组，可配置最多 8 条备用入口</span></div>
-        <button type="button" data-add-emby-endpoint class="ghost-button emby-endpoint-add">＋ 添加备用线路</button>
+        <button type="button" data-add-emby-endpoint class="ghost-button emby-endpoint-add">
+          <i data-lucide="plus"></i>添加备用线路
+        </button>
       </header>
       <div class="emby-endpoint-list" data-emby-endpoint-list>
         ${embyEndpointRowMarkup(safeEmbyEndpointDraft(initial), true)}
@@ -367,6 +383,7 @@ function embyEndpointEditorMarkup(context: "login" | "manage", initial = ""): st
 export async function openChannelSession(
   options: ChannelSessionOptions,
 ): Promise<void> {
+  options.operationSignal?.throwIfAborted();
   const {
     root,
     desktop,
@@ -747,12 +764,16 @@ export async function openChannelSession(
     sessionStorage.setItem(resumeTokenKey, resumeToken);
   }
   let dockHideTimer: number | undefined;
-  let dockChatCloseTimer: number | undefined;
+  let fullscreenHintTimer: number | undefined;
   let activeBroadcastMode: "screen" | "emby" = "screen";
   let broadcastModeTransition = 0;
-  let broadcastModeAnimations: Animation[] = [];
+  let broadcastModeAbort: AbortController | undefined;
   const sessionUiAbortController = new AbortController();
-  const dialogOpeners = new WeakMap<HTMLDialogElement, HTMLElement>();
+  let ambientLight: AmbientLightController | undefined;
+  let dockMoreSurface: FloatingSurface | undefined;
+  let profileSurface: FloatingSurface | undefined;
+  let initialInvitePending = options.showInviteOnStart === true;
+  let connectionProgressDelay: number | undefined;
   let danmakuEnabled =
     localStorage.getItem("synced:danmaku") !== "false";
   let mobileGestureHudTimer: number | undefined;
@@ -802,6 +823,14 @@ export async function openChannelSession(
           aria-label="修改昵称，当前昵称 ${escapeHtml(nickname)}"
           title="${escapeHtml(nickname)} · 点击修改昵称"
         >${escapeHtml(Array.from(nickname)[0] || "友")}</button>
+        <div id="session-profile-menu" class="profile-popover" hidden>
+          <label for="session-nickname-input">频道昵称</label>
+          <input id="session-nickname-input" type="text" maxlength="24"
+                 autocomplete="nickname" value="${escapeHtml(nickname)}" />
+          <button id="save-session-nickname" class="btn btn-primary" type="button">
+            保存昵称
+          </button>
+        </div>
       </aside>
       <main class="stage-column">
         <header class="channel-header session-header">
@@ -814,7 +843,7 @@ export async function openChannelSession(
           </div>
           <div class="channel-header-actions">
             <div
-              class="hud-bar glass-a is-idle"
+              class="hud-bar session-status-line is-idle"
               id="hud-bar"
               data-playback-state="idle"
               aria-label="连接与播放状态，当前无放映"
@@ -824,12 +853,10 @@ export async function openChannelSession(
                 <span class="dot" id="hud-signal-dot"></span>
                 <span class="hud-label" id="hud-signal-text">连接中</span>
               </button>
-              <span class="hud-divider" aria-hidden="true"></span>
               <span class="hud-track" id="hud-media" role="status" aria-live="polite">
                 <span class="hud-label" id="hud-media-text">等待放映</span>
               </span>
-              <span class="hud-divider" aria-hidden="true"></span>
-              <span class="hud-track" id="hud-voice" role="status" aria-live="polite">
+              <span class="hud-track hud-voice-compact" id="hud-voice" role="status" aria-live="polite">
                 <span class="meter" id="hud-voice-meter" aria-hidden="true">
                   <i></i><i></i><i></i>
                 </span>
@@ -841,26 +868,55 @@ export async function openChannelSession(
                 ? `<button id="broadcast-action" class="btn btn-subtle header-broadcast-action" type="button" hidden>停止放映</button>`
                 : ""
             }
-            <button id="session-invite" class="btn btn-secondary" type="button">邀请</button>
-            <button id="leave-room" class="btn btn-danger" type="button">退出</button>
+            <button id="session-companion" class="btn btn-ghost btn-icon" type="button"
+                    aria-label="打开聊天与成员" title="聊天与成员">
+              <i data-lucide="users"></i>
+            </button>
+            <button id="session-invite" class="btn btn-secondary" type="button"
+                    aria-label="邀请朋友" title="邀请朋友" data-tooltip="邀请朋友">
+              <i data-lucide="user-plus"></i><span>邀请</span>
+            </button>
+            <button id="leave-room" class="btn btn-danger" type="button"
+                    aria-label="退出频道" title="退出频道" data-tooltip="退出频道">
+              <i data-lucide="log-out"></i><span>退出</span>
+            </button>
           </div>
         </header>
         <section id="player-stage" class="video-stage viewer-stage${nativeAndroid ? " native-android-player" : ""}">
+          <div class="ambient-light-field" aria-hidden="true"></div>
           <video id="channel-video" autoplay playsinline hidden></video>
           <canvas id="video-enhancement-canvas" class="video-enhancement-canvas" hidden aria-hidden="true"></canvas>
           <div id="video-enhancement-subtitles" class="video-enhancement-subtitles" hidden aria-hidden="true"></div>
           <audio id="channel-movie-audio" autoplay playsinline hidden></audio>
           <div id="stage-danmaku" class="danmaku-layer" aria-hidden="true"></div>
           <div id="receiver-stream-badge" class="receiver-stream-badge" hidden aria-live="polite"></div>
-          <div id="channel-empty" class="channel-empty">
-            <span aria-hidden="true">▣</span>
-            <h2>已经在频道里了</h2>
-            <p>当前无人放映。大家可以先连麦聊天，Windows 成员随时可以开始共享。</p>
-            ${
-              desktop
-                ? `<button id="stage-start-broadcast" class="primary-button compact-button" type="button">开始放映</button>`
-                : `<small>等待电脑端成员开始放映</small>`
-            }
+          <div id="channel-empty" class="channel-empty channel-lobby">
+            <div class="lobby-light-field" data-decorative-motion aria-hidden="true">
+              <i></i><i></i><i></i>
+            </div>
+            <span class="eyebrow">频道大厅</span>
+            <h2>${escapeHtml(channelName)}</h2>
+            <button id="lobby-copy-room" class="lobby-room-code tnum" type="button"
+                    aria-label="复制频道码 ${escapeHtml(room)}">
+              ${escapeHtml(room.slice(0, 4))}<span>·</span>${escapeHtml(room.slice(4))}
+            </button>
+            <div id="lobby-participants" class="lobby-participants" aria-live="polite">
+              <span class="lobby-avatar" title="${escapeHtml(nickname)}">${escapeHtml(Array.from(nickname)[0] || "友")}</span>
+            </div>
+            <p id="lobby-participant-summary">正在同步频道成员…</p>
+            <div class="lobby-actions">
+              ${
+                desktop
+                  ? `<button id="stage-start-broadcast" class="btn btn-primary" type="button">
+                       <i data-lucide="monitor-play"></i>开始放映
+                     </button>`
+                  : `<span class="lobby-waiting-note">等待 Windows 成员开始放映</span>`
+              }
+              <button id="lobby-invite" class="btn btn-secondary" type="button">
+                <i data-lucide="user-plus"></i>邀请朋友
+              </button>
+            </div>
+            <p id="lobby-voice-summary" class="lobby-voice-summary">还没有人加入连麦</p>
           </div>
           <div id="channel-buffering" class="channel-buffering" hidden>
             <span class="buffer-spinner" aria-hidden="true"></span>
@@ -874,8 +930,8 @@ export async function openChannelSession(
               ? `
                 <output id="mobile-playback-stats" class="mobile-playback-stats" aria-live="polite" hidden>等待画面数据</output>
                 <div id="mobile-gesture-hud" class="mobile-gesture-hud" hidden aria-live="polite">
-                  <svg class="brightness-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.5"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
-                  <svg class="volume-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M11 5 6.5 9H3v6h3.5l4.5 4V5ZM15.5 8.5a5 5 0 0 1 0 7M18.5 5.5a9 9 0 0 1 0 13"/></svg>
+                  <i class="brightness-icon" data-lucide="sun"></i>
+                  <i class="volume-icon" data-lucide="volume-2"></i>
                   <strong id="mobile-gesture-value">50%</strong>
                 </div>
                 <div class="mobile-gesture-hint" aria-hidden="true">左侧滑动调亮度 · 右侧滑动调音量</div>
@@ -891,23 +947,23 @@ export async function openChannelSession(
           <div class="progress-thumb" id="progress-thumb" aria-hidden="true"></div>
           <span class="progress-tooltip" id="progress-tooltip" aria-hidden="true"></span>
         </div>
-        <div class="dock glass-a" id="stage-dock" role="toolbar" aria-label="播放控制" hidden>
+        <div class="dock material-clear" id="stage-dock" role="toolbar" aria-label="播放控制" hidden>
           <div class="dock-cluster dock-transport" role="group" aria-label="播放">
             <button class="btn btn-ghost btn-icon" id="dock-play"
                     type="button" aria-label="播放" aria-pressed="false"
                     title="播放 / 暂停" data-tooltip="播放 / 暂停">
-              <svg class="play-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m8 5 11 7-11 7z"></path></svg>
-              <svg class="pause-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14M16 5v14"></path></svg>
+              <i class="play-icon" data-lucide="play"></i>
+              <i class="pause-icon" data-lucide="pause"></i>
             </button>
             <button class="btn btn-ghost btn-icon btn-icon-sm" id="dock-rewind"
                     type="button" aria-label="后退 10 秒"
                     title="后退 10 秒" data-tooltip="后退 10 秒">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 7 4 12l5 5M5 12h8a6 6 0 1 1 0 12"></path><text x="11" y="15">10</text></svg>
+              <i data-lucide="rotate-ccw"></i>
             </button>
             <button class="btn btn-ghost btn-icon btn-icon-sm" id="dock-forward"
                     type="button" aria-label="前进 10 秒"
                     title="前进 10 秒" data-tooltip="前进 10 秒">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 7 5 5-5 5M19 12h-8a6 6 0 1 0 0 12"></path><text x="3" y="15">10</text></svg>
+              <i data-lucide="rotate-cw"></i>
             </button>
           </div>
           <span class="dock-sep dock-sep-after-transport" aria-hidden="true"></span>
@@ -917,7 +973,7 @@ export async function openChannelSession(
               <button class="btn btn-ghost btn-icon btn-icon-sm" id="dock-mute"
                       type="button" aria-label="静音切换" aria-pressed="false"
                       title="影片静音" data-tooltip="影片静音">
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 5 6.5 9H3v6h3.5l4.5 4V5ZM15.5 8.5a5 5 0 0 1 0 7M18.5 5.5a9 9 0 0 1 0 13"></path></svg>
+                <i data-lucide="volume-2"></i>
               </button>
               <input class="slider" type="range" min="0" max="1" step="0.05"
                      id="dock-volume" aria-label="影片音量" value="${movieVolume}">
@@ -932,46 +988,69 @@ export async function openChannelSession(
                     aria-pressed="${danmakuEnabled}"
                     title="${danmakuEnabled ? "弹幕已开启，点击关闭" : "弹幕已关闭，点击开启"}"
                     data-tooltip="${danmakuEnabled ? "弹幕：已开启" : "弹幕：已关闭"}">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h10M4 18h13"></path></svg>
+              <i data-lucide="list"></i>
             </button>
             <button class="btn btn-ghost btn-icon btn-icon-sm" id="dock-chat"
                       type="button" title="打开聊天" data-tooltip="聊天"
                       aria-label="快捷发送弹幕" aria-pressed="false"
                       aria-expanded="false" aria-controls="dock-chat-composer">
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v12H9l-5 4z"></path></svg>
+                <i data-lucide="message-circle"></i>
               </button>
           </div>
           <span class="dock-sep" aria-hidden="true"></span>
           <div class="dock-cluster dock-view" role="group" aria-label="画面与窗口">
             <button class="btn btn-ghost btn-icon btn-icon-sm" id="dock-quality"
                     type="button" title="画面设置" data-tooltip="画面设置" aria-label="画面设置">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h10M18 7h2M4 17h2M10 17h10M14 4v6M6 14v6"></path></svg>
+              <i data-lucide="sliders-horizontal"></i>
             </button>
             <button class="btn btn-ghost btn-icon btn-icon-sm" id="dock-emby-settings"
                     type="button" title="流设置" data-tooltip="音轨 / 字幕 / 画质" aria-label="流设置" hidden>
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20h9M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
+              <i data-lucide="settings"></i>
             </button>
-            <button class="btn btn-ghost btn-icon btn-icon-sm${fullscreenFit === "smart" ? " is-on" : ""}" id="dock-smart-crop"
-                    type="button" aria-label="${fullscreenFit === "smart" ? "关闭智能裁剪" : "开启智能裁剪"}"
-                    aria-pressed="${fullscreenFit === "smart"}"
-                    title="智能裁剪（全屏自动去黑边）" data-tooltip="智能裁剪">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3v14a2 2 0 0 0 2 2h12M3 7h14a2 2 0 0 1 2 2v12M10 10h4v4h-4z"/></svg>
-            </button>
-            <button class="btn btn-ghost btn-icon btn-icon-sm" id="dock-pip"
-                    type="button" role="switch" aria-label="小窗模式已关闭，点击开启"
-                    aria-checked="false" aria-pressed="false"
-                    title="小窗模式" data-tooltip="小窗模式">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v14H4zM12.5 11.5h5v4h-5z"></path></svg>
-              <span class="mini-window-state sr-only" aria-hidden="true">关</span>
+            <button class="btn btn-ghost btn-icon btn-icon-sm" id="dock-more"
+                    type="button" aria-label="更多播放操作" aria-expanded="false"
+                    aria-controls="dock-more-menu" title="更多" data-tooltip="更多">
+              <i data-lucide="ellipsis"></i>
             </button>
             <button class="btn btn-ghost btn-icon btn-icon-sm" id="dock-fullscreen"
                     type="button" aria-label="进入全屏" aria-pressed="false" disabled
                     title="全屏播放" data-tooltip="全屏播放">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5"></path></svg>
+              <i data-lucide="maximize-2"></i>
             </button>
-            </div>
           </div>
-          <form id="dock-chat-composer" class="dock-chat-composer glass-b"
+          <div id="dock-more-menu" class="dock-more-menu" hidden role="menu"
+               aria-label="更多播放操作">
+            <button class="dock-menu-item${fullscreenFit === "smart" ? " is-on" : ""}" id="dock-smart-crop"
+                    type="button" role="menuitemcheckbox"
+                    aria-checked="${fullscreenFit === "smart"}"
+                    aria-label="${fullscreenFit === "smart" ? "关闭智能裁剪" : "开启智能裁剪"}">
+              <i data-lucide="scan-line"></i><span>智能裁剪</span><small>全屏去黑边</small>
+            </button>
+            <button class="dock-menu-item" id="dock-highlight" type="button" role="menuitemcheckbox"
+                    aria-checked="${highlightCorrection}">
+              <i data-lucide="sliders-horizontal"></i><span>高光修正</span><small>${highlightCorrection ? "已开启" : "已关闭"}</small>
+            </button>
+            <button class="dock-menu-item" id="dock-enhancement" type="button" role="menuitemcheckbox"
+                    aria-checked="${videoEnhancementPreference !== "off"}">
+              <i data-lucide="sparkles"></i><span>视频增强</span><small>${videoEnhancementPreference === "off" ? "已关闭" : "自动"}</small>
+            </button>
+            <button class="dock-menu-item" id="dock-pip"
+                    type="button" role="menuitemcheckbox" aria-label="小窗模式已关闭，点击开启"
+                    aria-checked="false">
+              <i data-lucide="picture-in-picture-2"></i><span>小窗模式</span>
+              <small class="mini-window-state">关</small>
+            </button>
+            <button class="dock-menu-item" id="dock-stats" type="button" role="menuitem">
+              <i data-lucide="radio"></i><span>统计信息</span><small>可关闭面板</small>
+            </button>
+            <button class="dock-menu-item" id="dock-diagnostics" type="button" role="menuitem">
+              <i data-lucide="wifi"></i><span>线路诊断</span><small>网络与媒体路径</small>
+            </button>
+            <button class="dock-menu-item" id="dock-shortcuts" type="button" role="menuitem">
+              <i data-lucide="command"></i><span>键盘快捷键</span><small>随时查看</small>
+            </button>
+          </div>
+          <form id="dock-chat-composer" class="dock-chat-composer material-regular"
                 aria-label="快捷发送弹幕" hidden>
             <label class="sr-only" for="dock-chat-input">弹幕内容</label>
             <input id="dock-chat-input" class="dock-chat-input" type="text"
@@ -980,22 +1059,81 @@ export async function openChannelSession(
             <button id="dock-chat-send" class="dock-chat-send btn btn-primary"
                     type="submit">发送</button>
             <button id="dock-chat-close" class="dock-chat-close btn btn-ghost btn-icon"
-                    type="button" aria-label="关闭快捷弹幕">×</button>
+                    type="button" aria-label="关闭快捷弹幕"><i data-lucide="x"></i></button>
           </form>
         </section>
       </main>
       ${roomSidebarMarkup()}
     </div>
-    <dialog id="invite-dialog" class="invite-dialog">
-      <button data-close-invite type="button" aria-label="关闭">×</button>
-      <span class="eyebrow">INVITE FRIENDS</span>
-      <h2>邀请朋友进入频道</h2>
-      <button id="copy-room" class="invite-code" type="button" aria-label="复制频道码 ${escapeHtml(room)}">
-        <span>${escapeHtml(room)}</span><small>点击复制</small>
+    <section id="session-connection-progress" class="session-connection-progress material-card"
+             aria-labelledby="session-connection-title" aria-live="polite" hidden>
+      <div class="connection-orbit" aria-hidden="true"></div>
+      <span class="eyebrow">正在进入光域</span>
+      <h2 id="session-connection-title">正在连接服务器</h2>
+      <ol class="connection-steps">
+        <li data-connection-step="server" data-state="active">
+          <i data-lucide="circle"></i><span>连接服务器</span>
+        </li>
+        <li data-connection-step="room" data-state="pending">
+          <i data-lucide="circle"></i><span>加入频道</span>
+        </li>
+        <li data-connection-step="members" data-state="pending">
+          <i data-lucide="circle"></i><span>同步成员</span>
+        </li>
+        <li data-connection-step="media" data-state="pending">
+          <i data-lucide="circle"></i><span>准备媒体线路</span>
+        </li>
+      </ol>
+      <button id="cancel-session-connection" class="btn btn-secondary" type="button">取消</button>
+    </section>
+    <dialog id="invite-dialog" class="invite-dialog dialog">
+      <div class="dialog-header">
+        <div>
+          <span class="eyebrow">${createIfMissing ? "频道已准备好" : "邀请朋友"}</span>
+          <h2>${createIfMissing ? "把朋友带进这束光" : "邀请朋友进入频道"}</h2>
+        </div>
+        <button data-close-invite class="btn btn-ghost btn-icon" type="button" aria-label="关闭">
+          <i data-lucide="x"></i>
+        </button>
+      </div>
+      <p class="invite-channel-name">${escapeHtml(channelName)}</p>
+      <button id="copy-room" class="invite-code tnum" type="button" aria-label="复制频道码 ${escapeHtml(room)}">
+        <span>${escapeHtml(room.slice(0, 4))}<i aria-hidden="true">·</i>${escapeHtml(room.slice(4))}</span>
+        <small><i data-lucide="copy"></i>点击复制频道码</small>
       </button>
-      ${desktop ? `<img id="invite-qr" alt="频道邀请二维码" />` : ""}
-      <p>${desktop ? "朋友扫码或输入频道码即可加入；Windows 端也可以接棒放映。" : "点击上方频道码即可复制并发给朋友。"}</p>
-      <button id="copy-invite" class="primary-button compact-button" type="button">复制邀请信息</button>
+      ${desktop ? `<img id="invite-qr" alt="加入 ${escapeHtml(channelName)} 的二维码" width="220" height="220" />` : ""}
+      <p class="invite-help">${desktop ? "朋友扫码、打开邀请链接或输入频道码即可加入。" : "复制邀请或使用系统分享发送给朋友。"}</p>
+      <div class="dialog-actions invite-actions">
+        <button id="copy-invite" class="btn btn-secondary" type="button">
+          <i data-lucide="copy"></i>复制邀请
+        </button>
+        <button id="share-invite" class="btn btn-secondary" type="button">
+          <i data-lucide="share-2"></i>系统分享
+        </button>
+        <button id="enter-created-room" class="btn btn-primary" type="button">
+          进入频道
+        </button>
+      </div>
+    </dialog>
+    <dialog id="playback-diagnostics-dialog" class="dialog playback-diagnostics-dialog">
+      <div class="dialog-header">
+        <div>
+          <span class="eyebrow">播放诊断</span>
+          <h2 id="playback-diagnostics-title">统计信息</h2>
+        </div>
+        <button class="btn btn-ghost btn-icon" type="button"
+                data-close-playback-diagnostics aria-label="关闭">
+          <i data-lucide="x"></i>
+        </button>
+      </div>
+      <output id="desktop-playback-stats" class="playback-stats-output"
+              aria-live="polite">等待媒体统计数据</output>
+      <dl id="playback-route-details" class="playback-route-details">
+        <div><dt>信令</dt><dd id="diagnostic-signal-route">正在连接</dd></div>
+        <div><dt>媒体</dt><dd id="diagnostic-media-route">等待放映</dd></div>
+        <div><dt>网络建议</dt><dd id="diagnostic-network-advice">正在检测</dd></div>
+        <div><dt>隐私</dt><dd>只显示路径状态，不公开本地地址</dd></div>
+      </dl>
     </dialog>
     <dialog id="picture-dialog" class="picture-dialog">
       <header>
@@ -1003,7 +1141,7 @@ export async function openChannelSession(
           <span class="eyebrow">PLAYBACK</span>
           <h2>画面设置</h2>
         </div>
-        <button data-close-picture type="button" aria-label="关闭画面设置">×</button>
+        <button data-close-picture type="button" aria-label="关闭画面设置"><i data-lucide="x"></i></button>
       </header>
       <p id="picture-source-summary" class="picture-source-summary">等待放映画面</p>
       <div id="receiver-quality" class="receiver-quality picture-quality" aria-label="观看画质偏好" hidden>
@@ -1063,7 +1201,7 @@ export async function openChannelSession(
           <span class="eyebrow">STREAM</span>
           <h2>流设置</h2>
         </div>
-        <button data-close-emby-settings type="button" aria-label="关闭流设置">×</button>
+        <button data-close-emby-settings type="button" aria-label="关闭流设置"><i data-lucide="x"></i></button>
       </header>
       <p id="emby-settings-summary" class="picture-source-summary">Emby 高清放映中</p>
       <div class="emby-live-settings">
@@ -1108,18 +1246,81 @@ export async function openChannelSession(
           <dialog id="broadcast-dialog" class="source-dialog broadcast-dialog">
             <header>
               <div><span class="eyebrow">START BROADCAST</span><h2>选择放映模式</h2></div>
-              <button data-close-broadcast type="button" aria-label="关闭">×</button>
+              <button data-close-broadcast type="button" aria-label="关闭"><i data-lucide="x"></i></button>
             </header>
             <div class="broadcast-mode-tabs" role="tablist" aria-label="放映模式" data-active-mode="screen">
               <span class="broadcast-mode-glider" aria-hidden="true"></span>
-              <button id="screen-mode-tab" class="active" type="button" role="tab" aria-selected="true" data-broadcast-mode="screen">
+              <button id="screen-mode-tab" class="active" type="button" role="tab"
+                      aria-selected="true" aria-controls="screen-broadcast-panel"
+                      data-selected="true" tabindex="0" data-broadcast-mode="screen">
                 <strong>普通屏幕共享</strong><span>兼容所有播放器和内容</span>
               </button>
-              <button id="emby-mode-tab" type="button" role="tab" aria-selected="false" data-broadcast-mode="emby">
+              <button id="emby-mode-tab" type="button" role="tab"
+                      aria-selected="false" aria-controls="emby-broadcast-panel"
+                      data-selected="false" tabindex="-1" data-broadcast-mode="emby">
                 <strong>Emby 高清播放</strong><span>服务器原始编码流，不捕获屏幕</span>
               </button>
             </div>
-            <section id="screen-broadcast-panel" class="broadcast-mode-panel">
+            <section id="screen-broadcast-panel" class="broadcast-mode-panel"
+                     role="tabpanel" aria-labelledby="screen-mode-tab">
+            <div class="source-toolbar">
+              <label>
+                <i data-lucide="search" aria-hidden="true"></i>
+                <input id="session-source-search" type="search" autocomplete="off"
+                       placeholder="搜索播放器或窗口名称" aria-label="搜索可分享窗口" />
+              </label>
+              <span id="session-source-count">尚未读取</span>
+              <button id="refresh-session-sources" class="btn btn-ghost" type="button">
+                <i data-lucide="refresh-cw"></i>刷新
+              </button>
+            </div>
+            <div class="source-filter-row" role="group" aria-label="筛选窗口来源">
+              <button class="btn btn-subtle" type="button" data-source-filter="recent" aria-pressed="false">最近</button>
+              <button class="btn btn-subtle" type="button" data-source-filter="player" aria-pressed="false">播放器</button>
+              <button class="btn btn-subtle" type="button" data-source-filter="browser" aria-pressed="false">浏览器</button>
+              <button class="btn btn-subtle" type="button" data-source-filter="all" aria-pressed="true">全部</button>
+            </div>
+            <div id="session-source-grid" class="source-grid" role="listbox"
+                 aria-label="可分享窗口" aria-live="polite">
+              ${Array.from({ length: 6 }, () => `<div class="source-card source-skeleton" aria-hidden="true"><span></span><i></i></div>`).join("")}
+            </div>
+            <section id="selected-source-summary" class="selected-source-summary" aria-live="polite">
+              <div>
+                <span>当前来源</span>
+                <strong id="selected-source-name">请选择要放映的窗口</strong>
+                <small id="selected-source-detail">选择后可在开始前确认分辨率与声音能力</small>
+              </div>
+              <i data-lucide="monitor-play" aria-hidden="true"></i>
+            </section>
+            <section class="screen-smart-default" aria-labelledby="screen-smart-title">
+              <div>
+                <span>画质</span>
+                <strong id="screen-smart-title">智能推荐</strong>
+                <small id="screen-smart-reason">依据房间人数、实时上行与窗口尺寸自动选择</small>
+              </div>
+              <fieldset class="content-mode-field">
+                <legend>内容</legend>
+                <div class="segmented-control">
+                  ${([
+                    ["motion", "电影"],
+                    ["detail", "文字"],
+                    ["balanced", "高动态"],
+                  ] as const)
+                    .map(
+                      ([value, label]) => `
+                        <button type="button" class="${screenContentMode === value ? "active" : ""}"
+                                data-screen-content-mode="${value}"
+                                aria-pressed="${screenContentMode === value}">
+                          ${label}
+                        </button>
+                      `,
+                    )
+                    .join("")}
+                </div>
+              </fieldset>
+            </section>
+            <details id="broadcast-advanced" class="broadcast-advanced">
+              <summary>高级编码设置</summary>
             <section id="broadcast-network-card" class="broadcast-network-card" data-confidence="low" aria-labelledby="broadcast-network-title">
               <header>
                 <div>
@@ -1165,37 +1366,24 @@ export async function openChannelSession(
                   ).join("")}
                 </div>
               </fieldset>
-              <fieldset class="quality-field content-mode-field">
-                <legend>共享内容类型</legend>
-                <div class="quality-grid">
-                  ${([
-                    ["detail", "文字细节", "代码、网页、PPT，弱网先保分辨率"],
-                    ["motion", "动态画面", "电影、游戏，弱网先保帧率"],
-                    ["balanced", "智能均衡", "兼顾清晰度与运动流畅度"],
-                  ] as const)
-                    .map(
-                      ([value, label, description]) => `
-                        <button type="button" class="quality-option ${screenContentMode === value ? "active" : ""}" data-screen-content-mode="${value}">
-                          <strong>${label}</strong><span>${description}</span>
-                        </button>
-                      `,
-                    )
-                    .join("")}
-                </div>
-              </fieldset>
               <p id="session-quality-summary" class="quality-summary">${escapeHtml(buildQualityPreset(resolutionKey, frameRate).detail)}</p>
             </div>
-            <div class="source-toolbar">
-              <label>
-                <span aria-hidden="true">⌕</span>
-                <input id="session-source-search" type="search" autocomplete="off" placeholder="搜索播放器或窗口名称" aria-label="搜索可分享窗口" />
-              </label>
-              <span id="session-source-count">尚未读取</span>
-              <button id="refresh-session-sources" class="ghost-button" type="button">↻ 刷新窗口</button>
-            </div>
-            <div id="session-source-grid" class="source-grid"><div class="loading-state">打开后读取窗口列表</div></div>
+            </details>
+            <footer class="source-dialog-footer">
+              <div>
+                <strong id="broadcast-ready-title">选择一个来源后即可开始</strong>
+                <small id="broadcast-ready-detail">启动前会再次确认画质、帧率和声音</small>
+              </div>
+              <div class="source-dialog-actions">
+                <button id="cancel-screen-broadcast" class="btn btn-secondary" type="button">取消</button>
+                <button id="start-screen-broadcast" class="btn btn-primary" type="button" disabled>
+                  <i data-lucide="cast"></i><span id="start-screen-broadcast-label">开始放映</span>
+                </button>
+              </div>
+            </footer>
             </section>
-            <section id="emby-broadcast-panel" class="broadcast-mode-panel emby-broadcast-panel" hidden>
+            <section id="emby-broadcast-panel" class="broadcast-mode-panel emby-broadcast-panel"
+                     role="tabpanel" aria-labelledby="emby-mode-tab" hidden>
               <div id="emby-login-panel" class="emby-login-panel">
                 <div id="emby-saved-accounts" class="emby-saved-accounts" hidden>
                   <div class="emby-saved-heading">
@@ -1217,33 +1405,84 @@ export async function openChannelSession(
                 <p id="emby-login-status" class="emby-status" aria-live="polite"></p>
               </div>
               <div id="emby-library-panel" class="emby-library-panel" hidden>
-                <div class="emby-account-row">
-                  <div><strong id="emby-account-name">已连接 Emby</strong><span id="emby-account-detail"></span></div>
-                  <div class="emby-account-actions">
-                     <select id="emby-account-switch" aria-label="切换 Emby 服务器"></select>
-                     <button id="emby-manage-endpoints" class="ghost-button" type="button">管理线路</button>
-                     <button id="emby-add-account" class="ghost-button" type="button">添加服务器</button>
-                    <button id="emby-logout" class="ghost-button danger-ghost" type="button">移除此账户</button>
-                  </div>
+                <div class="emby-library-layout">
+                  <nav class="emby-library-nav" aria-label="Emby 媒体库">
+                    <div class="emby-library-identity">
+                      <strong id="emby-account-name">已连接 Emby</strong>
+                      <span id="emby-account-detail"></span>
+                    </div>
+                    <button type="button" data-emby-nav-mode="all" aria-current="page" tabindex="0">
+                      <i data-lucide="library"></i>首页
+                    </button>
+                    <button type="button" data-emby-nav-mode="resume" tabindex="-1">
+                      <i data-lucide="play"></i>继续观看
+                    </button>
+                    <button type="button" data-emby-nav-mode="movies" tabindex="-1">
+                      <i data-lucide="monitor-play"></i>电影
+                    </button>
+                    <button type="button" data-emby-nav-mode="episodes" tabindex="-1">
+                      <i data-lucide="library"></i>剧集
+                    </button>
+                    <button type="button" data-emby-nav-mode="favorite" tabindex="-1">
+                      <i data-lucide="heart"></i>收藏
+                    </button>
+                    <button type="button" data-emby-nav-mode="latest" tabindex="-1">
+                      <i data-lucide="sparkles"></i>最近添加
+                    </button>
+                    <label class="emby-library-select-label">
+                      <span>媒体库</span>
+                      <select id="emby-library-select">
+                        <option value="">全部媒体</option>
+                      </select>
+                    </label>
+                    <button id="emby-open-settings" type="button">
+                      <i data-lucide="settings"></i>账户与线路设置
+                    </button>
+                  </nav>
+                  <section class="emby-library-content">
+                    <header class="emby-content-header">
+                      <div>
+                        <span class="eyebrow">LIBRARY</span>
+                        <h3 id="emby-content-title">媒体首页</h3>
+                      </div>
+                      <select id="emby-account-switch" aria-label="切换 Emby 服务器"></select>
+                    </header>
+                    <div class="emby-browser-toolbar">
+                      <label class="emby-search">
+                        <i data-lucide="search" aria-hidden="true"></i>
+                        <input id="emby-search-input" type="search" maxlength="160"
+                               placeholder="搜索电影、剧集或集名" aria-label="搜索 Emby 媒体" />
+                      </label>
+                      <select id="emby-browse-filter" class="sr-only" aria-label="内容筛选">
+                        <option value="all">全部可播放内容</option>
+                        <option value="resume">继续观看</option>
+                        <option value="latest">最近新增</option>
+                        <option value="movies">电影与视频</option>
+                        <option value="episodes">剧集</option>
+                        <option value="favorite">收藏</option>
+                      </select>
+                      <button id="emby-refresh-library" class="btn btn-ghost" type="button">
+                        <i data-lucide="refresh-cw"></i>刷新
+                      </button>
+                    </div>
+                    <p id="emby-library-status" class="emby-status" aria-live="polite">
+                      登录后读取媒体库
+                    </p>
+                    <div id="emby-item-grid" class="emby-item-grid"></div>
+                    <button id="emby-load-more" class="btn btn-secondary emby-load-more"
+                            type="button" hidden>加载更多</button>
+                  </section>
                 </div>
-                <div class="emby-browser-toolbar">
-                  <label><span>媒体库</span><select id="emby-library-select"><option value="">全部媒体</option></select></label>
-                  <label><span>内容</span><select id="emby-browse-filter"><option value="all">全部可播放内容</option><option value="resume">继续观看</option><option value="latest">最近新增</option><option value="movies">电影与视频</option><option value="episodes">剧集</option></select></label>
-                  <label class="emby-search"><span>搜索</span><input id="emby-search-input" type="search" maxlength="160" placeholder="电影、剧集或集名" /></label>
-                  <button id="emby-refresh-library" class="ghost-button" type="button">刷新</button>
-                </div>
-                <p id="emby-library-status" class="emby-status" aria-live="polite">登录后读取媒体库</p>
-                <div id="emby-item-grid" class="emby-item-grid"></div>
-                <button id="emby-load-more" class="ghost-button emby-load-more" type="button" hidden>加载更多</button>
               </div>
             </section>
-          </dialog>
-        <dialog id="emby-item-popup" class="emby-item-popup-dialog">
-          <button type="button" data-close-emby-popup class="emby-popup-close" aria-label="关闭影片详情">×</button>
+        <aside id="emby-item-popup" class="emby-item-popup-dialog" hidden
+               aria-label="Emby 媒体详情">
+          <button type="button" data-close-emby-popup class="emby-popup-close"
+                  aria-label="关闭影片详情"><i data-lucide="x"></i></button>
           <div class="emby-popup-layout">
             <div class="emby-popup-poster">
               <img class="emby-popup-poster-img" alt="" hidden />
-              <div class="emby-popup-poster-placeholder" aria-hidden="true">▶</div>
+              <div class="emby-popup-poster-placeholder" aria-hidden="true"><i data-lucide="play"></i></div>
             </div>
             <div class="emby-popup-info">
               <div class="emby-popup-meta">
@@ -1296,7 +1535,7 @@ export async function openChannelSession(
                   <b>允许 HEVC 直传（自动检测）</b>
                   <small id="emby-hevc-support" aria-live="polite">正在检查本机与观众设备…</small>
                 </span>
-                <i tabindex="0" role="note" aria-label="HEVC 说明" title="HEVC 在相近画质下通常更省带宽，但 Windows、浏览器和手机的硬件解码支持并不一致。只有本机和当前所有观众都明确上报支持时才可开启；否则自动使用兼容性更高的 H.264。">?</i>
+                <i data-lucide="circle-help" tabindex="0" role="note" aria-label="HEVC 说明" title="HEVC 在相近画质下通常更省带宽，但 Windows、浏览器和手机的硬件解码支持并不一致。只有本机和当前所有观众都明确上报支持时才可开启；否则自动使用兼容性更高的 H.264。"></i>
               </label>
               <label id="emby-resume-option" class="emby-resume-option" hidden><input id="emby-resume-playback" type="checkbox" checked /><span id="emby-resume-label">从上次位置继续播放</span></label>
             </div>
@@ -1306,14 +1545,15 @@ export async function openChannelSession(
           <div class="emby-popup-actions">
             <button id="emby-start-from-popup" type="button" class="primary-button compact-button">开始 Emby 高清放映</button>
           </div>
-        </dialog>
+        </aside>
+          </dialog>
         <dialog id="emby-endpoint-dialog" class="emby-endpoint-dialog">
           <header>
             <div>
               <span class="eyebrow">ROUTES</span>
               <h2>管理 Emby 线路</h2>
             </div>
-            <button type="button" data-close-emby-endpoints aria-label="关闭线路管理">×</button>
+            <button type="button" data-close-emby-endpoints aria-label="关闭线路管理"><i data-lucide="x"></i></button>
           </header>
           <p class="emby-endpoint-dialog-note">备用线路会先匿名验证 Server Id；只有确认属于同一台 Emby 后，才会保存并在主线路故障时使用。</p>
           ${embyEndpointEditorMarkup("manage")}
@@ -1325,10 +1565,37 @@ export async function openChannelSession(
     }
   `;
 
+  hydrateIcons(root);
   const video = document.querySelector<HTMLVideoElement>("#channel-video");
   const movieAudio =
     document.querySelector<HTMLAudioElement>("#channel-movie-audio");
   const playerStage = document.querySelector<HTMLElement>("#player-stage");
+  const connectionProgress =
+    document.querySelector<HTMLElement>("#session-connection-progress");
+  const connectionTitle =
+    document.querySelector<HTMLElement>("#session-connection-title");
+  const connectionPresence = connectionProgress
+    ? new PresenceController(connectionProgress, {
+        enter: [
+          {
+            opacity: 0,
+            transform: "translate(-50%, calc(-50% + 8px)) scale(0.99)",
+          },
+          { opacity: 1, transform: "translate(-50%, -50%)" },
+        ],
+        exit: [
+          { opacity: 1, transform: "translate(-50%, -50%)" },
+          {
+            opacity: 0,
+            transform: "translate(-50%, calc(-50% - 3px)) scale(0.995)",
+          },
+        ],
+      })
+    : undefined;
+  if (video && playerStage) {
+    ambientLight = new AmbientLightController(video, playerStage);
+    ambientLight.start();
+  }
   const emptyState = document.querySelector<HTMLElement>("#channel-empty");
   const bufferingState =
     document.querySelector<HTMLElement>("#channel-buffering");
@@ -1350,12 +1617,59 @@ export async function openChannelSession(
     document.querySelector<HTMLOutputElement>("#movie-volume-value");
   const stageDock =
     document.querySelector<HTMLElement>("#stage-dock");
+  const dockMoreButton =
+    document.querySelector<HTMLButtonElement>("#dock-more");
+  const dockMoreMenu =
+    document.querySelector<HTMLElement>("#dock-more-menu");
+  const playbackDiagnosticsDialog =
+    document.querySelector<HTMLDialogElement>(
+      "#playback-diagnostics-dialog",
+    );
+  const embyItemPopup =
+    document.querySelector<HTMLElement>("#emby-item-popup");
+  const embyDetailPresence = embyItemPopup
+    ? new PresenceController(embyItemPopup, {
+        enter: [
+          { opacity: 0, transform: "translateX(18px)" },
+          { opacity: 1, transform: "none" },
+        ],
+        exit: [
+          { opacity: 1, transform: "none" },
+          { opacity: 0, transform: "translateX(10px)" },
+        ],
+      })
+    : undefined;
+  let embyDetailOpener: HTMLElement | undefined;
   const dockChatButton =
     document.querySelector<HTMLButtonElement>("#dock-chat");
   const dockChatComposer =
     document.querySelector<HTMLFormElement>("#dock-chat-composer");
   const dockChatInput =
     document.querySelector<HTMLInputElement>("#dock-chat-input");
+  const dockChatPresence = dockChatComposer
+    ? new PresenceController(dockChatComposer, {
+        enter: [
+          {
+            opacity: 0,
+            transform: "translateX(-50%) translateY(8px) scale(0.98)",
+          },
+          {
+            opacity: 1,
+            transform: "translateX(-50%) translateY(0) scale(1)",
+          },
+        ],
+        exit: [
+          {
+            opacity: 1,
+            transform: "translateX(-50%) translateY(0) scale(1)",
+          },
+          {
+            opacity: 0,
+            transform: "translateX(-50%) translateY(4px) scale(0.99)",
+          },
+        ],
+      })
+    : undefined;
   const stageProgress =
     document.querySelector<HTMLElement>("#stage-progress");
   const progressBuffer =
@@ -1516,44 +1830,182 @@ export async function openChannelSession(
   });
   void resourceBudgetMonitor.start().catch(() => undefined);
 
+  const connectionSteps = [
+    "server",
+    "room",
+    "members",
+    "media",
+  ] as const;
+  type ConnectionStep = (typeof connectionSteps)[number];
+
+  function setConnectionStep(
+    active: ConnectionStep,
+    title: string,
+  ): void {
+    if (connectionTitle) connectionTitle.textContent = title;
+    const activeIndex = connectionSteps.indexOf(active);
+    connectionSteps.forEach((step, index) => {
+      const item = document.querySelector<HTMLElement>(
+        `[data-connection-step="${step}"]`,
+      );
+      if (!item) return;
+      item.dataset.state =
+        index < activeIndex
+          ? "complete"
+          : index === activeIndex
+            ? "active"
+            : "pending";
+      const icon = item.querySelector<HTMLElement>("[data-lucide]");
+      if (icon) {
+        icon.dataset.lucide = index < activeIndex ? "check" : "circle";
+      }
+    });
+    hydrateIcons(connectionProgress || root);
+  }
+
+  async function finishConnectionProgress(): Promise<void> {
+    if (connectionProgressDelay !== undefined) {
+      window.clearTimeout(connectionProgressDelay);
+      connectionProgressDelay = undefined;
+    }
+    connectionSteps.forEach((step) => {
+      const item = document.querySelector<HTMLElement>(
+        `[data-connection-step="${step}"]`,
+      );
+      if (item) item.dataset.state = "complete";
+      const icon = item?.querySelector<HTMLElement>("[data-lucide]");
+      if (icon) icon.dataset.lucide = "check";
+    });
+    hydrateIcons(connectionProgress || root);
+    if (connectionTitle) connectionTitle.textContent = "频道已同步";
+    if (connectionProgress && !connectionProgress.hidden) {
+      await connectionPresence?.hide(sessionUiAbortController.signal);
+    }
+  }
+
+  connectionProgressDelay = window.setTimeout(() => {
+    connectionProgressDelay = undefined;
+    if (!joined && !leaving) {
+      void connectionPresence?.show(sessionUiAbortController.signal);
+    }
+  }, 900);
+
+  function renderLobbyParticipants(
+    nextParticipants: RoomParticipant[] = [...participants.values()],
+    speakingLevels: ReadonlyMap<string, number> = new Map(),
+  ): void {
+    const list =
+      document.querySelector<HTMLElement>("#lobby-participants");
+    const summary =
+      document.querySelector<HTMLElement>("#lobby-participant-summary");
+    const voiceSummary =
+      document.querySelector<HTMLElement>("#lobby-voice-summary");
+    if (!list) return;
+    const sorted = [...nextParticipants].sort((left, right) => {
+      if (left.role !== right.role) return left.role === "host" ? -1 : 1;
+      return left.nickname.localeCompare(right.nickname, "zh-CN");
+    });
+    const existing = new Map(
+      [...list.querySelectorAll<HTMLElement>("[data-lobby-participant]")].map(
+        (element) => [
+          element.dataset.lobbyParticipant as string,
+          element,
+        ],
+      ),
+    );
+    list.querySelectorAll(":scope > :not([data-lobby-participant])")
+      .forEach((element) => element.remove());
+    sorted.slice(0, 8).forEach((participant, index) => {
+      let avatar = existing.get(participant.id);
+      const isNew = !avatar;
+      if (!avatar) {
+        avatar = document.createElement("span");
+        avatar.className = "lobby-avatar";
+        avatar.dataset.lobbyParticipant = participant.id;
+      }
+      avatar.textContent = Array.from(participant.nickname)[0] || "友";
+      avatar.title =
+        `${participant.nickname} · ${
+          participant.broadcasting
+            ? "正在放映"
+            : participant.voiceActive
+              ? "已连麦"
+              : participant.role === "host"
+                ? "频道主"
+                : "在频道中"
+        }`;
+      avatar.classList.toggle("is-voice-active", participant.voiceActive);
+      avatar.classList.toggle(
+        "is-speaking",
+        speakingLevels.has(participant.id),
+      );
+      const level = speakingLevels.get(participant.id) || 0;
+      avatar.dataset.speakingLevel =
+        level >= 0.16 ? "high" : level >= 0.07 ? "medium" : "low";
+      list.append(avatar);
+      existing.delete(participant.id);
+      if (isNew && index < 8) {
+        void animateElement(
+          avatar,
+          [
+            { opacity: 0, transform: "translateY(8px) scale(0.96)" },
+            { opacity: 1, transform: "none" },
+          ],
+          {
+            kind: "control",
+            id: `lobby-${participant.id}`,
+            signal: sessionUiAbortController.signal,
+          },
+        );
+      }
+    });
+    existing.forEach((element) => element.remove());
+    if (summary) {
+      summary.textContent =
+        sorted.length > 0
+          ? `${sorted.length} 位朋友已经在这里`
+          : "正在同步频道成员…";
+    }
+    if (voiceSummary) {
+      const active = sorted
+        .filter((participant) => participant.voiceActive)
+        .map((participant) => participant.nickname);
+      voiceSummary.textContent =
+        active.length > 0
+          ? `当前正在连麦：${active.join("、")}`
+          : "还没有人加入连麦";
+    }
+  }
+
   function openDialog(dialog: HTMLDialogElement): void {
-    if (dialog.open) return;
     const opener =
       document.activeElement instanceof HTMLElement
         ? document.activeElement
         : undefined;
-    if (opener) dialogOpeners.set(dialog, opener);
-    dialog.showModal();
-    const first = dialog.querySelector<HTMLElement>(
-      'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex="0"]',
-    );
-    first?.focus();
-    document.querySelector(".session-shell")?.setAttribute("inert", "");
+    void dialogController.open(dialog, opener);
   }
 
   function closeDialog(dialog: HTMLDialogElement): void {
-    if (dialog.open) dialog.close();
-    if (!document.querySelector("dialog[open]")) {
-      document.querySelector(".session-shell")?.removeAttribute("inert");
-    }
-    dialogOpeners.get(dialog)?.focus();
-    dialogOpeners.delete(dialog);
+    void dialogController.close(dialog);
   }
 
   function hideControls(): void {
     if (!stageDock || stageDock.hidden) return;
     if (
       stageDock.querySelector(":focus-visible") ||
-      (dockChatComposer && !dockChatComposer.hidden)
+      (dockChatComposer && !dockChatComposer.hidden) ||
+      dockMoreButton?.getAttribute("aria-expanded") === "true" ||
+      (video && !video.hidden && video.paused) ||
+      (bufferingState && !bufferingState.hidden)
     ) {
       window.clearTimeout(dockHideTimer);
       dockHideTimer = window.setTimeout(hideControls, IDLE_HIDE_MS);
       return;
     }
-    stageDock.classList.add("is-hidden", "glass-hidden");
+    stageDock.classList.add("is-hidden", "material-released");
     document
       .getElementById("hud-bar")
-      ?.classList.add("is-hidden", "glass-hidden");
+      ?.classList.add("is-hidden", "material-released");
     stageProgress?.classList.add("is-hidden");
     if (nativeAndroid && mobilePlaybackStats) {
       mobilePlaybackStats.hidden = true;
@@ -1565,10 +2017,10 @@ export async function openChannelSession(
 
   function showControlsWithGlass(): void {
     document.body.classList.remove("fullscreen-controls-hidden");
-    stageDock?.classList.remove("is-hidden", "glass-hidden");
+    stageDock?.classList.remove("is-hidden", "material-released");
     document
       .getElementById("hud-bar")
-      ?.classList.remove("is-hidden", "glass-hidden");
+      ?.classList.remove("is-hidden", "material-released");
     stageProgress?.classList.remove("is-hidden");
     if (
       nativeAndroid &&
@@ -1608,6 +2060,20 @@ export async function openChannelSession(
     passive: true,
     signal: sessionUiAbortController.signal,
   });
+  if (dockMoreButton && dockMoreMenu) {
+    dockMoreSurface = new FloatingSurface(dockMoreButton, dockMoreMenu, {
+      placement: "top-end",
+      closeOnOutside: true,
+    });
+    dockMoreButton.addEventListener(
+      "click",
+      () => {
+        showControlsWithGlass();
+        void dockMoreSurface?.toggle();
+      },
+      { signal: sessionUiAbortController.signal },
+    );
+  }
   if (!nativeAndroid) {
     document.addEventListener(
       "touchstart",
@@ -2595,6 +3061,17 @@ export async function openChannelSession(
           String(button.dataset.fitMode === fullscreenFit),
         );
       });
+    smartCropButton?.classList.toggle("is-on", fullscreenFit === "smart");
+    smartCropButton?.setAttribute(
+      "aria-checked",
+      String(fullscreenFit === "smart"),
+    );
+    smartCropButton?.setAttribute(
+      "aria-label",
+      fullscreenFit === "smart"
+        ? "关闭智能裁剪"
+        : "开启智能裁剪",
+    );
     updateMobilePlayerButtons();
   }
 
@@ -2692,7 +3169,7 @@ export async function openChannelSession(
   function finishImmersiveUi(): void {
     window.clearTimeout(dockHideTimer);
     document.body.classList.remove("fullscreen-controls-hidden");
-    stageDock?.classList.remove("is-hidden", "glass-hidden");
+    stageDock?.classList.remove("is-hidden", "material-released");
     stageProgress?.classList.remove("is-hidden");
     updateMobilePlayerButtons();
   }
@@ -2811,15 +3288,30 @@ export async function openChannelSession(
     if (sessionStorage.getItem("synced:shown-immersive-hint")) return;
     sessionStorage.setItem("synced:shown-immersive-hint", "1");
     const hint = document.createElement("div");
-    hint.className = "immersive-hint glass-a";
+    hint.className = "immersive-hint material-clear";
     hint.textContent = nativeAndroid
       ? "轻触画面显示控件 · 返回键退出全屏"
       : "移动鼠标显示控件 · 按 Esc 退出全屏";
     hint.setAttribute("aria-live", "polite");
     document.body.append(hint);
-    window.setTimeout(() => {
-      hint.classList.add("is-leaving");
-      window.setTimeout(() => hint.remove(), 300);
+    if (fullscreenHintTimer !== undefined) {
+      window.clearTimeout(fullscreenHintTimer);
+    }
+    fullscreenHintTimer = window.setTimeout(() => {
+      fullscreenHintTimer = undefined;
+      void animateElement(
+        hint,
+        [
+          { opacity: 1, transform: "translateY(0)" },
+          { opacity: 0, transform: "translateY(-4px)" },
+        ],
+        {
+          kind: "control",
+          id: "fullscreen-hint",
+          signal: sessionUiAbortController.signal,
+          reducedKeyframes: [{ opacity: 1 }, { opacity: 0 }],
+        },
+      ).finally(() => hint.remove());
     }, 3_000);
   }
 
@@ -8408,6 +8900,7 @@ export async function openChannelSession(
   }
 
   function closeBroadcastDialog(): void {
+    hideEmbyItemPopup(false);
     const dialog =
       document.querySelector<HTMLDialogElement>("#broadcast-dialog");
     if (dialog) closeDialog(dialog);
@@ -8438,26 +8931,25 @@ export async function openChannelSession(
     document
       .querySelectorAll<HTMLButtonElement>("[data-session-resolution]")
       .forEach((button) => {
-        button.classList.toggle(
-          "active",
-          button.dataset.sessionResolution === resolutionKey,
-        );
+        const active = button.dataset.sessionResolution === resolutionKey;
+        button.classList.toggle("active", active);
+        button.setAttribute("aria-pressed", String(active));
       });
     document
       .querySelectorAll<HTMLButtonElement>("[data-session-frame-rate]")
       .forEach((button) => {
-        button.classList.toggle(
-          "active",
-          Number(button.dataset.sessionFrameRate) === frameRate,
-        );
+        const active =
+          Number(button.dataset.sessionFrameRate) === frameRate;
+        button.classList.toggle("active", active);
+        button.setAttribute("aria-pressed", String(active));
       });
     document
       .querySelectorAll<HTMLButtonElement>("[data-screen-content-mode]")
       .forEach((button) => {
-        button.classList.toggle(
-          "active",
-          button.dataset.screenContentMode === screenContentMode,
-        );
+        const active =
+          button.dataset.screenContentMode === screenContentMode;
+        button.classList.toggle("active", active);
+        button.setAttribute("aria-pressed", String(active));
       });
     const summary = document.querySelector<HTMLElement>(
       "#session-quality-summary",
@@ -8468,6 +8960,13 @@ export async function openChannelSession(
         frameRate,
       ).detail;
     }
+    const smartReason = document.getElementById("screen-smart-reason");
+    if (smartReason) {
+      smartReason.textContent =
+        `${buildQualityPreset(resolutionKey, frameRate).detail} · ` +
+        networkAdvice.reason;
+    }
+    updateSelectedSourceSummary();
   }
 
   function renderNetworkRecommendation(): void {
@@ -8732,7 +9231,108 @@ export async function openChannelSession(
     }
   }
 
+  type SourceFilter = "recent" | "player" | "browser" | "all";
+  const recentSourceKey = "synced:recent-capture-sources";
   let broadcastSources: CaptureSource[] = [];
+  let selectedBroadcastSourceId = "";
+  let sourceFilter: SourceFilter = "all";
+  let sourceEnumerationGeneration = 0;
+
+  function recentCaptureSources(): Array<{
+    id: string;
+    name: string;
+    usedAt: number;
+  }> {
+    try {
+      const stored = JSON.parse(localStorage.getItem(recentSourceKey) || "[]");
+      if (!Array.isArray(stored)) return [];
+      return stored
+        .filter(
+          (entry) =>
+            entry &&
+            typeof entry.id === "string" &&
+            typeof entry.name === "string" &&
+            Number.isFinite(entry.usedAt),
+        )
+        .slice(0, 8);
+    } catch {
+      return [];
+    }
+  }
+
+  function rememberCaptureSource(source: CaptureSource): void {
+    const next = [
+      { id: source.id, name: source.name, usedAt: Date.now() },
+      ...recentCaptureSources().filter(
+        (entry) => entry.id !== source.id && entry.name !== source.name,
+      ),
+    ].slice(0, 8);
+    localStorage.setItem(recentSourceKey, JSON.stringify(next));
+  }
+
+  function sourceCategory(
+    source: CaptureSource,
+  ): Exclude<SourceFilter, "recent" | "all"> | "other" {
+    const identity =
+      `${source.processName || ""} ${source.executableName || ""} ${source.name}`
+        .toLocaleLowerCase("zh-CN");
+    if (
+      /(chrome|msedge|firefox|brave|opera|vivaldi|browser|浏览器)/iu.test(
+        identity,
+      )
+    ) {
+      return "browser";
+    }
+    if (
+      /(potplayer|vlc|mpv|mpc|media player|video|player|播放器|影视|爱奇艺|腾讯视频|哔哩哔哩)/iu.test(
+        identity,
+      )
+    ) {
+      return "player";
+    }
+    return "other";
+  }
+
+  function updateSelectedSourceSummary(): void {
+    const source = broadcastSources.find(
+      (candidate) => candidate.id === selectedBroadcastSourceId,
+    );
+    const name = document.getElementById("selected-source-name");
+    const detail = document.getElementById("selected-source-detail");
+    const readyTitle = document.getElementById("broadcast-ready-title");
+    const readyDetail = document.getElementById("broadcast-ready-detail");
+    const start =
+      document.querySelector<HTMLButtonElement>("#start-screen-broadcast");
+    if (!source) {
+      if (name) name.textContent = "请选择要放映的窗口";
+      if (detail) {
+        detail.textContent = "选择后可在开始前确认分辨率与声音能力";
+      }
+      if (readyTitle) readyTitle.textContent = "选择一个来源后即可开始";
+      if (readyDetail) {
+        readyDetail.textContent = "启动前会再次确认画质、帧率和声音";
+      }
+      if (start) start.disabled = true;
+      return;
+    }
+    const dimensions =
+      source.width && source.height
+        ? `${source.width}×${source.height}`
+        : "启动时确认尺寸";
+    const audio = source.audioAvailable
+      ? "可采集应用声音"
+      : "声音能力启动时确认";
+    if (name) name.textContent = source.name || "未命名窗口";
+    if (detail) detail.textContent = `${dimensions} · ${audio}`;
+    if (readyTitle) {
+      readyTitle.textContent = `当前：${source.name || "未命名窗口"}`;
+    }
+    if (readyDetail) {
+      readyDetail.textContent =
+        `${dimensions} · ${audio} · ${buildQualityPreset(resolutionKey, frameRate).detail}`;
+    }
+    if (start) start.disabled = preparingBroadcast;
+  }
 
   function renderBroadcastSources(): void {
     const grid = document.querySelector<HTMLElement>("#session-source-grid");
@@ -8744,13 +9344,26 @@ export async function openChannelSession(
     );
     if (!grid) return;
     const query = search?.value.trim().toLocaleLowerCase("zh-CN") || "";
-    const visible = query
-      ? broadcastSources.filter((source) =>
-          source.name.toLocaleLowerCase("zh-CN").includes(query),
-        )
-      : broadcastSources;
+    const recent = recentCaptureSources();
+    const recentIds = new Set(recent.map((entry) => entry.id));
+    const recentNames = new Set(recent.map((entry) => entry.name));
+    const visible = broadcastSources.filter((source) => {
+      if (
+        query &&
+        !`${source.name} ${source.processName || ""} ${source.executableName || ""}`
+          .toLocaleLowerCase("zh-CN")
+          .includes(query)
+      ) {
+        return false;
+      }
+      if (sourceFilter === "all") return true;
+      if (sourceFilter === "recent") {
+        return recentIds.has(source.id) || recentNames.has(source.name);
+      }
+      return sourceCategory(source) === sourceFilter;
+    });
     if (count) {
-      count.textContent = query
+      count.textContent = query || sourceFilter !== "all"
         ? `显示 ${visible.length} / 共 ${broadcastSources.length} 个`
         : `共 ${broadcastSources.length} 个窗口 · 向下滚动查看全部`;
     }
@@ -8765,50 +9378,79 @@ export async function openChannelSession(
     grid.innerHTML = visible
       .map(
         (source) => `
-          <button class="source-card" data-session-source="${escapeHtml(source.id)}" type="button" title="${escapeHtml(source.name || "未命名窗口")}">
+          <button class="source-card${selectedBroadcastSourceId === source.id ? " selected" : ""}"
+                  data-session-source="${escapeHtml(source.id)}" type="button"
+                  role="option"
+                  aria-selected="${selectedBroadcastSourceId === source.id}"
+                  data-selected="${selectedBroadcastSourceId === source.id}"
+                  title="${escapeHtml(source.name || "未命名窗口")}">
             <span class="source-preview">
               ${
                 source.thumbnail
-                  ? `<img src="${source.thumbnail}" alt="" />`
-                  : `<span class="source-placeholder" aria-hidden="true">▣</span>`
-              }
-              ${
-                source.appIcon
-                  ? `<img class="source-app-icon" src="${source.appIcon}" alt="" />`
+                  ? `<img src="${source.thumbnail}" alt="" decoding="async" />`
                   : ""
               }
+              <span class="source-placeholder" aria-hidden="true" ${source.thumbnail ? "hidden" : ""}>
+                <i data-lucide="monitor-play"></i>
+              </span>
+              ${
+                source.appIcon
+                  ? `<img class="source-app-icon" src="${source.appIcon}" alt="" width="28" height="28" />`
+                  : ""
+              }
+              <span class="source-selected-check" aria-hidden="true">
+                <i data-lucide="check"></i>
+              </span>
             </span>
-            <span>${escapeHtml(source.name || "未命名窗口")}</span>
+            <span class="source-card-copy">
+              <strong>${escapeHtml(source.name || "未命名窗口")}</strong>
+              <small>${source.width && source.height ? `${source.width}×${source.height}` : "尺寸待确认"} · ${source.audioAvailable ? "可采集声音" : "声音待确认"}</small>
+            </span>
+            ${
+              recentIds.has(source.id) || recentNames.has(source.name)
+                ? `<span class="source-recent-badge">最近使用</span>`
+                : ""
+            }
           </button>
         `,
       )
       .join("");
+    hydrateIcons(grid);
+    grid.querySelectorAll<HTMLImageElement>(".source-preview > img").forEach(
+      (image) => {
+        image.addEventListener(
+          "error",
+          () => {
+            image.hidden = true;
+            const placeholder =
+              image.parentElement?.querySelector<HTMLElement>(
+                ".source-placeholder",
+              );
+            if (placeholder) placeholder.hidden = false;
+          },
+          { once: true },
+        );
+      },
+    );
     grid
       .querySelectorAll<HTMLButtonElement>("[data-session-source]")
       .forEach((button) => {
-        button.addEventListener("click", async () => {
+        button.addEventListener("click", () => {
           if (preparingBroadcast) return;
-          if (button.closest("dialog") instanceof HTMLDialogElement) {
-            // Close on the same user gesture. Source selection and Windows
-            // capture can both take time, so neither may leave this chooser
-            // covering a broadcast that is already starting behind it.
-            closeBroadcastDialog();
-          }
-          grid.querySelectorAll("button").forEach((item) => {
-            item.disabled = true;
-          });
-          button.classList.add("selected");
-          button.setAttribute("aria-busy", "true");
-          const pending = document.createElement("span");
-          pending.className = "source-card-pending";
-          pending.textContent = "正在启动放映…";
-          button.append(pending);
-          await prepareLocalBroadcast(button.dataset.sessionSource!);
-          if (button.isConnected && !mediaStream) {
-            renderBroadcastSources();
-          }
+          selectedBroadcastSourceId = button.dataset.sessionSource || "";
+          grid
+            .querySelectorAll<HTMLButtonElement>("[data-session-source]")
+            .forEach((item) => {
+              const selected =
+                item.dataset.sessionSource === selectedBroadcastSourceId;
+              item.classList.toggle("selected", selected);
+              item.setAttribute("aria-selected", String(selected));
+              item.dataset.selected = String(selected);
+            });
+          updateSelectedSourceSummary();
         });
       });
+    updateSelectedSourceSummary();
   }
 
   async function loadBroadcastSources(): Promise<void> {
@@ -8821,7 +9463,12 @@ export async function openChannelSession(
       "#session-source-count",
     );
     if (!grid) return;
-    grid.innerHTML = `<div class="loading-state">正在读取全部可分享窗口…</div>`;
+    const generation = ++sourceEnumerationGeneration;
+    grid.innerHTML = Array.from(
+      { length: 6 },
+      () =>
+        `<div class="source-card source-skeleton" aria-hidden="true"><span></span><i></i></div>`,
+    ).join("");
     if (count) count.textContent = "正在刷新";
     if (refresh) refresh.disabled = true;
     try {
@@ -8830,8 +9477,24 @@ export async function openChannelSession(
         5_000,
         "读取可共享窗口超时",
       );
+      if (
+        generation !== sourceEnumerationGeneration ||
+        leaving ||
+        !grid.isConnected
+      ) {
+        return;
+      }
+      if (
+        selectedBroadcastSourceId &&
+        !broadcastSources.some(
+          (source) => source.id === selectedBroadcastSourceId,
+        )
+      ) {
+        selectedBroadcastSourceId = "";
+      }
       renderBroadcastSources();
     } catch (error) {
+      if (generation !== sourceEnumerationGeneration || leaving) return;
       grid.innerHTML = `<div class="loading-state">${escapeHtml(error instanceof Error ? error.message : "读取窗口失败")}</div>`;
       if (count) count.textContent = "读取失败";
     } finally {
@@ -8844,23 +9507,14 @@ export async function openChannelSession(
       document.querySelector<HTMLElement>("#screen-broadcast-panel");
     const embyPanel =
       document.querySelector<HTMLElement>("#emby-broadcast-panel");
-    const dialog =
-      document.querySelector<HTMLDialogElement>("#broadcast-dialog");
     const tabs =
       document.querySelector<HTMLElement>(".broadcast-mode-tabs");
     if (!screenPanel || !embyPanel) return;
 
     const previousMode = activeBroadcastMode;
     activeBroadcastMode = mode;
-    const reducedMotion = window.matchMedia(
-      "(prefers-reduced-motion: reduce)",
-    ).matches;
-    const previousHeight = dialog?.open
-      ? dialog.getBoundingClientRect().height
-      : 0;
-
-    for (const animation of broadcastModeAnimations) animation.cancel();
-    broadcastModeAnimations = [];
+    broadcastModeAbort?.abort();
+    broadcastModeAbort = new AbortController();
     const transition = ++broadcastModeTransition;
 
     screenPanel?.toggleAttribute("hidden", mode !== "screen");
@@ -8872,58 +9526,33 @@ export async function openChannelSession(
         const active = button.dataset.broadcastMode === mode;
         button.classList.toggle("active", active);
         button.setAttribute("aria-selected", String(active));
+        button.dataset.selected = String(active);
+        button.tabIndex = active ? 0 : -1;
       });
 
     const incoming = mode === "emby" ? embyPanel : screenPanel;
-    if (
-      dialog?.open &&
-      previousMode !== mode &&
-      !reducedMotion
-    ) {
-      const nextHeight = dialog.getBoundingClientRect().height;
+    if (previousMode !== mode) {
       const direction = mode === "emby" ? 1 : -1;
-      const panelAnimation = incoming.animate(
+      incoming.classList.add("is-mode-switching");
+      void animateElement(
+        incoming,
         [
           {
             opacity: 0,
-            transform: `translate3d(${direction * 24}px, 0, 0) scale(0.985)`,
+            transform: `translate3d(${direction * 12}px, 0, 0)`,
           },
-          { opacity: 1, transform: "translate3d(0, 0, 0) scale(1)" },
+          { opacity: 1, transform: "translate3d(0, 0, 0)" },
         ],
         {
-          duration: 360,
-          easing: "cubic-bezier(0.2, 0, 0, 1)",
-          fill: "both",
+          kind: "panel",
+          id: "broadcast-mode",
+          signal: broadcastModeAbort.signal,
         },
-      );
-      broadcastModeAnimations.push(panelAnimation);
-      if (Math.abs(nextHeight - previousHeight) > 1) {
-        const dialogAnimation = dialog.animate(
-          [
-            { height: `${previousHeight}px` },
-            { height: `${nextHeight}px` },
-          ],
-          {
-            duration: 420,
-            easing: "cubic-bezier(0.2, 0, 0, 1)",
-            fill: "both",
-          },
-        );
-        broadcastModeAnimations.push(dialogAnimation);
-      }
-      dialog.classList.add("is-mode-switching");
-      const finishModeTransition = (): void => {
-        if (transition !== broadcastModeTransition) return;
-        for (const animation of broadcastModeAnimations) animation.cancel();
-        broadcastModeAnimations = [];
-        dialog.classList.remove("is-mode-switching");
-      };
-      void Promise.allSettled(
-        broadcastModeAnimations.map((animation) => animation.finished),
-      ).then(finishModeTransition);
-      // Background-window animation clocks can be throttled by Chromium.
-      // Never let the temporary overflow guard survive that throttling.
-      window.setTimeout(finishModeTransition, 480);
+      ).finally(() => {
+        if (transition === broadcastModeTransition) {
+          incoming.classList.remove("is-mode-switching");
+        }
+      });
     }
     if (mode === "emby") {
       void refreshEmbyAccounts();
@@ -9068,6 +9697,7 @@ export async function openChannelSession(
         );
         const row = list.lastElementChild as HTMLElement | null;
         if (row) {
+          hydrateIcons(row);
           row.dataset.endpointProtocol = "https";
           row
             .querySelector<HTMLInputElement>("[data-emby-endpoint-host]")
@@ -9176,6 +9806,51 @@ export async function openChannelSession(
     }
   }
 
+  function hideEmbyItemPopup(restoreFocus = true): void {
+    if (!embyItemPopup || embyItemPopup.hidden) return;
+    embySelectionRequestId += 1;
+    pendingEmbySelectionKey = "";
+    const restoreTarget = embyDetailOpener;
+    embyDetailOpener = undefined;
+    const sourcePoster =
+      restoreTarget?.querySelector<HTMLElement>(".emby-poster");
+    const popupPoster =
+      embyItemPopup.querySelector<HTMLElement>(".emby-popup-poster");
+    const reduced =
+      matchMedia("(prefers-reduced-motion: reduce)").matches ||
+      document.documentElement.dataset.motion === "reduced";
+    if (
+      document.startViewTransition &&
+      sourcePoster &&
+      sourcePoster.isConnected &&
+      popupPoster &&
+      !reduced
+    ) {
+      embyDetailPresence?.cancel();
+      popupPoster.style.setProperty("view-transition-name", "emby-poster");
+      const transition = document.startViewTransition(() => {
+        popupPoster.style.removeProperty("view-transition-name");
+        embyItemPopup.hidden = true;
+        embyItemPopup.dataset.presence = "left";
+        sourcePoster.style.setProperty("view-transition-name", "emby-poster");
+      });
+      void transition.finished.finally(() => {
+        sourcePoster.style.removeProperty("view-transition-name");
+        if (restoreFocus && restoreTarget?.isConnected) {
+          restoreTarget.focus();
+        }
+      });
+      return;
+    }
+    void embyDetailPresence
+      ?.hide(sessionUiAbortController.signal)
+      .then(() => {
+        if (restoreFocus && restoreTarget?.isConnected) {
+          restoreTarget.focus();
+        }
+      });
+  }
+
   function resetEmbyBrowser(clearItems = true): void {
     embySelectedItem = undefined;
     embyPlaybackInfo = undefined;
@@ -9183,10 +9858,10 @@ export async function openChannelSession(
     embyLibraryRequestId += 1;
     embySelectionRequestId += 1;
     pendingEmbySelectionKey = "";
-    const popup =
-      document.querySelector<HTMLDialogElement>("#emby-item-popup");
-    if (popup?.open) closeDialog(popup);
+    hideEmbyItemPopup(false);
     if (!clearItems) return;
+    embyVirtualGrid?.destroy();
+    embyVirtualGrid = undefined;
     embyBrowseItems = [];
     embyBrowseTotal = 0;
     const grid = document.querySelector<HTMLElement>("#emby-item-grid");
@@ -9626,7 +10301,7 @@ export async function openChannelSession(
   }
 
   function setEmbyPopupFact(
-    dialog: HTMLDialogElement,
+    dialog: HTMLElement,
     name: string,
     value: string,
   ): void {
@@ -9640,8 +10315,12 @@ export async function openChannelSession(
   }
 
   async function showEmbyItemPopup(item: EmbyLibraryItem): Promise<void> {
-    const dialog = document.querySelector<HTMLDialogElement>("#emby-item-popup");
+    const dialog = embyItemPopup;
     if (!dialog) { void selectEmbyItem(item); return; }
+    const sourceCard = document.querySelector<HTMLElement>(
+      `[data-emby-item="${CSS.escape(embyItemKey(item))}"]`,
+    );
+    embyDetailOpener = sourceCard ?? undefined;
     embySelectedItem = item;
     const popupTitle = dialog.querySelector<HTMLElement>(".emby-popup-title");
     const popupYear = dialog.querySelector<HTMLElement>(".emby-popup-year");
@@ -9649,6 +10328,10 @@ export async function openChannelSession(
     const popupPoster = dialog.querySelector<HTMLImageElement>(".emby-popup-poster-img");
     const popupKind = dialog.querySelector<HTMLElement>(".emby-popup-kind");
     const popupTagline = dialog.querySelector<HTMLElement>(".emby-popup-tagline");
+    const popupPosterShell =
+      dialog.querySelector<HTMLElement>(".emby-popup-poster");
+    const popupPlaceholder =
+      dialog.querySelector<HTMLElement>(".emby-popup-poster-placeholder");
     const selectionKey = embyItemKey(item);
     pendingEmbySelectionKey = selectionKey;
     if (popupTitle) popupTitle.textContent = item.name || "";
@@ -9703,6 +10386,8 @@ export async function openChannelSession(
       popupPoster.hidden = true;
       popupPoster.removeAttribute("src");
       popupPoster.alt = item.name ? `${item.name} 海报` : "影片海报";
+      if (popupPlaceholder) popupPlaceholder.hidden = false;
+      dialog.style.removeProperty("--emby-detail-accent");
       if (item.imageTag && window.roomDesktop) {
         void window.roomDesktop.embyImageData({
           itemId: item.imageItemId || item.id,
@@ -9714,125 +10399,251 @@ export async function openChannelSession(
             embySelectedItem &&
             embyItemKey(embySelectedItem) === selectionKey
           ) {
+            popupPoster.addEventListener(
+              "load",
+              () => {
+                if (
+                  !embySelectedItem ||
+                  embyItemKey(embySelectedItem) !== selectionKey
+                ) {
+                  return;
+                }
+                popupPoster.hidden = false;
+                if (popupPlaceholder) popupPlaceholder.hidden = true;
+                try {
+                  const canvas = document.createElement("canvas");
+                  canvas.width = 8;
+                  canvas.height = 8;
+                  const context = canvas.getContext("2d", {
+                    willReadFrequently: true,
+                  });
+                  context?.drawImage(popupPoster, 0, 0, 8, 8);
+                  const pixels = context?.getImageData(0, 0, 8, 8).data;
+                  if (pixels) {
+                    let red = 0;
+                    let green = 0;
+                    let blue = 0;
+                    let count = 0;
+                    for (let offset = 0; offset < pixels.length; offset += 8) {
+                      red += pixels[offset];
+                      green += pixels[offset + 1];
+                      blue += pixels[offset + 2];
+                      count += 1;
+                    }
+                    dialog.style.setProperty(
+                      "--emby-detail-accent",
+                      `rgba(${Math.round(red / count)}, ${Math.round(green / count)}, ${Math.round(blue / count)}, 0.18)`,
+                    );
+                  }
+                } catch {
+                  dialog.style.removeProperty("--emby-detail-accent");
+                }
+              },
+              { once: true },
+            );
+            popupPoster.addEventListener(
+              "error",
+              () => {
+                popupPoster.hidden = true;
+                if (popupPlaceholder) popupPlaceholder.hidden = false;
+              },
+              { once: true },
+            );
             popupPoster.src = url;
-            popupPoster.hidden = false;
           }
         }).catch(() => undefined);
       }
     }
-    if (!dialog.open) openDialog(dialog);
+    if (dialog.hidden) {
+      const sourcePoster =
+        sourceCard?.querySelector<HTMLElement>(".emby-poster");
+      const reduced =
+        matchMedia("(prefers-reduced-motion: reduce)").matches ||
+        document.documentElement.dataset.motion === "reduced";
+      if (document.startViewTransition && sourcePoster && popupPosterShell && !reduced) {
+        sourcePoster.style.setProperty(
+          "view-transition-name",
+          "emby-poster",
+        );
+        const transition = document.startViewTransition(() => {
+          sourcePoster.style.removeProperty("view-transition-name");
+          popupPosterShell.style.setProperty(
+            "view-transition-name",
+            "emby-poster",
+          );
+          void embyDetailPresence?.show(sessionUiAbortController.signal);
+        });
+        void transition.finished.finally(() => {
+          popupPosterShell.style.removeProperty("view-transition-name");
+        });
+      } else {
+        void embyDetailPresence?.show(sessionUiAbortController.signal);
+      }
+      queueMicrotask(() => {
+        dialog
+          .querySelector<HTMLButtonElement>("[data-close-emby-popup]")
+          ?.focus();
+      });
+    }
     await selectEmbyItem(item);
+  }
+
+  let embyVirtualGrid: VirtualGrid<EmbyLibraryItem> | undefined;
+  let embyVirtualShowServer = false;
+
+  function createEmbyItemCard(item: EmbyLibraryItem): HTMLElement {
+    const itemKey = embyItemKey(item);
+    const progress = Math.max(
+      0,
+      Math.min(
+        100,
+        Math.round(
+          item.playedPercentage ??
+            (item.playbackPositionTicks && item.runtimeTicks
+              ? (item.playbackPositionTicks / item.runtimeTicks) * 100
+              : 0),
+        ),
+      ),
+    );
+    const kind =
+      item.type === "Episode"
+        ? item.seasonName || "剧集"
+        : item.type === "Movie"
+          ? "电影"
+          : "视频";
+    const state = item.played
+      ? "已看完"
+      : progress > 0
+        ? `继续观看 · ${progress}%`
+        : kind;
+    const episode =
+      item.type === "Episode" &&
+      item.parentIndexNumber !== undefined &&
+      item.indexNumber !== undefined
+        ? `S${item.parentIndexNumber}E${item.indexNumber}`
+        : "";
+    const context = [
+      item.type === "Episode" ? item.seriesName : item.productionYear,
+      episode,
+      state,
+    ]
+      .filter(Boolean)
+      .join(" · ");
+    const template = document.createElement("template");
+    template.innerHTML = `
+      <button type="button" class="emby-item-card"
+              data-emby-item="${escapeHtml(itemKey)}"
+              aria-label="${escapeHtml(embyItemLabel(item))}">
+        <span class="emby-poster">
+          <span class="emby-poster-placeholder" aria-hidden="true">
+            <i data-lucide="play"></i>
+          </span>
+          <img data-emby-image="${escapeHtml(itemKey)}"
+               alt="${escapeHtml(item.name)} 海报" loading="lazy"
+               decoding="async" hidden />
+          <span class="emby-card-overlay" aria-hidden="true">
+            <b><i data-lucide="play"></i></b><small>查看详情</small>
+          </span>
+          <span class="emby-kind-chip">${escapeHtml(kind)}</span>
+          ${
+            embyVirtualShowServer && item.serverName
+              ? `<span class="emby-server-chip">${escapeHtml(item.serverName)}</span>`
+              : ""
+          }
+          ${
+            progress > 0 && progress < 100
+              ? `<progress class="emby-progress" max="100" value="${progress}" aria-label="观看进度 ${progress}%"></progress>`
+              : ""
+          }
+        </span>
+        <strong>${escapeHtml(item.name)}</strong>
+        <small class="emby-card-meta">${escapeHtml(context)}</small>
+      </button>
+    `;
+    return template.content.firstElementChild as HTMLElement;
+  }
+
+  function mountEmbyItemCard(
+    element: HTMLElement,
+    item: EmbyLibraryItem,
+  ): void {
+    hydrateIcons(element);
+    element.addEventListener("click", () => {
+      void showEmbyItemPopup(item);
+    });
+    if (!item.imageTag || !window.roomDesktop) return;
+    const image =
+      element.querySelector<HTMLImageElement>("[data-emby-image]");
+    const placeholder =
+      element.querySelector<HTMLElement>(".emby-poster-placeholder");
+    if (!image) return;
+    void window.roomDesktop
+      .embyImageData({
+        itemId: item.imageItemId || item.id,
+        tag: item.imageTag,
+        accountId: item.accountId,
+      })
+      .then((dataUrl) => {
+        if (
+          !image.isConnected ||
+          image.dataset.embyImage !== embyItemKey(item)
+        ) {
+          return;
+        }
+        image.addEventListener(
+          "load",
+          () => {
+            image.hidden = false;
+            if (placeholder) placeholder.hidden = true;
+          },
+          { once: true },
+        );
+        image.addEventListener(
+          "error",
+          () => {
+            image.hidden = true;
+            if (placeholder) placeholder.hidden = false;
+          },
+          { once: true },
+        );
+        image.src = dataUrl;
+      })
+      .catch(() => {
+        if (placeholder) placeholder.hidden = false;
+      });
   }
 
   async function renderEmbyItems(items: EmbyLibraryItem[]): Promise<void> {
     const grid = document.querySelector<HTMLElement>("#emby-item-grid");
-    if (!grid) return;
+    const scroller =
+      document.querySelector<HTMLElement>("#emby-broadcast-panel");
+    if (!grid || !scroller) return;
     const playable = items.filter((item) =>
       ["Movie", "Episode", "Video"].includes(item.type),
     );
     if (!playable.length) {
-      grid.innerHTML = `<div class="loading-state">没有找到可播放的电影或剧集</div>`;
+      embyVirtualGrid?.destroy();
+      embyVirtualGrid = undefined;
+      grid.innerHTML =
+        `<div class="loading-state">没有找到可播放的电影或剧集</div>`;
       return;
     }
-    const showServer =
+    embyVirtualShowServer =
       new Set(playable.map((item) => item.accountId).filter(Boolean)).size > 1;
-    grid.innerHTML = playable
-      .map(
-        (item) => {
-          const itemKey = embyItemKey(item);
-          const progress = Math.max(
-            0,
-            Math.min(
-              100,
-              Math.round(
-                item.playedPercentage ??
-                  (item.playbackPositionTicks && item.runtimeTicks
-                    ? (item.playbackPositionTicks / item.runtimeTicks) * 100
-                    : 0),
-              ),
-            ),
-          );
-          const kind =
-            item.type === "Episode"
-              ? item.seasonName || "剧集"
-              : item.type === "Movie"
-                ? "电影"
-                : "视频";
-          const state = item.played
-            ? "已看完"
-            : progress > 0
-              ? `继续观看 · ${progress}%`
-              : kind;
-          const episode =
-            item.type === "Episode" &&
-            item.parentIndexNumber !== undefined &&
-            item.indexNumber !== undefined
-              ? `S${item.parentIndexNumber}E${item.indexNumber}`
-              : "";
-          const context = [
-            item.type === "Episode" ? item.seriesName : item.productionYear,
-            episode,
-            state,
-          ]
-            .filter(Boolean)
-            .join(" · ");
-          return `
-          <button type="button" class="emby-item-card" data-emby-item="${escapeHtml(itemKey)}">
-            <span class="emby-poster">
-              <span class="emby-poster-placeholder" aria-hidden="true">▶</span>
-              <img data-emby-image="${escapeHtml(itemKey)}" alt="" loading="lazy" hidden />
-              <span class="emby-card-overlay" aria-hidden="true"><b>▶</b><small>查看详情</small></span>
-              <span class="emby-kind-chip">${escapeHtml(kind)}</span>
-              ${showServer && item.serverName ? `<span class="emby-server-chip">${escapeHtml(item.serverName)}</span>` : ""}
-              ${progress > 0 && progress < 100 ? `<span class="emby-progress" data-emby-progress="${progress}"></span>` : ""}
-            </span>
-            <strong>${escapeHtml(item.name)}</strong>
-            <small class="emby-card-meta">${escapeHtml(context)}</small>
-          </button>
-        `;
-        },
-      )
-      .join("");
-    grid
-      .querySelectorAll<HTMLElement>("[data-emby-progress]")
-      .forEach((indicator) => {
-        const progress = Number(indicator.dataset.embyProgress);
-        if (Number.isFinite(progress)) {
-          indicator.style.setProperty(
-            "--emby-progress",
-            `${Math.max(0, Math.min(100, progress))}%`,
-          );
-        }
+    if (!embyVirtualGrid) {
+      embyVirtualGrid = new VirtualGrid(grid, scroller, {
+        key: embyItemKey,
+        renderItem: createEmbyItemCard,
+        onMount: mountEmbyItemCard,
+        minColumnWidth: 148,
+        gap: 20,
+        aspectRatio: 2 / 3,
+        extraHeight: 64,
+        overscanRows: 2,
+        virtualizationThreshold: 24,
       });
-    grid
-      .querySelectorAll<HTMLButtonElement>("[data-emby-item]")
-      .forEach((button) => {
-        button.addEventListener("click", () => {
-          const item = playable.find(
-            (candidate) =>
-              embyItemKey(candidate) === button.dataset.embyItem,
-          );
-          if (item) void showEmbyItemPopup(item);
-        });
-      });
-    for (const item of playable) {
-      if (!item.imageTag || !window.roomDesktop) continue;
-      void window.roomDesktop
-        .embyImageData({
-          itemId: item.imageItemId || item.id,
-          tag: item.imageTag,
-          accountId: item.accountId,
-        })
-        .then((dataUrl) => {
-          const image = grid.querySelector<HTMLImageElement>(
-            `[data-emby-image="${CSS.escape(embyItemKey(item))}"]`,
-          );
-          if (!image) return;
-          image.src = dataUrl;
-          image.hidden = false;
-        })
-        .catch(() => undefined);
     }
+    embyVirtualGrid.setItems(playable);
   }
 
   async function loadEmbyItems(reset = true): Promise<void> {
@@ -9861,7 +10672,13 @@ export async function openChannelSession(
       status.classList.remove("error");
     }
     if (grid && reset) {
-      grid.innerHTML = `<div class="loading-state">读取媒体项目…</div>`;
+      embyVirtualGrid?.destroy();
+      embyVirtualGrid = undefined;
+      grid.innerHTML = Array.from(
+        { length: 10 },
+        () =>
+          `<div class="emby-item-card emby-item-skeleton" aria-hidden="true"><span></span><i></i></div>`,
+      ).join("");
     }
     if (loadMore) {
       loadMore.disabled = true;
@@ -9876,7 +10693,12 @@ export async function openChannelSession(
           : mode === "episodes"
             ? ["Episode"]
             : ["Movie", "Episode", "Video"];
-      const filters = mode === "resume" ? (["IsResumable"] as const) : undefined;
+      const filters =
+        mode === "resume"
+          ? (["IsResumable"] as const)
+          : mode === "favorite"
+            ? (["IsFavorite"] as const)
+            : undefined;
       const recent = mode === "latest" || mode === "resume";
       const crossServer = Boolean(searchTerm && embyAccounts.length > 1);
       const commonQuery = {
@@ -11272,9 +12094,7 @@ export async function openChannelSession(
         "启用 Emby 放映状态超时",
       );
       requireCurrentBroadcast();
-      const popup =
-        document.querySelector<HTMLDialogElement>("#emby-item-popup");
-      if (popup?.open) closeDialog(popup);
+      hideEmbyItemPopup(false);
       closeBroadcastDialog();
       setStatus("Emby 编码流已就绪 · 正在取得放映权", "neutral");
       if (
@@ -11497,33 +12317,22 @@ export async function openChannelSession(
   }
 
   function focusCompanion(target: "chat" | "members"): void {
-    const inlineMobilePanel = nativeAndroid || window.innerWidth <= 899;
     const targetElement = document.getElementById(
       target === "chat" ? "chat-panel" : "member-panel",
     );
-    if (inlineMobilePanel) {
-      targetElement?.scrollIntoView({
-        behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches
-          ? "auto"
-          : "smooth",
-        block: "start",
-      });
-      targetElement?.focus({ preventScroll: true });
-      if (target === "chat") {
-        window.setTimeout(() => {
-          document.getElementById("chat-input")?.focus();
-        }, 180);
-      }
-      return;
-    }
     document.body.classList.remove("panel-collapsed");
     document.body.classList.add("panel-open");
+    document.dispatchEvent(
+      new CustomEvent<"chat" | "members">("synced:companion-tab", {
+        detail: target,
+      }),
+    );
     const toggle = document.getElementById("panel-toggle");
     toggle?.setAttribute("aria-expanded", "true");
-    toggle?.setAttribute("aria-label", "收起成员与弹幕面板");
-    toggle?.setAttribute("title", "收起成员与弹幕面板");
+    toggle?.setAttribute("aria-label", "收起频道陪伴面板");
+    toggle?.setAttribute("title", "收起频道陪伴面板");
     if (toggle instanceof HTMLElement) {
-      toggle.dataset.tooltip = "收起成员与弹幕面板";
+      toggle.dataset.tooltip = "收起频道陪伴面板";
     }
     targetElement?.focus({ preventScroll: true });
     if (target === "chat") {
@@ -11535,38 +12344,35 @@ export async function openChannelSession(
     open: boolean,
     restoreButtonFocus = false,
   ): void {
-    if (!dockChatComposer || !dockChatButton) return;
-    if (dockChatCloseTimer !== undefined) {
-      window.clearTimeout(dockChatCloseTimer);
-      dockChatCloseTimer = undefined;
-    }
+    if (!dockChatComposer || !dockChatButton || !dockChatPresence) return;
     dockChatButton.setAttribute("aria-expanded", String(open));
     dockChatButton.setAttribute("aria-pressed", String(open));
     dockChatButton.classList.toggle("is-on", open);
     if (open) {
-      dockChatComposer.hidden = false;
       showControlsWithGlass();
-      window.requestAnimationFrame(() => {
-        if (!dockChatComposer.hidden) {
-          dockChatComposer.classList.add("is-open");
+      dockChatComposer.classList.add("is-open");
+      void dockChatPresence.show(sessionUiAbortController.signal);
+      queueMicrotask(() => {
+        if (
+          dockChatButton.getAttribute("aria-expanded") === "true" &&
+          !dockChatComposer.hidden
+        ) {
           dockChatInput?.focus({ preventScroll: true });
         }
       });
       return;
     }
     dockChatComposer.classList.remove("is-open");
-    dockChatCloseTimer = window.setTimeout(() => {
-      dockChatCloseTimer = undefined;
-      dockChatComposer.hidden = true;
-    }, 180);
+    void dockChatPresence.hide(sessionUiAbortController.signal);
     if (restoreButtonFocus) {
       dockChatButton.focus({ preventScroll: true });
     }
   }
 
   function toggleDockChatComposer(forceOpen?: boolean): void {
-    if (!dockChatComposer) return;
-    const open = forceOpen ?? dockChatComposer.hidden;
+    if (!dockChatComposer || !dockChatButton) return;
+    const open =
+      forceOpen ?? dockChatButton.getAttribute("aria-expanded") !== "true";
     setDockChatComposerOpen(open);
   }
 
@@ -11627,8 +12433,7 @@ export async function openChannelSession(
       ".command-palette[open]",
     );
     if (!dialog) return;
-    closeDialog(dialog);
-    dialog.remove();
+    void dialogController.close(dialog).finally(() => dialog.remove());
   }
 
   function runCommand(command: string): void {
@@ -11649,17 +12454,17 @@ export async function openChannelSession(
       ".command-palette",
     );
     if (existing) {
-      if (existing.open) closeDialog(existing);
-      existing.remove();
+      if (existing.open) closeCommandPalette();
+      else existing.remove();
       return;
     }
     const dialog = document.createElement("dialog");
-    dialog.className = "command-palette glass-c";
+    dialog.className = "command-palette material-regular";
     dialog.innerHTML = `
       <header>
         <label for="command-search">命令面板</label>
         <button class="btn btn-ghost btn-icon" type="button" data-close-command aria-label="关闭">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"></path></svg>
+          <i data-lucide="x"></i>
         </button>
       </header>
       <input id="command-search" type="search" autocomplete="off"
@@ -11677,13 +12482,11 @@ export async function openChannelSession(
       </div>
     `;
     document.body.append(dialog);
+    hydrateIcons(dialog);
+    dialog.addEventListener("close", () => dialog.remove(), { once: true });
     dialog
       .querySelector("[data-close-command]")
       ?.addEventListener("click", closeCommandPalette);
-    dialog.addEventListener("cancel", (event) => {
-      event.preventDefault();
-      closeCommandPalette();
-    });
     dialog.querySelectorAll<HTMLButtonElement>("[data-command]").forEach(
       (button) => {
         button.addEventListener("click", () => {
@@ -11716,18 +12519,21 @@ export async function openChannelSession(
       "keyboard-help-dialog",
     ) as HTMLDialogElement | null;
     if (existing) {
-      if (existing.open) closeDialog(existing);
-      existing.remove();
+      if (existing.open) {
+        void dialogController.close(existing).finally(() => existing.remove());
+      } else {
+        existing.remove();
+      }
       return;
     }
     const dialog = document.createElement("dialog");
     dialog.id = "keyboard-help-dialog";
-    dialog.className = "keyboard-help-dialog glass-c";
+    dialog.className = "keyboard-help-dialog material-regular";
     dialog.innerHTML = `
       <header>
         <h2>键盘快捷键</h2>
         <button class="btn btn-ghost btn-icon" id="kbhelp-close" type="button" aria-label="关闭">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"></path></svg>
+          <i data-lucide="x"></i>
         </button>
       </header>
       <div class="keyboard-help-grid">
@@ -11759,14 +12565,10 @@ export async function openChannelSession(
       </div>
     `;
     document.body.append(dialog);
+    hydrateIcons(dialog);
+    dialog.addEventListener("close", () => dialog.remove(), { once: true });
     dialog.querySelector("#kbhelp-close")?.addEventListener("click", () => {
-      closeDialog(dialog);
-      dialog.remove();
-    });
-    dialog.addEventListener("cancel", (event) => {
-      event.preventDefault();
-      closeDialog(dialog);
-      dialog.remove();
+      void dialogController.close(dialog).finally(() => dialog.remove());
     });
     openDialog(dialog);
   }
@@ -11820,11 +12622,25 @@ export async function openChannelSession(
         closeCommandPalette();
         return;
       }
+      if (embyItemPopup && !embyItemPopup.hidden) {
+        event.preventDefault();
+        hideEmbyItemPopup();
+        return;
+      }
       const openDialogElement =
         document.querySelector<HTMLDialogElement>("dialog[open]");
       if (openDialogElement) {
         event.preventDefault();
         closeDialog(openDialogElement);
+        return;
+      }
+      if (
+        (nativeAndroid || overlayPanelQuery.matches) &&
+        document.body.classList.contains("panel-open")
+      ) {
+        event.preventDefault();
+        applyPanelState(true);
+        document.getElementById("session-companion")?.focus();
       }
       return;
     }
@@ -11951,6 +12767,7 @@ export async function openChannelSession(
     }
     if (message.type === "channel:joined" && message.clientId) {
       clearChannelJoinAckTimer();
+      setConnectionStep("members", "正在同步频道成员");
       const rejoined = hasJoinedOnce;
       const previousSelfId = selfId;
       const previousBroadcasterId = broadcasterId;
@@ -12087,6 +12904,8 @@ export async function openChannelSession(
       for (const participant of message.participants || []) {
         participants.set(participant.id, participant);
       }
+      renderLobbyParticipants();
+      setConnectionStep("media", "正在准备媒体线路");
       if (broadcasterId === selfId) {
         for (const viewerId of [...outboundPeers.keys()]) {
           if (!participants.has(viewerId)) forgetDepartedViewer(viewerId);
@@ -12144,6 +12963,9 @@ export async function openChannelSession(
             syncDesktopDanmaku();
             setVoiceStatus(active, count);
           },
+          (nextParticipants, speakingLevels) => {
+            renderLobbyParticipants(nextParticipants, speakingLevels);
+          },
         );
       }
       resumeVoiceAfterReconnect = false;
@@ -12167,6 +12989,13 @@ export async function openChannelSession(
         message.created ? "频道已创建" : "频道已加入",
         "ready",
       );
+      void finishConnectionProgress().then(() => {
+        if (!initialInvitePending || rejoined || leaving) return;
+        initialInvitePending = false;
+        const inviteDialog =
+          document.querySelector<HTMLDialogElement>("#invite-dialog");
+        if (inviteDialog) openDialog(inviteDialog);
+      });
       if (desktop && window.roomDesktop) {
         try {
           const network = await boundedUiOperation(
@@ -12713,6 +13542,18 @@ export async function openChannelSession(
     signalMessageScheduler.close();
     videoEnhancement?.destroy();
     videoEnhancement = undefined;
+    ambientLight?.destroy();
+    ambientLight = undefined;
+    dockMoreSurface?.destroy();
+    dockMoreSurface = undefined;
+    profileSurface?.destroy();
+    profileSurface = undefined;
+    connectionPresence?.cancel();
+    embyDetailPresence?.cancel();
+    if (connectionProgressDelay !== undefined) {
+      window.clearTimeout(connectionProgressDelay);
+      connectionProgressDelay = undefined;
+    }
     hideEmbeddedGame();
     sessionUiAbortController.abort();
     networkProbeAbortController.abort();
@@ -12777,10 +13618,12 @@ export async function openChannelSession(
       window.clearTimeout(networkAdviceExpiryTimer);
       networkAdviceExpiryTimer = undefined;
     }
-    if (dockChatCloseTimer !== undefined) {
-      window.clearTimeout(dockChatCloseTimer);
-      dockChatCloseTimer = undefined;
+    if (fullscreenHintTimer !== undefined) {
+      window.clearTimeout(fullscreenHintTimer);
+      fullscreenHintTimer = undefined;
     }
+    document.querySelector(".fullscreen-enter-hint")?.remove();
+    dockChatPresence?.cancel();
     if (fullscreenViewportTimer !== undefined) {
       window.clearTimeout(fullscreenViewportTimer);
       fullscreenViewportTimer = undefined;
@@ -12813,10 +13656,20 @@ export async function openChannelSession(
     embyLogin = undefined;
     embySelectedItem = undefined;
     embyPlaybackInfo = undefined;
+    embyVirtualGrid?.destroy();
+    embyVirtualGrid = undefined;
     await musicController?.destroy();
     musicController = undefined;
     await companion?.destroy();
     signal?.close();
+    const openDialogElement =
+      document.querySelector<HTMLDialogElement>("dialog[open]");
+    if (openDialogElement) {
+      await dialogController.close(openDialogElement);
+    }
+    document
+      .querySelectorAll(".command-palette, #keyboard-help-dialog")
+      .forEach((element) => element.remove());
     document.body.classList.remove(
       "mode-lobby",
       "mode-theater",
@@ -12824,6 +13677,9 @@ export async function openChannelSession(
       "is-lobby",
       "panel-collapsed",
       "panel-open",
+      "panel-overlay",
+      "panel-mobile-sheet",
+      "panel-inline",
     );
     await options.onLeave();
   }
@@ -12854,73 +13710,138 @@ export async function openChannelSession(
       document.querySelector<HTMLElement>(".session-rail") ?? document,
     );
   }
+  const sessionProfile =
+    document.querySelector<HTMLButtonElement>("#session-profile");
+  const sessionProfileMenu =
+    document.querySelector<HTMLElement>("#session-profile-menu");
+  const sessionNicknameInput =
+    document.querySelector<HTMLInputElement>("#session-nickname-input");
+  if (sessionProfile && sessionProfileMenu) {
+    profileSurface = new FloatingSurface(
+      sessionProfile,
+      sessionProfileMenu,
+      {
+        placement: "right-end",
+        closeOnOutside: true,
+      },
+    );
+    sessionProfile.addEventListener(
+      "click",
+      () => {
+        hideEmbeddedGame();
+        if (sessionNicknameInput) sessionNicknameInput.value = nickname;
+        void profileSurface?.toggle();
+      },
+      { signal: sessionUiAbortController.signal },
+    );
+  }
+  const saveSessionNickname = (): void => {
+    const nextNickname = saveNickname(
+      sessionNicknameInput?.value || nickname,
+    );
+    if (nextNickname === nickname) {
+      void profileSurface?.close();
+      return;
+    }
+    nickname = nextNickname;
+    if (sessionProfile) {
+      sessionProfile.textContent = Array.from(nickname)[0] || "友";
+      sessionProfile.title = `${nickname} · 点击修改昵称`;
+      sessionProfile.setAttribute(
+        "aria-label",
+        `修改昵称，当前昵称 ${nickname}`,
+      );
+    }
+    safeSignalSend({ type: "participant:rename", nickname });
+    notify(`昵称已改为 ${nickname}`);
+    void profileSurface?.close();
+  };
   document
-    .querySelector<HTMLButtonElement>("#session-profile")
-    ?.addEventListener("click", () => {
-      hideEmbeddedGame();
-      const requested = window.prompt("修改你在频道里显示的昵称", nickname);
-      if (requested === null) return;
-      const nextNickname = saveNickname(requested);
-      if (nextNickname === nickname) return;
-      nickname = nextNickname;
-      const profile =
-        document.querySelector<HTMLButtonElement>("#session-profile");
-      if (profile) {
-        profile.textContent = Array.from(nickname)[0] || "友";
-        profile.title = `${nickname} · 点击修改昵称`;
-        profile.setAttribute("aria-label", `修改昵称，当前昵称 ${nickname}`);
-      }
-      try {
-        safeSignalSend({ type: "participant:rename", nickname });
-      } catch {
-        // The new name is persisted and will be sent on the next reconnect.
-      }
-      notify(`昵称已改为 ${nickname}`);
-    });
-  document.addEventListener("keydown", handleGlobalKey);
-  document.querySelectorAll<HTMLDialogElement>("dialog").forEach((dialog) => {
-    dialog.addEventListener("cancel", (event) => {
-      event.preventDefault();
-      closeDialog(dialog);
-    });
+    .querySelector("#save-session-nickname")
+    ?.addEventListener("click", saveSessionNickname);
+  sessionNicknameInput?.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    saveSessionNickname();
   });
+  document.addEventListener("keydown", handleGlobalKey);
   const panelToggle =
     document.querySelector<HTMLButtonElement>("#panel-toggle");
-  const mobilePanelQuery = window.matchMedia("(max-width: 899px)");
-  const usesInlineCompanion = (): boolean =>
-    nativeAndroid || mobilePanelQuery.matches;
+  const companionScrim =
+    document.querySelector<HTMLButtonElement>("#companion-scrim");
+  const companionPanel =
+    document.querySelector<HTMLElement>(".room-sidebar.companion-panel");
+  const companionSheetHandle =
+    document.querySelector<HTMLElement>("#companion-sheet-handle");
+  const overlayPanelQuery = window.matchMedia("(max-width: 1199px)");
+  const mobileSheetQuery = window.matchMedia("(max-width: 599px)");
+  const splitCompanionQuery = window.matchMedia(
+    "(min-width: 768px) and (min-aspect-ratio: 4 / 3)",
+  );
+  let sheetPointerId: number | undefined;
+  let sheetDragStartY = 0;
+  let sheetDragLatestY = 0;
+  let sheetDragStartedAt = 0;
+  let sheetDragFrame = 0;
+  const resetSheetDrag = (): void => {
+    if (sheetDragFrame) {
+      cancelAnimationFrame(sheetDragFrame);
+      sheetDragFrame = 0;
+    }
+    sheetPointerId = undefined;
+    sheetDragLatestY = 0;
+    companionPanel?.classList.remove("is-sheet-dragging");
+    companionPanel?.style.removeProperty("--sheet-drag-y");
+  };
+  const usesSplitCompanion = (): boolean =>
+    splitCompanionQuery.matches;
+  const usesOverlayCompanion = (): boolean =>
+    !usesSplitCompanion() &&
+    (nativeAndroid || overlayPanelQuery.matches);
+  const usesMobileSheet = (): boolean =>
+    !usesSplitCompanion() &&
+    (nativeAndroid || mobileSheetQuery.matches);
   const applyPanelState = (
     collapsed: boolean,
     persist = true,
   ): void => {
-    if (usesInlineCompanion()) {
-      document.body.classList.remove("panel-collapsed");
-      document.body.classList.add("panel-open", "panel-inline");
-      if (panelToggle) {
-        panelToggle.hidden = true;
-        panelToggle.setAttribute("aria-expanded", "true");
-      }
-      return;
+    resetSheetDrag();
+    if (!collapsed) {
+      setDockChatComposerOpen(false);
     }
-    document.body.classList.remove("panel-inline");
+    document.body.classList.toggle(
+      "panel-overlay",
+      usesOverlayCompanion(),
+    );
+    document.body.classList.toggle(
+      "panel-mobile-sheet",
+      usesMobileSheet(),
+    );
+    document.body.classList.toggle(
+      "panel-inline",
+      !usesOverlayCompanion(),
+    );
     if (panelToggle) panelToggle.hidden = false;
     document.body.classList.toggle("panel-collapsed", collapsed);
     document.body.classList.toggle("panel-open", !collapsed);
+    if (companionScrim) {
+      companionScrim.hidden = collapsed || !usesOverlayCompanion();
+    }
     if (persist) {
       localStorage.setItem("synced:panel-collapsed", String(collapsed));
     }
     panelToggle?.setAttribute(
       "aria-label",
-      collapsed ? "展开成员与弹幕面板" : "收起成员与弹幕面板",
+      collapsed ? "展开频道陪伴面板" : "收起频道陪伴面板",
     );
     panelToggle?.setAttribute(
       "title",
-      collapsed ? "展开成员与弹幕面板" : "收起成员与弹幕面板",
+      collapsed ? "展开频道陪伴面板" : "收起频道陪伴面板",
     );
     if (panelToggle) {
       panelToggle.dataset.tooltip = collapsed
-        ? "展开成员与弹幕面板"
-        : "收起成员与弹幕面板";
+        ? "展开频道陪伴面板"
+        : "收起频道陪伴面板";
     }
     panelToggle?.setAttribute("aria-expanded", String(!collapsed));
   };
@@ -12928,24 +13849,118 @@ export async function openChannelSession(
     localStorage.getItem("synced:panel-collapsed");
   applyPanelState(
     savedPanelState === null
-      ? window.innerWidth <= 1_199
+      ? usesOverlayCompanion()
       : savedPanelState === "true",
     false,
   );
   panelToggle?.addEventListener("click", () => {
-    if (usesInlineCompanion()) return;
     const collapsed =
       !document.body.classList.contains("panel-collapsed");
     applyPanelState(collapsed);
   });
-  mobilePanelQuery.addEventListener(
+  companionScrim?.addEventListener("click", () => {
+    applyPanelState(true);
+    document.getElementById("session-companion")?.focus();
+  });
+  overlayPanelQuery.addEventListener(
     "change",
     () => {
       const saved = localStorage.getItem("synced:panel-collapsed");
-      applyPanelState(saved === null ? false : saved === "true", false);
+      applyPanelState(
+        saved === null ? usesOverlayCompanion() : saved === "true",
+        false,
+      );
     },
     { signal: sessionUiAbortController.signal },
   );
+  mobileSheetQuery.addEventListener(
+    "change",
+    () =>
+      applyPanelState(
+        document.body.classList.contains("panel-collapsed"),
+        false,
+    ),
+    { signal: sessionUiAbortController.signal },
+  );
+  splitCompanionQuery.addEventListener(
+    "change",
+    () => {
+      const saved = localStorage.getItem("synced:panel-collapsed");
+      applyPanelState(
+        saved === null ? usesOverlayCompanion() : saved === "true",
+        false,
+      );
+    },
+    { signal: sessionUiAbortController.signal },
+  );
+  companionSheetHandle?.addEventListener(
+    "pointerdown",
+    (event) => {
+      if (
+        !usesMobileSheet() ||
+        document.body.classList.contains("panel-collapsed") ||
+        !companionPanel
+      ) {
+        return;
+      }
+      event.preventDefault();
+      sheetPointerId = event.pointerId;
+      sheetDragStartY = event.clientY;
+      sheetDragLatestY = 0;
+      sheetDragStartedAt = performance.now();
+      companionPanel.classList.add("is-sheet-dragging");
+      companionSheetHandle.setPointerCapture?.(event.pointerId);
+    },
+    { signal: sessionUiAbortController.signal },
+  );
+  companionSheetHandle?.addEventListener(
+    "pointermove",
+    (event) => {
+      if (event.pointerId !== sheetPointerId || !companionPanel) return;
+      sheetDragLatestY = Math.max(0, event.clientY - sheetDragStartY);
+      if (sheetDragFrame) return;
+      sheetDragFrame = requestAnimationFrame(() => {
+        sheetDragFrame = 0;
+        companionPanel.style.setProperty(
+          "--sheet-drag-y",
+          `${Math.round(sheetDragLatestY)}px`,
+        );
+      });
+    },
+    { signal: sessionUiAbortController.signal },
+  );
+  const finishSheetDrag = (event: PointerEvent): void => {
+    if (event.pointerId !== sheetPointerId || !companionPanel) return;
+    const elapsed = Math.max(1, performance.now() - sheetDragStartedAt);
+    const velocity = sheetDragLatestY / elapsed;
+    const shouldClose =
+      sheetDragLatestY > Math.min(180, companionPanel.clientHeight * 0.24) ||
+      velocity > 0.68;
+    resetSheetDrag();
+    if (shouldClose) {
+      applyPanelState(true);
+      document.getElementById("session-companion")?.focus();
+    }
+  };
+  companionSheetHandle?.addEventListener(
+    "pointerup",
+    finishSheetDrag,
+    { signal: sessionUiAbortController.signal },
+  );
+  companionSheetHandle?.addEventListener(
+    "pointercancel",
+    (event) => {
+      if (event.pointerId === sheetPointerId) resetSheetDrag();
+    },
+    { signal: sessionUiAbortController.signal },
+  );
+  window.addEventListener("resize", resetSheetDrag, {
+    passive: true,
+    signal: sessionUiAbortController.signal,
+  });
+  document
+    .querySelector("#session-companion")
+    ?.addEventListener("click", () => focusCompanion("chat"));
   document
     .querySelector("#dock-play")
     ?.addEventListener("click", handlePlayPause);
@@ -12971,8 +13986,86 @@ export async function openChannelSession(
       videoEnhancement?.refresh();
       const btn = document.getElementById("dock-smart-crop");
       btn?.classList.toggle("is-on", fullscreenFit === "smart");
-      btn?.setAttribute("aria-pressed", String(fullscreenFit === "smart"));
+      btn?.setAttribute("aria-checked", String(fullscreenFit === "smart"));
       btn?.setAttribute("aria-label", fullscreenFit === "smart" ? "关闭智能裁剪" : "开启智能裁剪");
+    });
+  document
+    .querySelector("#dock-highlight")
+    ?.addEventListener("click", () => {
+      if (!highlightCorrectionInput) return;
+      highlightCorrectionInput.checked = !highlightCorrectionInput.checked;
+      highlightCorrectionInput.dispatchEvent(
+        new Event("change", { bubbles: true }),
+      );
+    });
+  document
+    .querySelector("#dock-enhancement")
+    ?.addEventListener("click", () => {
+      if (!videoEnhancementInput || videoEnhancementInput.disabled) {
+        notify("当前设备暂不支持视频增强", "warn");
+        return;
+      }
+      videoEnhancementInput.checked = !videoEnhancementInput.checked;
+      videoEnhancementInput.dispatchEvent(
+        new Event("change", { bubbles: true }),
+      );
+    });
+  const openPlaybackDiagnostics = (
+    section: "stats" | "route",
+  ): void => {
+    if (!playbackDiagnosticsDialog) return;
+    const title = document.getElementById("playback-diagnostics-title");
+    if (title) {
+      title.textContent =
+        section === "stats" ? "播放统计信息" : "线路诊断";
+    }
+    const signalRoute =
+      document.getElementById("diagnostic-signal-route");
+    if (signalRoute) {
+      signalRoute.textContent = signalUnavailable ? "正在重连" : "连接正常";
+    }
+    const mediaRoute =
+      document.getElementById("diagnostic-media-route");
+    if (mediaRoute) {
+      mediaRoute.textContent =
+        !broadcasterId
+          ? "等待放映"
+          : broadcastCapabilities?.mode === "emby" &&
+              signalFeatures.has("emby-segment-relay-v1")
+            ? "HTTPS CMAF 独立 ABR"
+            : sfuViewerActive || broadcasterId === selfId
+              ? "服务器 SFU"
+              : "P2P 备用链路";
+    }
+    const advice =
+      document.getElementById("diagnostic-network-advice");
+    if (advice) {
+      advice.textContent =
+        `${networkRouteLabel(networkAdvice.routeMode)} · ` +
+        networkAdvice.reason;
+    }
+    playbackDiagnosticsDialog.dataset.section = section;
+    void dockMoreSurface?.close();
+    openDialog(playbackDiagnosticsDialog);
+  };
+  document
+    .querySelector("#dock-stats")
+    ?.addEventListener("click", () => openPlaybackDiagnostics("stats"));
+  document
+    .querySelector("#dock-diagnostics")
+    ?.addEventListener("click", () => openPlaybackDiagnostics("route"));
+  document
+    .querySelector("#dock-shortcuts")
+    ?.addEventListener("click", () => {
+      void dockMoreSurface?.close();
+      showKeyboardHelp();
+    });
+  document
+    .querySelector("[data-close-playback-diagnostics]")
+    ?.addEventListener("click", () => {
+      if (playbackDiagnosticsDialog) {
+        closeDialog(playbackDiagnosticsDialog);
+      }
     });
   document
     .querySelector("#dock-chat")
@@ -13168,13 +14261,30 @@ export async function openChannelSession(
   document
     .querySelector("#leave-room")
     ?.addEventListener("click", () => void leaveSession());
+  const showInviteDialog = (): void => {
+    const dialog =
+      document.querySelector<HTMLDialogElement>("#invite-dialog");
+    if (dialog) openDialog(dialog);
+  };
   document
     .querySelector("#session-invite")
+    ?.addEventListener("click", showInviteDialog);
+  document
+    .querySelector("#lobby-invite")
+    ?.addEventListener("click", showInviteDialog);
+  document
+    .querySelector("#lobby-copy-room")
     ?.addEventListener("click", () => {
-      const dialog =
-        document.querySelector<HTMLDialogElement>("#invite-dialog");
-      if (dialog) openDialog(dialog);
+      document.getElementById("copy-room")?.click();
     });
+  document
+    .querySelector("#cancel-session-connection")
+    ?.addEventListener("click", () => void leaveSession());
+  options.operationSignal?.addEventListener(
+    "abort",
+    () => void leaveSession(),
+    { once: true, signal: sessionUiAbortController.signal },
+  );
   document
     .querySelector("[data-close-invite]")
     ?.addEventListener("click", () => {
@@ -13202,13 +14312,25 @@ export async function openChannelSession(
   const joinLink = buildJoinLink(room, signalUrl);
   const inviteQr = document.querySelector<HTMLImageElement>("#invite-qr");
   if (inviteQr) {
-    void QRCode.toDataURL(joinLink, {
-      width: 220,
-      margin: 1,
-      color: { dark: "#101925ff", light: "#f5f7fbff" },
-    }).then((url) => {
-      if (inviteQr.isConnected) inviteQr.src = url;
-    });
+    const rootStyle = getComputedStyle(document.documentElement);
+    const dark = rootStyle.getPropertyValue("--n-850").trim();
+    const light = rootStyle.getPropertyValue("--n-000").trim();
+    void import("qrcode")
+      .then(({ default: QRCode }) =>
+        QRCode.toDataURL(joinLink, {
+          width: 220,
+          margin: 1,
+          color: { dark, light },
+        }),
+      )
+      .then((url) => {
+        if (inviteQr.isConnected) inviteQr.src = url;
+      })
+      .catch(() => {
+        if (inviteQr.isConnected) {
+          inviteQr.alt = "二维码生成失败，请复制频道码";
+        }
+      });
   }
   document.querySelector("#copy-invite")?.addEventListener("click", async () => {
     try {
@@ -13220,6 +14342,30 @@ export async function openChannelSession(
       notify(error instanceof Error ? error.message : "复制失败", true);
     }
   });
+  const shareInvite =
+    document.querySelector<HTMLButtonElement>("#share-invite");
+  if (shareInvite && typeof navigator.share !== "function") {
+    shareInvite.hidden = true;
+  }
+  shareInvite?.addEventListener("click", async () => {
+    try {
+      await navigator.share({
+        title: channelName,
+        text: `加入“${channelName}”，频道码 ${room}`,
+        url: joinLink,
+      });
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") return;
+      notify(error instanceof Error ? error.message : "系统分享失败", true);
+    }
+  });
+  document
+    .querySelector("#enter-created-room")
+    ?.addEventListener("click", () => {
+      const dialog =
+        document.querySelector<HTMLDialogElement>("#invite-dialog");
+      if (dialog) closeDialog(dialog);
+    });
   pictureSettingsButton?.addEventListener("click", () => {
     if (pictureDialog) openDialog(pictureDialog);
   });
@@ -13334,8 +14480,7 @@ export async function openChannelSession(
   document
     .querySelector("[data-close-emby-popup]")
     ?.addEventListener("click", () => {
-      const d = document.querySelector<HTMLDialogElement>("#emby-item-popup");
-      if (d?.open) closeDialog(d);
+      hideEmbyItemPopup();
     });
   document
     .querySelector<HTMLButtonElement>("#emby-start-from-popup")
@@ -13365,6 +14510,10 @@ export async function openChannelSession(
       String(highlightCorrection),
     );
     applyHighlightCorrection();
+    const item = document.querySelector<HTMLElement>("#dock-highlight");
+    item?.setAttribute("aria-checked", String(highlightCorrection));
+    const state = item?.querySelector("small");
+    if (state) state.textContent = highlightCorrection ? "已开启" : "已关闭";
   });
   videoEnhancementInput?.addEventListener("change", () => {
     videoEnhancementPreference = videoEnhancementInput.checked
@@ -13376,6 +14525,16 @@ export async function openChannelSession(
     );
     videoEnhancement?.setPreference(videoEnhancementPreference);
     syncVideoEnhancement();
+    const item = document.querySelector<HTMLElement>("#dock-enhancement");
+    item?.setAttribute(
+      "aria-checked",
+      String(videoEnhancementPreference !== "off"),
+    );
+    const state = item?.querySelector("small");
+    if (state) {
+      state.textContent =
+        videoEnhancementPreference === "off" ? "已关闭" : "自动";
+    }
   });
   const requestBroadcast = (): void => {
     if (broadcasterId === selfId) {
@@ -13400,12 +14559,96 @@ export async function openChannelSession(
     .querySelector("#refresh-session-sources")
     ?.addEventListener("click", () => void loadBroadcastSources());
   document
+    .querySelectorAll<HTMLButtonElement>("[data-source-filter]")
+    .forEach((button) => {
+      button.addEventListener("click", () => {
+        sourceFilter =
+          button.dataset.sourceFilter === "recent" ||
+          button.dataset.sourceFilter === "player" ||
+          button.dataset.sourceFilter === "browser"
+            ? button.dataset.sourceFilter
+            : "all";
+        document
+          .querySelectorAll<HTMLButtonElement>("[data-source-filter]")
+          .forEach((candidate) => {
+            candidate.setAttribute(
+              "aria-pressed",
+              String(candidate.dataset.sourceFilter === sourceFilter),
+            );
+          });
+        renderBroadcastSources();
+      });
+    });
+  document
+    .querySelector("#cancel-screen-broadcast")
+    ?.addEventListener("click", closeBroadcastDialog);
+  document
+    .querySelector("#start-screen-broadcast")
+    ?.addEventListener("click", async () => {
+      if (preparingBroadcast || !selectedBroadcastSourceId) return;
+      const source = broadcastSources.find(
+        (candidate) => candidate.id === selectedBroadcastSourceId,
+      );
+      if (!source) {
+        selectedBroadcastSourceId = "";
+        renderBroadcastSources();
+        notify("所选窗口已经关闭，请重新选择", "warn");
+        return;
+      }
+      const start =
+        document.querySelector<HTMLButtonElement>("#start-screen-broadcast");
+      if (start) {
+        start.disabled = true;
+        start.setAttribute("aria-busy", "true");
+        const label = document.getElementById(
+          "start-screen-broadcast-label",
+        );
+        if (label) label.textContent = "正在启动…";
+      }
+      closeBroadcastDialog();
+      await prepareLocalBroadcast(source.id);
+      if (mediaStream) {
+        rememberCaptureSource(source);
+      }
+      if (start?.isConnected) {
+        start.removeAttribute("aria-busy");
+        const label = document.getElementById(
+          "start-screen-broadcast-label",
+        );
+        if (label) label.textContent = "开始放映";
+      }
+      updateSelectedSourceSummary();
+    });
+  document
     .querySelectorAll<HTMLButtonElement>("[data-broadcast-mode]")
     .forEach((button) => {
       button.addEventListener("click", () => {
         switchBroadcastMode(
           button.dataset.broadcastMode === "emby" ? "emby" : "screen",
         );
+      });
+      button.addEventListener("keydown", (event) => {
+        if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
+          return;
+        }
+        event.preventDefault();
+        const tabs = Array.from(
+          document.querySelectorAll<HTMLButtonElement>(
+            "[data-broadcast-mode]",
+          ),
+        );
+        const current = tabs.indexOf(button);
+        const nextIndex =
+          event.key === "Home"
+            ? 0
+            : event.key === "End"
+              ? tabs.length - 1
+              : (current +
+                  (event.key === "ArrowRight" ? 1 : -1) +
+                  tabs.length) %
+                tabs.length;
+        tabs[nextIndex]?.click();
+        tabs[nextIndex]?.focus();
       });
     });
   bindEndpointEditor("login");
@@ -13449,6 +14692,85 @@ export async function openChannelSession(
   document
     .querySelector<HTMLSelectElement>("#emby-library-select")
     ?.addEventListener("change", () => void loadEmbyItems());
+  document
+    .querySelectorAll<HTMLButtonElement>("[data-emby-nav-mode]")
+    .forEach((button) => {
+      button.addEventListener("click", () => {
+        const mode = button.dataset.embyNavMode || "all";
+        const filter =
+          document.querySelector<HTMLSelectElement>("#emby-browse-filter");
+        if (filter) filter.value = mode;
+        document
+          .querySelectorAll<HTMLButtonElement>("[data-emby-nav-mode]")
+          .forEach((candidate) => {
+            if (candidate === button) {
+              candidate.setAttribute("aria-current", "page");
+              candidate.tabIndex = 0;
+            } else {
+              candidate.removeAttribute("aria-current");
+              candidate.tabIndex = -1;
+            }
+          });
+        const title = document.getElementById("emby-content-title");
+        if (title) {
+          title.textContent =
+            mode === "resume"
+              ? "继续观看"
+              : mode === "movies"
+                ? "电影"
+                : mode === "episodes"
+                  ? "剧集"
+                  : mode === "favorite"
+                    ? "收藏"
+                    : mode === "latest"
+                      ? "最近添加"
+                      : "媒体首页";
+        }
+        void loadEmbyItems();
+      });
+      button.addEventListener("keydown", (event) => {
+        if (
+          ![
+            "ArrowUp",
+            "ArrowDown",
+            "ArrowLeft",
+            "ArrowRight",
+            "Home",
+            "End",
+          ].includes(event.key)
+        ) {
+          return;
+        }
+        event.preventDefault();
+        const items = Array.from(
+          document.querySelectorAll<HTMLButtonElement>(
+            "[data-emby-nav-mode]",
+          ),
+        );
+        const current = items.indexOf(button);
+        const nextIndex =
+          event.key === "Home"
+            ? 0
+            : event.key === "End"
+              ? items.length - 1
+              : (current +
+                  (["ArrowDown", "ArrowRight"].includes(event.key)
+                    ? 1
+                    : -1) +
+                  items.length) %
+                items.length;
+        items[nextIndex]?.click();
+        items[nextIndex]?.focus();
+      });
+    });
+  document
+    .querySelector("#emby-open-settings")
+    ?.addEventListener("click", () => {
+      closeBroadcastDialog();
+      document.dispatchEvent(
+        new CustomEvent("synced:open-settings", { detail: "emby" }),
+      );
+    });
   document
     .querySelector<HTMLSelectElement>("#emby-browse-filter")
     ?.addEventListener("change", () => void loadEmbyItems());
@@ -13793,10 +15115,17 @@ export async function openChannelSession(
 
   if (!desktop) {
     void App.addListener("backButton", () => {
-      const openDialog =
-        document.querySelector<HTMLDialogElement>("dialog[open]");
-      if (openDialog) {
-        closeDialog(openDialog);
+      if (dialogController.closeTopmost()) {
+        return;
+      }
+      if (closeTopmostFloatingSurface()) {
+        return;
+      } else if (
+        usesOverlayCompanion() &&
+        document.body.classList.contains("panel-open")
+      ) {
+        applyPanelState(true);
+        document.getElementById("session-companion")?.focus();
       } else if (document.body.classList.contains("immersive-player")) {
         finishImmersiveUi();
         void exitImmersivePlayer().finally(() => {
@@ -13887,9 +15216,14 @@ export async function openChannelSession(
   });
   try {
     await signal.connect(signalUrl);
+    options.operationSignal?.throwIfAborted();
+    setConnectionStep("room", "正在加入频道");
     sendChannelJoin();
   } catch (error) {
+    if (options.operationSignal?.aborted || leaving) return;
     signalUnavailable = true;
+    if (connectionTitle) connectionTitle.textContent = "连接暂时中断";
+    void connectionPresence?.show(sessionUiAbortController.signal);
     setStatus(
       error instanceof Error ? error.message : "无法连接频道服务器",
       "error",

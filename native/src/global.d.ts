@@ -1,6 +1,8 @@
 export {};
 
 declare global {
+  const __APP_VERSION__: string;
+
   interface Window {
     roomDesktop?: {
       loadChannelOwnership: () =>
@@ -94,7 +96,9 @@ declare global {
         searchTerm: string;
         includeItemTypes?: string[];
         limit?: number;
-        filters?: Array<"IsResumable" | "IsUnplayed" | "IsPlayed">;
+        filters?: Array<
+          "IsResumable" | "IsUnplayed" | "IsPlayed" | "IsFavorite"
+        >;
         sortBy?: string;
         sortOrder?: "Ascending" | "Descending";
       }) => Promise<{
@@ -114,7 +118,9 @@ declare global {
         includeItemTypes?: string[];
         limit?: number;
         startIndex?: number;
-        filters?: Array<"IsResumable" | "IsUnplayed" | "IsPlayed">;
+        filters?: Array<
+          "IsResumable" | "IsUnplayed" | "IsPlayed" | "IsFavorite"
+        >;
         sortBy?:
           | "SortName"
           | "DateCreated"
@@ -205,6 +211,9 @@ declare global {
     processId?: number;
     processName?: string;
     executableName?: string;
+    width?: number;
+    height?: number;
+    audioAvailable?: boolean;
   }
 
   interface CaptureSelection {

@@ -218,6 +218,16 @@ test("Android enforces WSS, app-local gesture volume and explicit notification c
   const channelStore = source("src/channel-store.ts");
 
   assert.match(manifest, /usesCleartextTraffic="false"/);
+  assert.match(manifest, /android\.permission\.CAMERA/);
+  assert.match(
+    manifest,
+    /android\.hardware\.camera\.any" android:required="false"/,
+  );
+  assert.equal(
+    (manifest.match(/android:scheme="synced"/gu) || []).length,
+    1,
+    "the custom invitation deep link must only be registered once",
+  );
   assert.doesNotMatch(manifest, /largeHeap=/);
   assert.match(rendererConfig, /allowInsecure\?: boolean/);
   assert.match(rendererConfig, /policy\.allowInsecure === false/);

@@ -1,4 +1,5 @@
 import { App } from "@capacitor/app";
+import type { PluginListenerHandle } from "@capacitor/core";
 import "./styles.css";
 import {
   forgetRecentChannel,
@@ -9,7 +10,7 @@ import {
   saveChannelName,
   saveNickname,
 } from "./channel-store";
-import { openChannelSession } from "./channel-session";
+import type { ChannelSessionOptions } from "./channel-session";
 import {
   describeSignalHost,
   HOME_SIGNAL_URL,
@@ -20,6 +21,25 @@ import {
 import { hideEmbeddedGame } from "./embedded-game";
 import { isNativeAndroid } from "./immersive";
 import { migrateStorageIdentity } from "./storage-identity";
+import { dialogController } from "./ui/dialog-controller";
+import { renderDesignLab } from "./ui/design-lab";
+import {
+  applySavedUiScale,
+  SettingsController,
+} from "./ui/settings-controller";
+import { effectsQuality } from "./ui/effects-quality";
+import {
+  closeTopmostFloatingSurface,
+  FloatingSurface,
+} from "./ui/floating-surface";
+import { hydrateIcons } from "./ui/icons";
+import {
+  animateElement,
+  cancelElementMotion,
+} from "./ui/motion-controller";
+import { scanQrCode } from "./ui/qr-scanner";
+import { probeSignalHealth } from "./ui/signal-health";
+import { transitionView } from "./ui/view-transition";
 
 migrateStorageIdentity(localStorage);
 
@@ -29,9 +49,41 @@ if (!root) {
 }
 const appRoot: HTMLDivElement = root;
 
+async function openSession(
+  options: ChannelSessionOptions,
+): Promise<void> {
+  const { openChannelSession } = await import("./channel-session");
+  options.operationSignal?.throwIfAborted();
+  await openChannelSession(options);
+}
+applySavedUiScale();
+void effectsQuality.start().catch(() => undefined);
+document.documentElement.dataset.input = matchMedia(
+  "(hover: none), (pointer: coarse)",
+).matches
+  ? "touch"
+  : "pointer";
+
 const DEFAULT_SIGNAL_URL = HOME_SIGNAL_URL;
 const isDesktop = Boolean(window.roomDesktop);
 const signalUrlPolicy = { allowInsecure: !isNativeAndroid() } as const;
+let viewAbortController = new AbortController();
+let settingsController: SettingsController;
+let appBackButtonHandle: PluginListenerHandle | undefined;
+
+function resetViewLifecycle(): AbortSignal {
+  viewAbortController.abort();
+  viewAbortController = new AbortController();
+  return viewAbortController.signal;
+}
+
+function navigate(
+  render: () => void | Promise<void>,
+  name: string,
+): void {
+  const signal = resetViewLifecycle();
+  void transitionView(appRoot, render, { signal, name });
+}
 
 function normalizeAppSignalUrl(value: string): string {
   return normalizeSignalUrl(value, signalUrlPolicy);
@@ -75,6 +127,23 @@ function saveSignalUrl(value: string): string {
 }
 
 type ToastType = "info" | "warn" | "danger";
+interface ActiveToast {
+  element: HTMLElement;
+  count: number;
+  timer: number;
+}
+const activeToasts = new Map<string, ActiveToast>();
+
+function syncToastMaterialBudget(): void {
+  const hasVisibleToast = Boolean(
+    document.querySelector("#toast-container .toast"),
+  );
+  if (hasVisibleToast) {
+    document.documentElement.dataset.toastVisible = "true";
+  } else {
+    delete document.documentElement.dataset.toastVisible;
+  }
+}
 
 function getOrCreateToastContainer(): HTMLElement {
   let container = document.getElementById("toast-container");
@@ -82,16 +151,46 @@ function getOrCreateToastContainer(): HTMLElement {
     container = document.createElement("div");
     container.id = "toast-container";
     container.setAttribute("aria-label", "通知");
+    container.setAttribute("aria-live", "polite");
     document.body.append(container);
   }
   return container;
 }
 
-function removeToast(element: Element | null): void {
-  if (!element?.parentNode) return;
-  const toastElement = element as HTMLElement;
-  toastElement.classList.add("is-leaving");
-  window.setTimeout(() => toastElement.remove(), 160);
+async function removeToast(
+  key: string,
+  element: HTMLElement,
+): Promise<void> {
+  if (!element.parentNode || element.dataset.presence === "leaving") return;
+  element.dataset.presence = "leaving";
+  const toastExitsDown = matchMedia("(max-width: 600px)").matches;
+  const result = await animateElement(
+    element,
+    [
+      { opacity: 1, transform: "none" },
+      {
+        opacity: 0,
+        transform: toastExitsDown
+          ? "translateY(8px)"
+          : "translateX(8px)",
+      },
+    ],
+    {
+      kind: "micro",
+      id: "toast-presence",
+      reducedKeyframes: [{ opacity: 1 }, { opacity: 0 }],
+    },
+  );
+  if (
+    result !== "finished" ||
+    element.dataset.presence !== "leaving"
+  ) {
+    return;
+  }
+  element.remove();
+  const active = activeToasts.get(key);
+  if (active?.element === element) activeToasts.delete(key);
+  syncToastMaterialBudget();
 }
 
 function toast(
@@ -100,31 +199,150 @@ function toast(
 ): void {
   const tone: ToastType =
     type === true ? "danger" : type === false ? "info" : type;
+  const key = `${tone}:${message}`;
+  const existing = activeToasts.get(key);
+  if (existing?.element.isConnected) {
+    cancelElementMotion(existing.element, "toast-presence");
+    existing.element.dataset.presence = "present";
+    existing.count += 1;
+    const count = existing.element.querySelector<HTMLElement>(
+      "[data-toast-count]",
+    );
+    if (count) {
+      count.hidden = false;
+      count.textContent = `×${existing.count}`;
+    }
+    window.clearTimeout(existing.timer);
+    existing.timer = window.setTimeout(
+      () => void removeToast(key, existing.element),
+      5_000,
+    );
+    void animateElement(
+      existing.element,
+      [
+        { transform: "scale(1)" },
+        { transform: "scale(1.015)" },
+        { transform: "scale(1)" },
+      ],
+      { kind: "micro", id: "toast-merge" },
+    );
+    return;
+  }
   const container = getOrCreateToastContainer();
   const element = document.createElement("div");
-  element.className = `toast toast-${tone}`;
+  element.className = `toast toast-${tone} material-regular`;
+  element.dataset.presence = "entering";
   element.setAttribute("role", tone === "danger" ? "alert" : "status");
   element.innerHTML = `
     <span class="toast-bar" aria-hidden="true"></span>
     <span class="toast-text">${escapeHtml(message)}</span>
+    <span class="toast-count tnum" data-toast-count hidden></span>
     <button class="btn btn-ghost btn-icon btn-icon-sm toast-close" type="button" aria-label="关闭通知">
-      <svg viewBox="0 0 24 24" aria-hidden="true">
-        <path d="M6 6l12 12M18 6 6 18"></path>
-      </svg>
+      <i data-lucide="x"></i>
     </button>
   `;
   element
     .querySelector(".toast-close")
-    ?.addEventListener("click", () => removeToast(element));
+    ?.addEventListener("click", () => void removeToast(key, element));
   container.append(element);
+  syncToastMaterialBudget();
+  hydrateIcons(element);
+  const toastStartsBelow = matchMedia("(max-width: 600px)").matches;
+  void animateElement(
+    element,
+    [
+      {
+        opacity: 0,
+        transform: toastStartsBelow
+          ? "translateY(12px)"
+          : "translateX(10px)",
+      },
+      { opacity: 1, transform: "none" },
+    ],
+    {
+      kind: "control",
+      id: "toast-presence",
+      reducedKeyframes: [{ opacity: 0 }, { opacity: 1 }],
+    },
+  ).then((result) => {
+    if (
+      result === "finished" &&
+      element.dataset.presence === "entering"
+    ) {
+      element.dataset.presence = "present";
+    }
+  });
   const all = container.querySelectorAll(".toast");
-  if (all.length > 3) removeToast(all[0]);
-  window.setTimeout(() => removeToast(element), 5_000);
+  if (all.length > 3 && all[0] instanceof HTMLElement) {
+    const oldest = [...activeToasts.entries()].find(
+      ([, value]) => value.element === all[0],
+    );
+    if (oldest) void removeToast(oldest[0], oldest[1].element);
+  }
+  const timer = window.setTimeout(
+    () => void removeToast(key, element),
+    5_000,
+  );
+  activeToasts.set(key, { element, count: 1, timer });
 }
 
-function confirmExternalInvite(
+async function requestSignalTrust(
+  signalUrl: string,
+  room: string,
+  opener?: HTMLElement,
+): Promise<boolean> {
+  const dialog = document.createElement("dialog");
+  dialog.className = "security-sheet";
+  dialog.setAttribute("aria-labelledby", "signal-trust-title");
+  dialog.innerHTML = `
+    <div class="security-sheet-content">
+      <span class="eyebrow">UNFAMILIAR SERVER</span>
+      <div class="cluster">
+        <i data-lucide="shield-alert" aria-hidden="true"></i>
+        <h2 id="signal-trust-title">确认使用陌生服务器</h2>
+      </div>
+      <p>这个邀请不会自动开启麦克风，但服务器可以看到你的频道连接元数据。只接受你认识的人提供的地址。</p>
+      <div class="security-host">
+        <strong>${escapeHtml(describeSignalHost(signalUrl))}</strong>
+        <small>频道 ${escapeHtml(room)}</small>
+      </div>
+      <div class="dialog-actions">
+        <button class="btn btn-secondary" type="button" data-trust-reject>取消</button>
+        <button class="btn btn-primary" type="button" data-trust-accept>信任并继续</button>
+      </div>
+    </div>
+  `;
+  document.body.append(dialog);
+  hydrateIcons(dialog);
+  return new Promise<boolean>((resolve) => {
+    let settled = false;
+    const finish = async (accepted: boolean): Promise<void> => {
+      if (settled) return;
+      settled = true;
+      await dialogController.close(dialog);
+      dialog.remove();
+      resolve(accepted);
+    };
+    dialog
+      .querySelector("[data-trust-reject]")
+      ?.addEventListener("click", () => void finish(false));
+    dialog
+      .querySelector("[data-trust-accept]")
+      ?.addEventListener("click", () => void finish(true));
+    dialog.addEventListener("close", () => {
+      if (!settled) {
+        settled = true;
+        dialog.remove();
+        resolve(false);
+      }
+    });
+    void dialogController.open(dialog, opener);
+  });
+}
+
+async function confirmExternalInvite(
   inviteUrl: string,
-): { room: string; signalUrl: string } | undefined {
+): Promise<{ room: string; signalUrl: string } | undefined> {
   const parsed = parseJoinLink(inviteUrl);
   if (!parsed.room) {
     toast("邀请链接无效或已损坏", "danger");
@@ -150,16 +368,7 @@ function confirmExternalInvite(
   // because joining never enables the microphone. Unknown signal hosts still
   // require an explicit trust decision.
   if (!untrusted) return { room: parsed.room, signalUrl };
-  const message = [
-    "⚠️ 注意：此邀请使用了陌生的信令服务器",
-    "",
-    `服务器：${describeSignalHost(signalUrl)}`,
-    `频道：${parsed.room}`,
-    "",
-    "只接受你认识的人发来的邀请链接。",
-    "加入后不会自动开启麦克风。",
-  ].join("\n");
-  const accepted = window.confirm(message);
+  const accepted = await requestSignalTrust(signalUrl, parsed.room);
   return accepted ? { room: parsed.room, signalUrl } : undefined;
 }
 
@@ -167,58 +376,280 @@ function channelInitial(name: string): string {
   return Array.from(name)[0] || "频";
 }
 
-function recentMarkup(disabled = false): string {
+function formatLastJoined(timestamp: number): string {
+  const elapsed = Math.max(0, Date.now() - timestamp);
+  if (elapsed < 60_000) return "刚刚进入";
+  if (elapsed < 3_600_000) {
+    return `${Math.max(1, Math.floor(elapsed / 60_000))} 分钟前`;
+  }
+  if (elapsed < 86_400_000) {
+    return `${Math.max(1, Math.floor(elapsed / 3_600_000))} 小时前`;
+  }
+  return new Intl.DateTimeFormat("zh-CN", {
+    month: "short",
+    day: "numeric",
+  }).format(timestamp);
+}
+
+function recentRailMarkup(disabled = false): string {
   const recent = getRecentChannels();
   if (!recent.length) {
-    return `<p class="recent-empty">加入过的频道会留在这里</p>`;
+    return `<p class="recent-empty" aria-label="暂无最近频道">—</p>`;
   }
-  const actionHint = isDesktop ? "左键进入，右键删除" : "短按进入，长按删除";
   return recent
+    .slice(0, 5)
     .map(
       (channel) => `
         <button
-          class="recent-channel"
+          class="recent-channel rail-recent"
           data-recent-room="${escapeHtml(channel.room)}"
           data-recent-name="${escapeHtml(channel.name)}"
           data-recent-signal="${escapeHtml(channel.signalUrl)}"
           data-recent-navigation-disabled="${disabled ? "true" : "false"}"
-          aria-label="${escapeHtml(channel.name)}，${actionHint}"
+          aria-label="进入频道 ${escapeHtml(channel.name)}"
           aria-disabled="${disabled ? "true" : "false"}"
-          title="${escapeHtml(channel.name)} · ${actionHint}"
+          title="${escapeHtml(channel.name)} · ${channel.room}"
         >
           <span>${escapeHtml(channelInitial(channel.name))}</span>
-          <b>${escapeHtml(channel.name)}</b>
-          <small>${channel.room}</small>
         </button>
       `,
     )
     .join("");
 }
 
+function recentHomeMarkup(): string {
+  const recent = getRecentChannels();
+  if (!recent.length) {
+    return `
+      <div class="recent-empty-state material-card">
+        <i data-lucide="users"></i>
+        <div><strong>还没有最近频道</strong><p>创建或加入一次后，可以从这里快速回来。</p></div>
+      </div>
+    `;
+  }
+  return recent
+    .slice(0, 6)
+    .map(
+      (channel) => `
+        <article class="recent-channel-card interactive-card" data-recent-card="${escapeHtml(channel.room)}">
+          <button class="recent-card-main" type="button"
+            data-recent-room="${escapeHtml(channel.room)}"
+            data-recent-name="${escapeHtml(channel.name)}"
+            data-recent-signal="${escapeHtml(channel.signalUrl)}"
+            data-recent-navigation-disabled="false"
+            aria-label="进入频道 ${escapeHtml(channel.name)}，${channel.room}">
+            <span class="recent-avatar">${escapeHtml(channelInitial(channel.name))}</span>
+            <span class="recent-card-copy">
+              <strong>${escapeHtml(channel.name)}</strong>
+              <small><span class="mono">${escapeHtml(channel.room.slice(0, 4))} · ${escapeHtml(channel.room.slice(4))}</span> · ${formatLastJoined(channel.lastJoinedAt)}</small>
+              <span class="recent-health" data-signal-health="${escapeHtml(channel.signalUrl)}">
+                <i data-lucide="circle"></i><span>检查服务状态</span>
+              </span>
+            </span>
+          </button>
+          <button class="btn btn-ghost btn-icon recent-menu-trigger" type="button"
+            data-recent-menu="${escapeHtml(channel.room)}"
+            aria-label="${escapeHtml(channel.name)}的更多操作"
+            aria-haspopup="menu" aria-expanded="false">
+            <i data-lucide="ellipsis"></i>
+          </button>
+        </article>
+      `,
+    )
+    .join("");
+}
+
+function continueChannelMarkup(): string {
+  const channel = getRecentChannels()[0];
+  if (!channel) return "";
+  return `
+    <section class="continue-card">
+      <div class="continue-card-copy">
+        <span class="eyebrow">CONTINUE</span>
+        <strong>${escapeHtml(channel.name)}</strong>
+        <small><span class="mono">${escapeHtml(channel.room.slice(0, 4))} · ${escapeHtml(channel.room.slice(4))}</span> · ${formatLastJoined(channel.lastJoinedAt)}</small>
+      </div>
+      <button class="btn btn-primary btn-lg" type="button"
+        data-recent-room="${escapeHtml(channel.room)}"
+        data-recent-name="${escapeHtml(channel.name)}"
+        data-recent-signal="${escapeHtml(channel.signalUrl)}"
+        data-recent-navigation-disabled="false">
+        <i data-lucide="play"></i><span>继续进入</span>
+      </button>
+    </section>
+  `;
+}
+
 function railMarkup(disabled = false): string {
   return `
-    <aside class="channel-rail">
+    <aside class="channel-rail" aria-label="主导航">
       <div class="rail-logo rail-identity" role="img" aria-label="同频">
         <img src="./brand-mark-dark.svg" width="26" height="26" alt="" aria-hidden="true" />
       </div>
       <div class="rail-divider"></div>
       <div class="recent-list" aria-label="最近加入的频道">
-        ${recentMarkup(disabled)}
+        ${recentRailMarkup(disabled)}
       </div>
-      <button class="rail-add" data-join-button aria-label="加入新频道">＋</button>
+      <button class="rail-add" data-join-button aria-label="加入新频道" data-tooltip="加入频道"><i data-lucide="plus"></i></button>
       <div class="rail-spacer"></div>
-      <div class="profile-orb" title="${escapeHtml(getNickname())}">
+      <button class="profile-orb profile-action" type="button"
+        data-profile-button aria-label="个人资料与设置，当前昵称 ${escapeHtml(getNickname())}"
+        aria-haspopup="menu" aria-expanded="false" title="${escapeHtml(getNickname())}">
         ${escapeHtml(channelInitial(getNickname()))}
-      </div>
+      </button>
     </aside>
   `;
 }
 
 function bindRailNavigation(): void {
   document.querySelector("[data-join-button]")?.addEventListener("click", () => {
-    void renderViewer({ desktop: isDesktop });
+    navigate(() => renderViewer({ desktop: isDesktop }), "join");
   });
   bindRecentChannelInteractions();
+  bindRecentMenus();
+  bindProfilePopover();
+  hydrateIcons(document);
+}
+
+function bindProfilePopover(): void {
+  const trigger = document.querySelector<HTMLButtonElement>(
+    "[data-profile-button]",
+  );
+  if (!trigger || document.querySelector("[data-profile-popover]")) return;
+  const popover = document.createElement("div");
+  popover.className = "profile-popover";
+  popover.dataset.profilePopover = "";
+  popover.hidden = true;
+  popover.setAttribute("role", "menu");
+  popover.innerHTML = `
+    <label class="field">
+      <span>我的昵称</span>
+      <input data-profile-nickname maxlength="16" value="${escapeHtml(getNickname())}" autocomplete="nickname" />
+    </label>
+    <div class="profile-popover-actions">
+      <button class="btn btn-secondary" type="button" data-profile-save>
+        <i data-lucide="check"></i><span>保存昵称</span>
+      </button>
+      <button class="btn btn-ghost" type="button" data-open-settings>
+        <i data-lucide="settings"></i><span>设置</span>
+      </button>
+    </div>
+  `;
+  document.body.append(popover);
+  hydrateIcons(popover);
+  const floating = new FloatingSurface(trigger, popover, {
+    placement: "top-start",
+    closeOnOutside: true,
+  });
+  trigger.addEventListener("click", () => void floating.toggle(), {
+    signal: viewAbortController.signal,
+  });
+  popover
+    .querySelector("[data-profile-save]")
+    ?.addEventListener(
+      "click",
+      () => {
+        const input =
+          popover.querySelector<HTMLInputElement>("[data-profile-nickname]");
+        if (!input) return;
+        input.value = saveNickname(input.value);
+        trigger.textContent = channelInitial(input.value);
+        trigger.setAttribute(
+          "aria-label",
+          `个人资料与设置，当前昵称 ${input.value}`,
+        );
+        toast("昵称已保存");
+        void floating.close();
+      },
+      { signal: viewAbortController.signal },
+    );
+  popover
+    .querySelector("[data-open-settings]")
+    ?.addEventListener(
+      "click",
+      () => {
+        void floating.close().then(() =>
+          settingsController.open(trigger),
+        );
+      },
+      { signal: viewAbortController.signal },
+    );
+  viewAbortController.signal.addEventListener(
+    "abort",
+    () => {
+      floating.destroy();
+      popover.remove();
+    },
+    { once: true },
+  );
+}
+
+function bindRecentMenus(): void {
+  document
+    .querySelectorAll<HTMLButtonElement>("[data-recent-menu]")
+    .forEach((trigger) => {
+      const room = trigger.dataset.recentMenu;
+      const card = room
+        ? document.querySelector<HTMLElement>(
+            `[data-recent-card="${CSS.escape(room)}"]`,
+          )
+        : undefined;
+      if (!room || !card) return;
+      const enter = card.querySelector<HTMLButtonElement>(
+        "[data-recent-room]",
+      );
+      const menu = document.createElement("div");
+      menu.className = "recent-menu";
+      menu.hidden = true;
+      menu.setAttribute("role", "menu");
+      menu.innerHTML = `
+        <button class="btn btn-ghost" type="button" role="menuitem" data-menu-enter>
+          <i data-lucide="play"></i><span>进入频道</span>
+        </button>
+        <button class="btn btn-danger" type="button" role="menuitem" data-menu-delete>
+          <i data-lucide="trash-2"></i><span>删除历史</span>
+        </button>
+      `;
+      document.body.append(menu);
+      hydrateIcons(menu);
+      const floating = new FloatingSurface(trigger, menu, {
+        placement: "bottom-end",
+        closeOnOutside: true,
+      });
+      trigger.addEventListener(
+        "click",
+        () => void floating.toggle(),
+        { signal: viewAbortController.signal },
+      );
+      menu
+        .querySelector("[data-menu-enter]")
+        ?.addEventListener(
+          "click",
+          () => {
+            void floating.close();
+            enter?.click();
+          },
+          { signal: viewAbortController.signal },
+        );
+      menu
+        .querySelector("[data-menu-delete]")
+        ?.addEventListener(
+          "click",
+          () => {
+            void floating.close();
+            if (enter) requestRecentChannelDeletion(enter);
+          },
+          { signal: viewAbortController.signal },
+        );
+      viewAbortController.signal.addEventListener(
+        "abort",
+        () => {
+          floating.destroy();
+          menu.remove();
+        },
+        { once: true },
+      );
+    });
 }
 
 function requestRecentChannelDeletion(
@@ -235,49 +666,50 @@ function requestRecentChannelDeletion(
   const dialog = document.createElement("dialog");
   dialog.className = "recent-delete-dialog";
   dialog.dataset.recentDeleteDialog = "";
+  dialog.setAttribute("aria-labelledby", "recent-delete-title");
   dialog.innerHTML = `
-    <div class="delete-dialog-icon" aria-hidden="true">−</div>
+    <div class="delete-dialog-icon" aria-hidden="true"><i data-lucide="trash-2"></i></div>
     <span class="eyebrow">REMOVE FROM HISTORY</span>
-    <h2>删除这个历史频道？</h2>
+    <h2 id="recent-delete-title">删除这个历史频道？</h2>
     <p><strong>${escapeHtml(name)}</strong><span>${escapeHtml(room)}</span></p>
     <small>只会从这台设备的历史记录中移除，不会关闭频道。</small>
     <div class="delete-dialog-actions">
-      <button class="ghost-button" type="button" data-cancel-recent-delete>取消</button>
-      <button class="delete-confirm-button" type="button" data-confirm-recent-delete>删除</button>
+      <button class="btn btn-secondary" type="button" data-cancel-recent-delete>取消</button>
+      <button class="btn btn-danger" type="button" data-confirm-recent-delete>删除</button>
     </div>
   `;
   document.body.append(dialog);
+  hydrateIcons(dialog);
 
-  const closeDialog = (): void => {
-    if (dialog.open) {
-      dialog.close();
-    }
+  const closeDialog = async (): Promise<void> => {
+    await dialogController.close(dialog);
     dialog.remove();
   };
   dialog.addEventListener("cancel", (event) => {
     event.preventDefault();
-    closeDialog();
+    void closeDialog();
   });
   dialog
     .querySelector("[data-cancel-recent-delete]")
-    ?.addEventListener("click", closeDialog);
+    ?.addEventListener("click", () => void closeDialog());
   dialog
     .querySelector("[data-confirm-recent-delete]")
     ?.addEventListener("click", () => {
       if (forgetRecentChannel(room)) {
-        const list = button.closest<HTMLElement>(".recent-list");
-        button.remove();
-        if (list && !list.querySelector("[data-recent-room]")) {
-          list.innerHTML = `<p class="recent-empty">加入过的频道会留在这里</p>`;
-        }
+        document
+          .querySelectorAll<HTMLElement>(
+            `[data-recent-room="${CSS.escape(room)}"]`,
+          )
+          .forEach((entry) => {
+            const card = entry.closest("[data-recent-card]");
+            if (card) card.remove();
+            else entry.remove();
+          });
         toast(`已从历史记录删除频道 ${room}`);
       }
-      closeDialog();
+      void closeDialog();
     });
-  dialog.showModal();
-  dialog
-    .querySelector<HTMLButtonElement>("[data-cancel-recent-delete]")
-    ?.focus();
+  void dialogController.open(dialog, button);
 }
 
 function bindRecentChannelInteractions(): void {
@@ -355,12 +787,16 @@ function bindRecentChannelInteractions(): void {
       if (button.dataset.recentNavigationDisabled === "true") {
         return;
       }
-      void renderViewer({
-        desktop: isDesktop,
-        room: button.dataset.recentRoom,
-        signalUrl: button.dataset.recentSignal,
-        autoJoin: true,
-      });
+      navigate(
+        () =>
+          renderViewer({
+            desktop: isDesktop,
+            room: button.dataset.recentRoom,
+            signalUrl: button.dataset.recentSignal,
+            autoJoin: true,
+          }),
+        "recent-channel",
+      );
     });
   });
 }
@@ -368,78 +804,181 @@ function bindRecentChannelInteractions(): void {
 /* ─── Star field ─────────────────────────────────────────────────── */
 let starCanvas: HTMLCanvasElement | null = null;
 let starAnimId = 0;
+let starController: AbortController | undefined;
 
 function startStarField(): void {
-  if (starCanvas) return;
+  stopStarField();
+  if (
+    isNativeAndroid() ||
+    matchMedia("(prefers-reduced-motion: reduce)").matches ||
+    document.documentElement.dataset.motion === "reduced" ||
+    document.documentElement.dataset.effectsQuality !== "full"
+  ) {
+    return;
+  }
   const canvas = document.createElement("canvas");
   canvas.id = "star-canvas";
+  canvas.dataset.decorativeMotion = "";
+  canvas.setAttribute("aria-hidden", "true");
   document.body.prepend(canvas);
   starCanvas = canvas;
+  const controller = new AbortController();
+  starController = controller;
 
   type Star = { x: number; y: number; r: number; a: number; da: number; speed: number };
   const stars: Star[] = [];
-  const COUNT = 180;
+  const starColor =
+    getComputedStyle(document.documentElement)
+      .getPropertyValue("--n-000")
+      .trim();
+  const count = window.innerWidth >= 1440 ? 72 : 48;
+  let width = window.innerWidth;
+  let height = window.innerHeight;
 
   const resize = (): void => {
-    canvas.width = window.innerWidth;
-    canvas.height = window.innerHeight;
+    width = window.innerWidth;
+    height = window.innerHeight;
+    const ratio = Math.min(window.devicePixelRatio || 1, 1.75);
+    canvas.width = Math.max(1, Math.round(width * ratio));
+    canvas.height = Math.max(1, Math.round(height * ratio));
+    canvas.style.width = `${width}px`;
+    canvas.style.height = `${height}px`;
+    canvas.getContext("2d")?.setTransform(ratio, 0, 0, ratio, 0, 0);
   };
   resize();
-  window.addEventListener("resize", resize, { passive: true });
+  window.addEventListener("resize", resize, {
+    passive: true,
+    signal: controller.signal,
+  });
 
-  for (let i = 0; i < COUNT; i++) {
+  for (let i = 0; i < count; i++) {
     stars.push({
-      x: Math.random() * canvas.width,
-      y: Math.random() * canvas.height,
-      r: Math.random() * 1.2 + 0.2,
-      a: Math.random(),
-      da: (Math.random() - 0.5) * 0.004,
-      speed: Math.random() * 0.06 + 0.01,
+      x: Math.random() * width,
+      y: Math.random() * height,
+      r: Math.random() * 0.8 + 0.25,
+      a: Math.random() * 0.45 + 0.08,
+      da: (Math.random() - 0.5) * 0.0016,
+      speed: Math.random() * 0.018 + 0.004,
     });
   }
 
   const draw = (): void => {
+    if (
+      controller.signal.aborted ||
+      document.hidden ||
+      document.documentElement.dataset.effectsQuality !== "full" ||
+      document.documentElement.dataset.motion === "reduced"
+    ) {
+      starAnimId = 0;
+      return;
+    }
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.clearRect(0, 0, width, height);
+    ctx.fillStyle = starColor;
     for (const s of stars) {
-      s.a = Math.max(0.05, Math.min(0.9, s.a + s.da));
-      if (s.a <= 0.05 || s.a >= 0.9) s.da *= -1;
+      s.a = Math.max(0.06, Math.min(0.52, s.a + s.da));
+      if (s.a <= 0.06 || s.a >= 0.52) s.da *= -1;
       s.y -= s.speed;
-      if (s.y < -2) { s.y = canvas.height + 2; s.x = Math.random() * canvas.width; }
+      if (s.y < -2) {
+        s.y = height + 2;
+        s.x = Math.random() * width;
+      }
       ctx.beginPath();
       ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2);
-      ctx.fillStyle = `rgba(255,255,255,${s.a.toFixed(2)})`;
+      ctx.globalAlpha = s.a;
       ctx.fill();
     }
+    ctx.globalAlpha = 1;
     starAnimId = requestAnimationFrame(draw);
   };
   draw();
+  document.addEventListener(
+    "visibilitychange",
+    () => {
+      if (!document.hidden && !starAnimId) draw();
+    },
+    { signal: controller.signal },
+  );
+  effectsQuality.addEventListener(
+    "change",
+    () => {
+      if (
+        document.documentElement.dataset.effectsQuality === "full" &&
+        document.documentElement.dataset.motion !== "reduced" &&
+        !document.hidden &&
+        !starAnimId
+      ) {
+        draw();
+      }
+    },
+    { signal: controller.signal },
+  );
 }
 
 function stopStarField(): void {
   if (starAnimId) { cancelAnimationFrame(starAnimId); starAnimId = 0; }
+  starController?.abort();
+  starController = undefined;
   starCanvas?.remove();
   starCanvas = null;
 }
 
-/* ─── Cursor glow ────────────────────────────────────────────────── */
-function startCursorGlow(): void {
-  if (document.getElementById("cursor-glow")) return;
-  const glow = document.createElement("div");
-  glow.id = "cursor-glow";
-  document.body.appendChild(glow);
+function bindLocalPointerLight(signal: AbortSignal): void {
+  if (
+    !matchMedia("(hover: hover) and (pointer: fine)").matches ||
+    document.documentElement.dataset.motion === "reduced"
+  ) {
+    return;
+  }
   let raf = 0;
-  let cx = -500, cy = -500;
-  document.addEventListener("mousemove", (event) => {
-    cx = event.clientX;
-    cy = event.clientY;
-    if (raf) return;
-    raf = requestAnimationFrame(() => {
-      raf = 0;
-      glow.style.transform = `translate(${cx - 110}px, ${cy - 110}px)`;
+  let pending:
+    | { card: HTMLElement; x: number; y: number }
+    | undefined;
+  document
+    .querySelectorAll<HTMLElement>(".interactive-card")
+    .forEach((card) => {
+      card.addEventListener(
+        "pointermove",
+        (event) => {
+          const bounds = card.getBoundingClientRect();
+          pending = {
+            card,
+            x: event.clientX - bounds.left,
+            y: event.clientY - bounds.top,
+          };
+          if (raf) return;
+          raf = requestAnimationFrame(() => {
+            raf = 0;
+            if (!pending) return;
+            pending.card.style.setProperty(
+              "--pointer-x",
+              `${pending.x}px`,
+            );
+            pending.card.style.setProperty(
+              "--pointer-y",
+              `${pending.y}px`,
+            );
+            pending.card.style.setProperty("--pointer-opacity", "1");
+          });
+        },
+        { passive: true, signal },
+      );
+      card.addEventListener(
+        "pointerleave",
+        () => {
+          card.style.setProperty("--pointer-opacity", "0");
+        },
+        { signal },
+      );
     });
-  }, { passive: true });
+  signal.addEventListener(
+    "abort",
+    () => {
+      if (raf) cancelAnimationFrame(raf);
+    },
+    { once: true },
+  );
 }
 
 function logoMarkup(label: string): string {
@@ -451,73 +990,115 @@ function logoMarkup(label: string): string {
   `;
 }
 
+async function refreshSignalHealthBadges(
+  signal: AbortSignal,
+): Promise<void> {
+  const elements = [
+    ...document.querySelectorAll<HTMLElement>("[data-signal-health]"),
+  ];
+  const groups = new Map<string, HTMLElement[]>();
+  for (const element of elements) {
+    const url = element.dataset.signalHealth;
+    if (!url) continue;
+    groups.set(url, [...(groups.get(url) || []), element]);
+  }
+  await Promise.all(
+    [...groups].map(async ([url, targets]) => {
+      const health = await probeSignalHealth(url, signal);
+      if (signal.aborted) return;
+      for (const target of targets) {
+        target.dataset.state = health.state;
+        const label =
+          target.querySelector<HTMLElement>("[data-health-label]") ||
+          target.querySelector<HTMLElement>("span:last-child");
+        if (label) {
+          label.textContent =
+            health.state === "online"
+              ? `服务可用${health.latencyMs ? ` · ${health.latencyMs}ms` : ""}`
+              : "暂时无法连接";
+        }
+      }
+    }),
+  );
+}
+
 function renderDesktopHome(): void {
   hideEmbeddedGame();
-  startStarField();
-  startCursorGlow();
+  stopStarField();
   appRoot.innerHTML = `
+    <a class="skip-link" href="#main-content">跳到主要内容</a>
     <div class="app-frame">
       ${railMarkup()}
-      <main class="home-main">
+      <main class="home-main" id="main-content" tabindex="-1">
         <header class="home-topbar">
           ${logoMarkup("朋友放映室")}
-          <label class="profile-field">
-            <span>我的昵称</span>
-            <input id="home-nickname" maxlength="16" value="${escapeHtml(getNickname())}" />
-          </label>
+          <button class="home-service" type="button"
+            data-signal-health="${escapeHtml(getSignalUrl())}"
+            data-state="checking" aria-live="polite"
+            aria-label="当前信令服务状态">
+            <span class="status-symbol" aria-hidden="true"></span>
+            <span data-health-label>正在检查服务</span>
+          </button>
         </header>
         <section class="home-hero">
           <div class="hero-copy">
             <span class="eyebrow">PRIVATE WATCH PARTY</span>
             <h1>今晚，和朋友<br /><em>同频看点好的。</em></h1>
-            <p>选择播放器窗口，影片声音只从该窗口的进程采集；朋友用房间码进入，就能看、聊、连麦。</p>
-            <div class="hero-trust">
-              <span>● 大陆服务器在线</span>
-              <span>● 画面点对点直传</span>
-              <span>● 最多 5 人</span>
+            <p>创建或加入一个最多 8 人的私人频道。屏幕分享优先使用服务器 SFU，异常时自动切换安全兜底线路。</p>
+          </div>
+          ${continueChannelMarkup()}
+          <div class="home-actions" aria-label="频道操作">
+            <button id="choose-host" class="home-action-card interactive-card create-action" type="button">
+              <span class="action-icon"><i data-lucide="plus"></i></span>
+              <span class="stack">
+                <small>建立一个新的私人空间</small>
+                <strong>创建我的频道</strong>
+                <p>先邀请朋友，再由任意 Windows 成员开始放映。</p>
+              </span>
+              <span class="icon-label">创建频道 <i data-lucide="user-plus"></i></span>
+            </button>
+            <button id="choose-viewer" class="home-action-card interactive-card join-action" type="button">
+              <span class="action-icon"><i data-lucide="play"></i></span>
+              <span class="stack">
+                <small>使用房间码或邀请链接</small>
+                <strong>加入朋友频道</strong>
+                <p>自动同步成员、媒体线路、聊天与连麦状态。</p>
+              </span>
+              <span class="icon-label">加入频道 <i data-lucide="users"></i></span>
+            </button>
+          </div>
+          <section class="recent-home-section" aria-labelledby="recent-heading">
+            <div class="section-heading">
+              <div><span class="eyebrow">RECENT</span><h2 id="recent-heading">最近进入</h2></div>
+              <small>历史只保存在这台设备</small>
             </div>
-          </div>
-          <div class="home-actions" aria-label="选择功能">
-            <button id="choose-host" class="mode-card host-mode" data-desktop-role="host">
-              <span class="mode-icon">▣</span>
-              <small>我是放映者</small>
-              <strong>开启我的频道</strong>
-              <p>选择窗口 · 独立影片声 · 原画直传</p>
-              <b>开始放映 →</b>
-            </button>
-            <button id="choose-viewer" class="mode-card viewer-mode" data-desktop-role="viewer">
-              <span class="mode-icon">▶</span>
-              <small>我是观看者</small>
-              <strong>加入朋友频道</strong>
-              <p>最近频道一键重进，也可输入房间码</p>
-              <b>加入频道 →</b>
-            </button>
-          </div>
+            <div class="recent-home-grid">${recentHomeMarkup()}</div>
+          </section>
         </section>
         <footer class="home-footer">
-          <span>服务器仅帮助设备相互找到</span>
-          <span>影片不会上传或保存</span>
-          <span>连麦约 128–160 kbps / 人</span>
+          <span>最多 8 人 · SFU 优先，异常自动兜底</span>
+          <span>服务器不保存影片、声音或聊天历史</span>
+          <span>隐私与媒体线路可在频道内随时查看</span>
         </footer>
       </main>
     </div>
   `;
   bindRailNavigation();
-  document.querySelector<HTMLInputElement>("#home-nickname")?.addEventListener("change", (event) => {
-    const input = event.currentTarget as HTMLInputElement;
-    input.value = saveNickname(input.value);
-    toast("昵称已保存");
-  });
-  document.querySelector("#choose-host")?.addEventListener("click", () => void renderHost());
+  hydrateIcons(appRoot);
+  bindLocalPointerLight(viewAbortController.signal);
+  startStarField();
+  void refreshSignalHealthBadges(viewAbortController.signal);
+  document.querySelector("#choose-host")?.addEventListener("click", () =>
+    navigate(() => renderHost(), "create-channel"),
+  );
   document.querySelector("#choose-viewer")?.addEventListener("click", () =>
-    void renderViewer({ desktop: true }),
+    navigate(() => renderViewer({ desktop: true }), "join-channel"),
   );
 }
 
 async function renderHost(): Promise<void> {
   hideEmbeddedGame();
   stopStarField();
-  startCursorGlow();
   if (!window.roomDesktop) {
     return;
   }
@@ -528,64 +1109,74 @@ async function renderHost(): Promise<void> {
   let channelName = getChannelName();
 
   appRoot.innerHTML = `
+    <a class="skip-link" href="#main-content">跳到主要内容</a>
     <div class="app-frame">
       ${railMarkup()}
-      <main class="setup-main">
+      <main class="setup-main" id="main-content" tabindex="-1">
         <header class="setup-topbar">
-          ${logoMarkup("设置放映")}
-          <button class="ghost-button" data-back-home>返回首页</button>
+          ${logoMarkup("创建频道")}
+          <button class="btn btn-ghost" type="button" data-back-home>
+            <i data-lucide="arrow-left"></i><span>返回首页</span>
+          </button>
         </header>
-        <section class="setup-grid">
-          <div class="setup-copy">
-            <span class="eyebrow">YOUR CHANNEL · ${roomCode}</span>
-            <h1>先进入频道，<br /><em>再决定谁来放映。</em></h1>
-            <p>频道创建后，所有人可以先连麦和聊天；任意 Windows 成员都能点击“开始放映”并选择自己的播放器窗口。</p>
-            <div class="privacy-callout">
-              <span aria-hidden="true">◎</span>
-              <div><strong>影片声与连麦声完全分轨</strong><small>需要 Windows 10 2004 或更高版本</small></div>
-            </div>
+        <section class="single-task-shell">
+          <div class="single-task-heading">
+            <span class="eyebrow">CREATE A CHANNEL</span>
+            <h1>创建今晚的同频空间</h1>
+            <p>先进入频道并邀请朋友，之后任意 Windows 成员都可以开始放映。</p>
           </div>
-          <div class="setup-card">
+          <form id="create-channel-form" class="setup-card setup-form material-card" novalidate>
             <label class="field">
               <span>频道名称</span>
-              <input id="channel-name" maxlength="24" value="${escapeHtml(channelName)}" />
+              <input id="channel-name" maxlength="24" value="${escapeHtml(channelName)}"
+                autocomplete="off" required aria-describedby="channel-name-help" />
+              <small id="channel-name-help" class="field-help">会显示在邀请卡和频道大厅中。</small>
             </label>
             <label class="field">
               <span>你的昵称</span>
-              <input id="host-nickname" maxlength="16" value="${escapeHtml(nickname)}" />
+              <input id="host-nickname" maxlength="16" value="${escapeHtml(nickname)}"
+                autocomplete="nickname" required />
             </label>
-            <button id="start-share" class="primary-button">
-              <span aria-hidden="true">▣</span>
-              <div><strong>创建并进入频道</strong><small>进入后再选择放映或观看</small></div>
-              <b aria-hidden="true">→</b>
+            <button id="start-share" class="btn btn-primary btn-lg form-primary-action"
+              type="submit" data-state="idle">
+              <span data-loading-label><i data-lucide="user-plus"></i>创建并进入频道</span>
             </button>
-            <details class="server-settings">
-              <summary>服务器设置</summary>
-              <label class="field">
-                <span>信令服务器${isNativeAndroid() ? "（Android 仅支持 wss://）" : ""}</span>
-                <input id="host-signal-url" value="${escapeHtml(signalUrl)}" />
-              </label>
-              <button id="save-host-server" type="button" class="ghost-button">保存服务器</button>
+            <details class="advanced-settings">
+              <summary><span class="icon-label"><i data-lucide="sliders-horizontal"></i>高级设置</span></summary>
+              <div class="advanced-settings-content">
+                <label class="field">
+                  <span>信令服务器${isNativeAndroid() ? "（Android 仅支持 wss://）" : ""}</span>
+                  <input id="host-signal-url" value="${escapeHtml(signalUrl)}" spellcheck="false" />
+                  <small class="field-help">自建地址只有在你明确确认后才会使用。</small>
+                </label>
+                <output class="field-help" id="create-network-status" aria-live="polite">
+                  频道码将在创建后显示为 ${escapeHtml(roomCode.slice(0, 4))} · ${escapeHtml(roomCode.slice(4))}
+                </output>
+              </div>
             </details>
-          </div>
+          </form>
         </section>
       </main>
     </div>
   `;
   bindRailNavigation();
-  document.querySelector("[data-back-home]")?.addEventListener("click", renderDesktopHome);
-  document.querySelector("#save-host-server")?.addEventListener("click", () => {
-    try {
-      const input = document.querySelector<HTMLInputElement>("#host-signal-url");
-      if (!input) return;
-      signalUrl = saveSignalUrl(input.value);
-      input.value = signalUrl;
-      toast("服务器地址已保存");
-    } catch (error) {
-      toast(error instanceof Error ? error.message : "服务器地址无效", "danger");
-    }
-  });
-  document.querySelector("#start-share")?.addEventListener("click", async () => {
+  hydrateIcons(appRoot);
+  document.querySelector("[data-back-home]")?.addEventListener("click", () =>
+    navigate(renderDesktopHome, "home"),
+  );
+  document
+    .querySelector<HTMLInputElement>("#channel-name")
+    ?.addEventListener("input", (event) => {
+      channelName = saveChannelName(
+        (event.currentTarget as HTMLInputElement).value,
+      );
+    });
+  document
+    .querySelector<HTMLFormElement>("#create-channel-form")
+    ?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const submit = document.querySelector<HTMLButtonElement>("#start-share");
+    if (!submit || submit.disabled) return;
     nickname = saveNickname(
       document.querySelector<HTMLInputElement>("#host-nickname")?.value || nickname,
     );
@@ -593,10 +1184,20 @@ async function renderHost(): Promise<void> {
       document.querySelector<HTMLInputElement>("#channel-name")?.value || channelName,
     );
     try {
-      signalUrl = saveSignalUrl(
+      const candidateSignal = normalizeAppSignalUrl(
         document.querySelector<HTMLInputElement>("#host-signal-url")?.value || signalUrl,
       );
-      await openChannelSession({
+      if (
+        requiresSignalTrust(candidateSignal) &&
+        !(await requestSignalTrust(candidateSignal, roomCode, submit))
+      ) {
+        return;
+      }
+      signalUrl = saveSignalUrl(candidateSignal);
+      submit.disabled = true;
+      submit.dataset.state = "loading";
+      submit.setAttribute("aria-busy", "true");
+      await openSession({
         root: appRoot,
         desktop: true,
         room: roomCode,
@@ -606,13 +1207,19 @@ async function renderHost(): Promise<void> {
         createIfMissing: true,
         ownerToken: hostOwnership.ownerToken,
         notify: toast,
-        onLeave: renderDesktopHome,
+        onLeave: () => {
+          resetViewLifecycle();
+          renderDesktopHome();
+        },
+        showInviteOnStart: true,
       });
     } catch (error) {
       toast(error instanceof Error ? error.message : "无法进入频道", "danger");
+      submit.disabled = false;
+      submit.dataset.state = "error";
+      submit.removeAttribute("aria-busy");
     }
-  });
-
+  }, { signal: viewAbortController.signal });
 }
 
 interface ViewerOptions {
@@ -622,15 +1229,34 @@ interface ViewerOptions {
   autoJoin?: boolean;
 }
 
+function cleanRoomCode(value: string): string {
+  const parsed = parseJoinLink(value.trim());
+  const candidate = parsed.room || value;
+  return candidate
+    .toUpperCase()
+    .replace(/[^23456789A-HJ-NP-Z]/g, "")
+    .slice(0, 8);
+}
+
+function displayRoomCode(value: string): string {
+  const room = cleanRoomCode(value);
+  return room.length > 4
+    ? `${room.slice(0, 4)} · ${room.slice(4)}`
+    : room;
+}
+
 async function renderViewer(options: ViewerOptions = {}): Promise<void> {
   hideEmbeddedGame();
   stopStarField();
-  startCursorGlow();
   const desktop = options.desktop === true;
   let signalUrl = options.signalUrl || getSignalUrl();
-  let roomCode =
-    options.room || new URLSearchParams(location.search).get("room")?.toUpperCase() || "";
+  let roomCode = cleanRoomCode(
+    options.room ||
+      new URLSearchParams(location.search).get("room") ||
+      "",
+  );
   let nickname = getNickname();
+  let joinAbortController: AbortController | undefined;
 
   const querySignal = new URLSearchParams(location.search).get("signal");
   if (querySignal) {
@@ -642,63 +1268,194 @@ async function renderViewer(options: ViewerOptions = {}): Promise<void> {
   }
 
   appRoot.innerHTML = `
+    <a class="skip-link" href="#main-content">跳到主要内容</a>
     <div class="app-frame">
       ${railMarkup()}
-      <main class="join-main">
+      <main class="join-main" id="main-content" tabindex="-1">
         <header class="setup-topbar">
-          ${logoMarkup(desktop ? "Windows 观看端" : "Android 观看端")}
-          ${desktop ? `<button class="ghost-button" data-back-home>返回首页</button>` : ""}
+          ${logoMarkup(desktop ? "加入频道" : "移动观看")}
+          ${desktop ? `<button class="btn btn-ghost" type="button" data-back-home><i data-lucide="arrow-left"></i><span>返回首页</span></button>` : ""}
         </header>
-        <section class="join-card">
-          <div class="join-art" aria-hidden="true"><span>▶</span><i></i><i></i></div>
-          <span class="eyebrow">JOIN A CHANNEL</span>
-          <h1>朋友已经开场？<br /><em>马上加入。</em></h1>
-          <p>输入 8 位频道码。加入成功后可以看电影、发弹幕，也可以选择加入连麦。</p>
-          <div class="room-code-entry">
+        <section class="single-task-shell">
+          <div class="single-task-heading">
+            <span class="eyebrow">JOIN A CHANNEL</span>
+            <h1>加入朋友的频道</h1>
+            <p>输入 8 位频道码、粘贴邀请链接，或从最近频道继续。</p>
+          </div>
+          <form id="join-channel-form" class="join-card join-form material-card" novalidate>
+            <div class="room-code-wrap">
             <label class="field">
               <span>频道码</span>
-              <input id="room-input" class="room-input" maxlength="8" value="${escapeHtml(roomCode)}" placeholder="例如 A7K9P2WX" autocomplete="one-time-code" />
+              <input id="room-input" class="room-code-input" maxlength="10"
+                value="${escapeHtml(displayRoomCode(roomCode))}"
+                placeholder="A7K9 · P2WX" autocomplete="one-time-code"
+                autocapitalize="characters" spellcheck="false"
+                aria-describedby="room-input-help room-input-error" />
+              <small id="room-input-help" class="field-help">也可以直接粘贴完整邀请链接。</small>
+              <small id="room-input-error" class="field-error" role="alert"></small>
             </label>
-          </div>
-          <label class="field">
-            <span>你的昵称</span>
-            <input id="viewer-nickname" maxlength="16" value="${escapeHtml(nickname)}" />
-          </label>
-          <button id="join-room" class="primary-button">
-            <span aria-hidden="true">▶</span><div><strong>进入频道</strong><small>自动连接朋友的画面</small></div><b>→</b>
-          </button>
-          <details class="server-settings">
-            <summary>服务器设置</summary>
-            <label class="field"><span>信令服务器${isNativeAndroid() ? "（Android 仅支持 wss://）" : ""}</span><input id="viewer-signal-url" value="${escapeHtml(signalUrl)}" /></label>
-          </details>
+            </div>
+            <div class="join-tools">
+              ${
+                isNativeAndroid()
+                  ? `<button id="scan-room-qr" class="btn btn-secondary" type="button"><i data-lucide="scan-line"></i><span>扫描二维码</span></button>`
+                  : ""
+              }
+              ${
+                getRecentChannels().length
+                  ? `<label class="field recent-select"><span>最近频道</span><select id="recent-room-select"><option value="">选择最近频道</option>${getRecentChannels()
+                      .map(
+                        (channel) =>
+                          `<option value="${escapeHtml(channel.room)}" data-signal="${escapeHtml(channel.signalUrl)}">${escapeHtml(channel.name)} · ${escapeHtml(channel.room.slice(0, 4))} ${escapeHtml(channel.room.slice(4))}</option>`,
+                      )
+                      .join("")}</select></label>`
+                  : ""
+              }
+            </div>
+            <label class="field">
+              <span>你的昵称</span>
+              <input id="viewer-nickname" maxlength="16" value="${escapeHtml(nickname)}" autocomplete="nickname" required />
+            </label>
+            <button id="join-room" class="btn btn-primary btn-lg form-primary-action"
+              type="submit" data-state="idle" ${roomCode.length === 8 ? "" : "disabled"}>
+              <span data-loading-label><i data-lucide="play"></i>进入频道</span>
+            </button>
+            <section id="join-progress" class="connection-progress" aria-live="polite" hidden>
+              <div class="connection-step" data-join-step="server" data-state="active"><i data-lucide="circle"></i><span>正在连接服务器</span></div>
+              <div class="connection-step" data-join-step="room"><i data-lucide="circle"></i><span>正在加入频道</span></div>
+              <div class="connection-step" data-join-step="members"><i data-lucide="circle"></i><span>正在同步成员</span></div>
+              <div class="connection-step" data-join-step="media"><i data-lucide="circle"></i><span>正在准备媒体线路</span></div>
+              <button id="cancel-join" class="btn btn-secondary" type="button">取消加入</button>
+            </section>
+            <details class="advanced-settings">
+              <summary><span class="icon-label"><i data-lucide="sliders-horizontal"></i>高级设置</span></summary>
+              <div class="advanced-settings-content">
+                <label class="field">
+                  <span>信令服务器${isNativeAndroid() ? "（Android 仅支持 wss://）" : ""}</span>
+                  <input id="viewer-signal-url" value="${escapeHtml(signalUrl)}" spellcheck="false" />
+                </label>
+              </div>
+            </details>
+          </form>
         </section>
       </main>
     </div>
   `;
   bindRailNavigation();
-  document.querySelector("[data-back-home]")?.addEventListener("click", renderDesktopHome);
+  hydrateIcons(appRoot);
+  document.querySelector("[data-back-home]")?.addEventListener("click", () =>
+    navigate(renderDesktopHome, "home"),
+  );
   const roomInput = document.querySelector<HTMLInputElement>("#room-input");
-  roomInput?.addEventListener("input", () => {
-    roomInput.value = roomInput.value.toUpperCase().replace(/[^23456789A-HJ-NP-Z]/g, "");
+  const joinButton = document.querySelector<HTMLButtonElement>("#join-room");
+  const applyInvitationText = (value: string): void => {
+    const parsed = parseJoinLink(value);
+    roomCode = cleanRoomCode(parsed.room || value);
+    if (roomInput) {
+      roomInput.value = displayRoomCode(roomCode);
+      roomInput.removeAttribute("aria-invalid");
+    }
+    const error =
+      document.querySelector<HTMLElement>("#room-input-error");
+    if (error) error.textContent = "";
+    joinButton?.toggleAttribute("disabled", roomCode.length !== 8);
+    if (parsed.signal) {
+      try {
+        signalUrl = normalizeAppSignalUrl(parsed.signal);
+        const signalInput =
+          document.querySelector<HTMLInputElement>("#viewer-signal-url");
+        if (signalInput) signalInput.value = signalUrl;
+      } catch {
+        toast("邀请中的服务器地址无效", "danger");
+      }
+    }
+  };
+  roomInput?.addEventListener("input", () =>
+    applyInvitationText(roomInput.value),
+  );
+  roomInput?.addEventListener("paste", (event) => {
+    const text = event.clipboardData?.getData("text") || "";
+    if (!text) return;
+    event.preventDefault();
+    applyInvitationText(text);
   });
-  document.querySelector("#join-room")?.addEventListener("click", () => void joinRoom());
+  document
+    .querySelector<HTMLSelectElement>("#recent-room-select")
+    ?.addEventListener("change", (event) => {
+      const select = event.currentTarget as HTMLSelectElement;
+      const option = select.selectedOptions[0];
+      applyInvitationText(option.value);
+      if (option.dataset.signal) {
+        signalUrl = option.dataset.signal;
+        const input =
+          document.querySelector<HTMLInputElement>("#viewer-signal-url");
+        if (input) input.value = signalUrl;
+      }
+    });
+  document
+    .querySelector<HTMLButtonElement>("#scan-room-qr")
+    ?.addEventListener("click", async (event) => {
+      const scanned = await scanQrCode(
+        event.currentTarget as HTMLButtonElement,
+      );
+      if (scanned) applyInvitationText(scanned);
+    });
+  document
+    .querySelector<HTMLButtonElement>("#cancel-join")
+    ?.addEventListener("click", () => {
+      joinAbortController?.abort();
+      if (desktop) navigate(renderDesktopHome, "home");
+      else {
+        resetViewLifecycle();
+        void renderViewer({ desktop: false });
+      }
+    });
+  document
+    .querySelector<HTMLFormElement>("#join-channel-form")
+    ?.addEventListener("submit", (event) => {
+      event.preventDefault();
+      void joinRoom();
+    });
   if (options.autoJoin && roomCode.length === 8) {
-    window.setTimeout(() => void joinRoom(), 120);
+    requestAnimationFrame(() => void joinRoom());
   }
 
   async function joinRoom(): Promise<void> {
-    roomCode = document.querySelector<HTMLInputElement>("#room-input")?.value.trim().toUpperCase() || "";
+    roomCode = cleanRoomCode(roomInput?.value || roomCode);
     if (roomCode.length !== 8) {
-      toast("请输入 8 位频道码", "danger");
+      roomInput?.setAttribute("aria-invalid", "true");
+      const error =
+        document.querySelector<HTMLElement>("#room-input-error");
+      if (error) error.textContent = "请输入完整的 8 位频道码。";
+      roomInput?.focus();
       return;
     }
     nickname = saveNickname(
       document.querySelector<HTMLInputElement>("#viewer-nickname")?.value || nickname,
     );
+    const progress =
+      document.querySelector<HTMLElement>("#join-progress");
+    const submit = document.querySelector<HTMLButtonElement>("#join-room");
     try {
-      signalUrl = saveSignalUrl(
-        document.querySelector<HTMLInputElement>("#viewer-signal-url")?.value || signalUrl,
+      const candidateSignal = normalizeAppSignalUrl(
+        document.querySelector<HTMLInputElement>("#viewer-signal-url")
+          ?.value || signalUrl,
       );
+      if (
+        requiresSignalTrust(candidateSignal) &&
+        !(await requestSignalTrust(candidateSignal, roomCode, submit ?? undefined))
+      ) {
+        return;
+      }
+      signalUrl = saveSignalUrl(candidateSignal);
+      submit?.setAttribute("aria-busy", "true");
+      if (submit) {
+        submit.disabled = true;
+        submit.dataset.state = "loading";
+      }
+      if (progress) progress.hidden = false;
+      joinAbortController?.abort();
+      joinAbortController = new AbortController();
       const hostOwnership = desktop
         ? await getHostChannelOwnership()
         : undefined;
@@ -706,7 +1463,7 @@ async function renderViewer(options: ViewerOptions = {}): Promise<void> {
         hostOwnership?.room === roomCode
           ? hostOwnership.ownerToken
           : undefined;
-      await openChannelSession({
+      await openSession({
         root: appRoot,
         desktop,
         room: roomCode,
@@ -715,35 +1472,105 @@ async function renderViewer(options: ViewerOptions = {}): Promise<void> {
         createIfMissing: Boolean(ownerToken),
         ownerToken,
         notify: toast,
-        onLeave: desktop
-          ? renderDesktopHome
-          : () => renderViewer({ desktop: false }),
+        onLeave: () => {
+          resetViewLifecycle();
+          if (desktop) renderDesktopHome();
+          else void renderViewer({ desktop: false });
+        },
+        operationSignal: joinAbortController.signal,
       });
     } catch (error) {
       toast(error instanceof Error ? error.message : "加入失败", "danger");
+      if (submit?.isConnected) {
+        submit.disabled = false;
+        submit.dataset.state = "error";
+        submit.removeAttribute("aria-busy");
+      }
+      if (progress?.isConnected) progress.hidden = true;
     }
   }
 }
 
-if (isDesktop) {
-  renderDesktopHome();
-  window.roomDesktop?.onOpenUrl((url) => {
-    const invite = confirmExternalInvite(url);
-    if (invite) {
-      void renderViewer({
-        desktop: true,
-        room: invite.room,
-        signalUrl: invite.signalUrl,
-        autoJoin: true,
-      });
+settingsController = new SettingsController({
+  notify: toast,
+  onOpenDesignLab: () => {
+    resetViewLifecycle();
+    stopStarField();
+    renderDesignLab(appRoot, () =>
+      navigate(renderDesktopHome, "home"),
+    );
+  },
+});
+if (isNativeAndroid()) {
+  void App.addListener("backButton", () => {
+    if (document.querySelector(".session-shell")) return;
+    if (dialogController.closeTopmost()) return;
+    if (closeTopmostFloatingSurface()) return;
+    const backHome =
+      document.querySelector<HTMLButtonElement>("[data-back-home]");
+    if (backHome) {
+      backHome.click();
+      return;
     }
+    void App.exitApp();
+  }).then((handle) => {
+    appBackButtonHandle = handle;
+  });
+}
+document.addEventListener("synced:open-settings", (event) => {
+  const detail = (
+    event as CustomEvent<
+      "appearance" | "playback" | "voice" | "network" | "emby" | "advanced" | "about"
+    >
+  ).detail;
+  void settingsController.open(
+    document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : undefined,
+    detail || "appearance",
+  );
+});
+
+window.addEventListener("beforeunload", () => {
+  viewAbortController.abort();
+  stopStarField();
+  void appBackButtonHandle?.remove();
+  appBackButtonHandle = undefined;
+  settingsController.destroy();
+  effectsQuality.destroy();
+});
+
+if (isDesktop) {
+  resetViewLifecycle();
+  if (new URLSearchParams(location.search).get("design-lab") === "1") {
+    renderDesignLab(appRoot, () =>
+      navigate(renderDesktopHome, "home"),
+    );
+  } else {
+    renderDesktopHome();
+  }
+  window.roomDesktop?.onOpenUrl((url) => {
+    void confirmExternalInvite(url).then((invite) => {
+      if (!invite) return;
+      navigate(
+        () =>
+          renderViewer({
+            desktop: true,
+            room: invite.room,
+            signalUrl: invite.signalUrl,
+            autoJoin: true,
+          }),
+        "deep-link",
+      );
+    });
   });
 } else {
   void (async () => {
     let recentInviteKey = "";
     let recentInviteAt = 0;
     let recentInviteHandled = false;
-    const openInvite = (url?: string): boolean => {
+    let recentInvitePromise: Promise<boolean> | undefined;
+    const openInvite = async (url?: string): Promise<boolean> => {
       if (!url) return false;
       const parsedForKey = parseJoinLink(url);
       const inviteKey = parsedForKey.room
@@ -756,28 +1583,39 @@ if (isDesktop) {
       // host must not prompt twice. The short window still permits a later,
       // deliberate re-open of the same invitation.
       if (inviteKey === recentInviteKey && now - recentInviteAt < 10_000) {
-        return recentInviteHandled;
+        return recentInvitePromise || recentInviteHandled;
       }
-      const invite = confirmExternalInvite(url);
       recentInviteKey = inviteKey;
       recentInviteAt = now;
-      recentInviteHandled = Boolean(invite);
-      if (!invite) return false;
-      void renderViewer({
-        room: invite.room,
-        signalUrl: invite.signalUrl,
-        autoJoin: true,
+      const operation = confirmExternalInvite(url).then((invite) => {
+        recentInviteHandled = Boolean(invite);
+        if (!invite) return false;
+        resetViewLifecycle();
+        void renderViewer({
+          room: invite.room,
+          signalUrl: invite.signalUrl,
+          autoJoin: true,
+        });
+        return true;
       });
-      return true;
+      recentInvitePromise = operation;
+      try {
+        return await operation;
+      } finally {
+        if (recentInvitePromise === operation) {
+          recentInvitePromise = undefined;
+        }
+      }
     };
     const appUrlListener = await App.addListener("appUrlOpen", ({ url }) => {
-      openInvite(url);
+      void openInvite(url);
     });
     window.addEventListener("beforeunload", () => {
       void appUrlListener.remove();
     });
     const launch = await App.getLaunchUrl().catch(() => undefined);
-    if (!openInvite(launch?.url)) {
+    if (!(await openInvite(launch?.url))) {
+      resetViewLifecycle();
       await renderViewer();
     }
   })();

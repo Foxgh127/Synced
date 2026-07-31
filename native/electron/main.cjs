@@ -2225,6 +2225,9 @@ app.whenReady().then(() => {
         processId: processInfo?.processId,
         processName: processInfo?.processName,
         executableName: processInfo?.executableName,
+        width: Number(processInfo?.width) || undefined,
+        height: Number(processInfo?.height) || undefined,
+        audioAvailable: Number(processInfo?.processId) > 0,
       };
     });
     if (includeAudioProcesses) {

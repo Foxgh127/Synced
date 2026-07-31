@@ -7,11 +7,11 @@ const http = require("node:http");
 const path = require("node:path");
 const WebSocket = require("ws");
 
-const EXPECTED_VERSION = "2.9.2";
 const projectRoot = path.join(__dirname, "..");
 const packageJson = JSON.parse(
   fs.readFileSync(path.join(projectRoot, "package.json"), "utf8"),
 );
+const EXPECTED_VERSION = String(packageJson.version);
 const portablePath =
   process.env.SYNCED_EMBY_FIELD_EXE ||
   path.join(
@@ -680,7 +680,9 @@ async function main() {
       await evaluate(`(() => {
         const nickname = document.querySelector("#host-nickname");
         const channel = document.querySelector("#channel-name");
-        if (nickname && !nickname.value.trim()) nickname.value = "2.9.2 实地验收";
+        if (nickname && !nickname.value.trim()) nickname.value = ${JSON.stringify(
+          `${EXPECTED_VERSION} 实地验收`,
+        )};
         if (channel && !channel.value.trim()) channel.value = "Emby 实地验收";
         nickname?.dispatchEvent(new Event("input", { bubbles: true }));
         channel?.dispatchEvent(new Event("input", { bubbles: true }));

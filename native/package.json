@@ -1,6 +1,6 @@
 {
   "name": "synced-native",
-  "version": "2.9.2",
+  "version": "3.0.0",
   "private": true,
   "author": "同频",
   "description": "同频：Windows 原生分享与观看，Android 低延迟观看",
@@ -13,6 +13,10 @@
     "build:audio-helper": "node scripts/build-audio-helper.mjs",
     "brand:generate": "node scripts/generate-brand-assets.mjs",
     "brand:check": "node scripts/generate-brand-assets.mjs --check",
+    "design:generate": "node scripts/generate-design-tokens.mjs",
+    "design:normalize-colors": "node scripts/normalize-css-colors.mjs",
+    "design:check-colors": "node scripts/normalize-css-colors.mjs --check",
+    "design:check": "node scripts/generate-design-tokens.mjs --check && npm run design:check-colors",
     "build:renderer": "vite build",
     "typecheck": "tsc --noEmit",
     "lint": "tsc --noEmit --pretty false && node --check electron/main.cjs && node --check server/index.mjs",
@@ -24,6 +28,8 @@
     "smoke:audio": "electron scripts/smoke-process-audio.cjs && electron scripts/smoke-process-audio-bridge.cjs",
     "smoke:voice": "electron scripts/smoke-voice-processing.cjs",
     "smoke:csp": "npm run build:renderer && electron scripts/smoke-csp.cjs",
+    "smoke:design-matrix": "npm run build:renderer && electron scripts/smoke-design-matrix.cjs",
+    "smoke:portable": "node scripts/smoke-portable-ui.cjs",
     "smoke:sidebar": "electron scripts/smoke-sidebar-layout.cjs",
     "smoke:game": "npm run build:renderer && electron scripts/smoke-embedded-game.cjs",
     "smoke:overlay": "electron scripts/smoke-danmaku-overlay.cjs",
@@ -45,13 +51,16 @@
     "apk:debug": "npm run cap:sync && cd android && gradlew.bat assembleDebug",
     "apk:release": "node scripts/build-android-release.mjs",
     "release:all": "node scripts/build-release.mjs",
-    "check": "npm run check:version && npm run brand:check && npm run lint && npm run check:ffmpeg && npm test && npm run build:renderer"
+    "check": "npm run check:version && npm run brand:check && npm run design:check && npm run lint && npm run check:ffmpeg && npm test && npm run build:renderer"
   },
   "dependencies": {
     "@capacitor/app": "^7.0.0",
     "@capacitor/core": "^7.0.0",
+    "@floating-ui/dom": "^1.8.0",
     "deepfilternet3-noise-filter": "1.3.0",
     "livekit-client": "2.21.0",
+    "lucide": "^1.28.0",
+    "qr-scanner": "^1.4.2",
     "qrcode": "^1.5.4",
     "ws": "^8.18.3"
   },

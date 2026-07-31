@@ -1,0 +1,47 @@
+.music-source-popover {
+  width: min(340px, calc(100vw - 24px));
+  max-height: min(520px, calc(100dvh - 24px));
+  border-radius: var(--r-lg);
+  background:
+    var(--glass-shine),
+    var(--material-l3);
+}
+
+.music-popover-heading,
+.music-all-heading {
+  min-height: var(--control-min);
+}
+
+.music-help,
+.music-close,
+.music-all-heading > button {
+  width: var(--control-min);
+  min-width: var(--control-min);
+  height: var(--control-min);
+  min-height: var(--control-min);
+  border-radius: var(--r-sm);
+}
+
+.music-source-row,
+.music-more-sources,
+.music-all-source,
+.music-active-source button,
+.music-popover-error button {
+  min-height: var(--control-min);
+}
+
+.music-source-popover :is(button, input) {
+  touch-action: manipulation;
+}
+
+.music-source-popover svg {
+  width: 20px;
+  height: 20px;
+}
+
+@media (max-width: 599px) {
+  .music-source-popover {
+    width: calc(100vw - 24px);
+    max-height: min(70dvh, 520px);
+  }
+}

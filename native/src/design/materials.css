@@ -1,0 +1,85 @@
+.material-canvas,
+.material-mica,
+.material-card,
+.material-regular,
+.material-clear {
+  isolation: isolate;
+}
+
+.material-canvas {
+  background: var(--material-l0);
+}
+
+.material-mica {
+  background: var(--material-l1);
+}
+
+.material-card {
+  border: 1px solid var(--stroke-default);
+  background: var(--material-l2);
+  box-shadow: var(--e-card);
+}
+
+.material-regular {
+  border: 1px solid var(--stroke-glass);
+  background:
+    var(--glass-shine),
+    var(--material-l3);
+  box-shadow: var(--shadow-c726f0d685);
+  backdrop-filter: blur(var(--blur-regular)) saturate(var(--saturation-glass));
+  -webkit-backdrop-filter: blur(var(--blur-regular)) saturate(var(--saturation-glass));
+}
+
+.material-clear {
+  border: 1px solid var(--stroke-glass);
+  background:
+    linear-gradient(180deg, var(--palette-67cac164e0), var(--stroke-inset)),
+    var(--material-l4);
+  box-shadow: var(--shadow-3f9fa35069);
+  backdrop-filter: blur(var(--blur-clear)) saturate(1.12);
+  -webkit-backdrop-filter: blur(var(--blur-clear)) saturate(1.12);
+}
+
+.material-smoke {
+  background: var(--material-smoke);
+}
+
+:is(.material-regular, .material-clear)
+  :is(.material-regular, .material-clear),
+.room-sidebar.companion-panel
+  :is(.material-regular, .material-clear) {
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+#toast-container .toast.material-regular:not(:last-child),
+[data-floating-surface]:not([data-floating-top="true"]),
+:root[data-floating-open="true"] .dock.material-clear,
+:root[data-toast-visible="true"] .room-sidebar.companion-panel,
+body[data-modal-open="true"]
+  :is(
+    .dock.material-clear,
+    .room-sidebar.companion-panel,
+    [data-floating-surface]
+  ) {
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+[hidden],
+[aria-hidden="true"],
+[data-presence="left"],
+.material-released {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+
+@supports not (backdrop-filter: blur(var(--blur-250248d413))) {
+  .material-regular {
+    background: var(--palette-979eb6c932);
+  }
+
+  .material-clear {
+    background: var(--palette-450c54f0cd);
+  }
+}

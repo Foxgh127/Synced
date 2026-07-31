@@ -24,10 +24,13 @@ const signingProperties = path.join(
 );
 const expectedPackage = "com.synced.room";
 const expectedCertificateSha256 =
-  "ca5c8f711b2d91ce5e7bd0dbf762bd191d5e8d9bb9269a3dee53a0540721e0a5";
+  "43ba099e46af2e3a3f582e6cc0445a34a0fb62c2461f47e1c5f1a9d2855667fc";
+const expectedPublicKeySha256 =
+  "bf5a5d002a8e1d0787873d37cd56fba6653c01639a85e1853f322d2ff623b742";
 const expectedPermissions = [
   "android.permission.ACCESS_NETWORK_STATE",
   "android.permission.BLUETOOTH_CONNECT",
+  "android.permission.CAMERA",
   "android.permission.FOREGROUND_SERVICE",
   "android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK",
   "android.permission.INTERNET",
@@ -301,6 +304,18 @@ if (certificateSha256 !== expectedCertificateSha256) {
     `签名证书不匹配：${certificateSha256 || "未读取到证书指纹"}`,
   );
 }
+const publicKeySha256 = (
+  signingReport.match(
+    /Signer #1 public key SHA-256 digest:\s*([0-9a-f:\s]+)/iu,
+  )?.[1] || ""
+)
+  .replace(/[^0-9a-f]/giu, "")
+  .toLowerCase();
+if (publicKeySha256 !== expectedPublicKeySha256) {
+  fail(
+    `签名公钥不匹配：${publicKeySha256 || "未读取到公钥指纹"}`,
+  );
+}
 const signerDn =
   signingReport.match(/Signer #1 certificate DN:\s*(.+)$/imu)?.[1]?.trim() ||
   "unknown";
@@ -407,6 +422,7 @@ const securityReport = [
   `SHA-256：${apkSha256}`,
   `签名者：${signerDn}`,
   `签名证书 SHA-256：${certificateSha256}`,
+  `签名公钥 SHA-256：${publicKeySha256}`,
   "签名方案：APK Signature Scheme v2 + v3",
   "调试标志：关闭",
   "任意明文网络：禁止",

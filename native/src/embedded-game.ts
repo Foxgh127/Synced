@@ -1,3 +1,5 @@
+import { hydrateIcons } from "./ui/icons";
+
 const GAME_NAME = "吹牛";
 const GAME_URL = "https://bluff.synced.com.cn/";
 
@@ -43,11 +45,7 @@ export function embeddedGameRailButtonMarkup(): string {
       aria-label="打开游戏中心"
       aria-pressed="false"
     >
-      <svg viewBox="0 0 24 24" aria-hidden="true">
-        <path d="M9 4.5h7.5a2 2 0 0 1 2 2v10.8a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2V6.5a2 2 0 0 1 2-2Z"></path>
-        <path d="M7 7H5.5a2 2 0 0 0-2 2v9.5a2 2 0 0 0 2 2H13a2 2 0 0 0 1.8-1.2"></path>
-        <path d="m12.75 8.2 2 2-2 2-2-2 2-2Z"></path>
-      </svg>
+      <i data-lucide="gamepad-2"></i>
       <span class="rail-tooltip">游戏<small>频道内小游戏</small></span>
     </button>
   `;
@@ -194,13 +192,13 @@ function ensureGameShell(): HTMLElement {
       </div>
       <div class="embedded-game-actions">
         <button type="button" data-game-center-back hidden aria-label="返回游戏中心" title="返回游戏中心">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 18-6-6 6-6"></path></svg>
+          <i data-lucide="arrow-left"></i>
         </button>
         <button type="button" data-game-reload hidden aria-label="刷新游戏" title="刷新游戏">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 5v6h-6"></path></svg>
+          <i data-lucide="refresh-cw"></i>
         </button>
         <button type="button" data-game-close aria-label="返回频道" title="返回频道">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"></path></svg>
+          <i data-lucide="x"></i>
         </button>
       </div>
     </header>
@@ -238,6 +236,7 @@ function ensureGameShell(): HTMLElement {
     </div>
   `;
   document.body.append(shell);
+  hydrateIcons(shell);
   gameShell = shell;
   gameCenter =
     shell.querySelector<HTMLElement>("[data-game-center]") ?? undefined;

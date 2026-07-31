@@ -219,11 +219,14 @@ async function main() {
       throw new Error(`voice validation failed: ${JSON.stringify(result)}`);
     }
 
-    const room = await window.webContents.executeJavaScript(
+    const displayedRoom = await window.webContents.executeJavaScript(
       `document.querySelector("#copy-room span")?.textContent?.trim()`,
     );
-    if (!/^[23456789A-HJ-NP-Z]{8}$/.test(room || "")) {
-      throw new Error(`host room code was not available: ${room}`);
+    const room = String(displayedRoom || "")
+      .toUpperCase()
+      .replace(/[^23456789A-HJ-NP-Z]/gu, "");
+    if (!/^[23456789A-HJ-NP-Z]{8}$/.test(room)) {
+      throw new Error(`host room code was not available: ${displayedRoom}`);
     }
     const viewerPartition = `voice-viewer-${Date.now()}`;
     const viewerSession = session.fromPartition(viewerPartition);
@@ -274,7 +277,9 @@ async function main() {
       "viewer setup",
     );
     await viewerWindow.webContents.executeJavaScript(`(() => {
-      document.querySelector("#room-input").value = ${JSON.stringify(room)};
+      const roomInput = document.querySelector("#room-input");
+      roomInput.value = ${JSON.stringify(room)};
+      roomInput.dispatchEvent(new Event("input", { bubbles: true }));
       document.querySelector("#viewer-signal-url").value = ${JSON.stringify(signalUrl)};
       document.querySelector("#join-room")?.click();
     })()`);

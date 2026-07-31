@@ -1,0 +1,175 @@
+.settings-dialog {
+  width: min(920px, calc(100vw - 32px));
+  height: min(760px, calc(100dvh - 32px));
+  overflow: hidden;
+}
+
+.settings-layout {
+  display: grid;
+  height: 100%;
+  grid-template-columns: 190px minmax(0, 1fr);
+}
+
+.settings-nav {
+  display: grid;
+  align-content: start;
+  gap: var(--s-2);
+  padding: var(--s-6);
+  border-right: 1px solid var(--stroke-default);
+  background: var(--palette-257daeefc3);
+}
+
+.settings-nav button {
+  min-height: var(--control-min);
+  justify-content: flex-start;
+  border-radius: var(--r-sm);
+  color: var(--text-secondary);
+}
+
+.settings-nav button[aria-selected="true"] {
+  background: var(--accent-bg);
+  color: var(--accent-text);
+}
+
+.settings-content {
+  min-width: 0;
+  padding: var(--s-7);
+  overflow-y: auto;
+}
+
+.settings-section {
+  display: grid;
+  gap: var(--s-6);
+  padding: var(--s-7);
+}
+
+.setting-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(160px, auto);
+  align-items: center;
+  gap: var(--s-6);
+}
+
+.settings-section-heading,
+.settings-emby-account > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-5);
+}
+
+.settings-section-heading h3,
+.settings-section-heading p {
+  margin: 0;
+}
+
+.settings-section-heading p,
+.settings-emby-account header span,
+.settings-status {
+  color: var(--text-tertiary);
+  font-size: var(--t-small);
+}
+
+.settings-emby-login {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--s-4);
+  padding: var(--s-5);
+  border: 1px solid var(--stroke-default);
+  border-radius: var(--r-lg);
+  background: var(--surface-1);
+}
+
+.settings-emby-login > :first-child,
+.settings-emby-login > .setting-inline-check {
+  grid-column: 1 / -1;
+}
+
+.setting-inline-check {
+  display: flex;
+  min-height: var(--control-min);
+  align-items: center;
+  gap: var(--s-3);
+}
+
+.settings-status[data-tone="danger"] {
+  color: var(--danger-text);
+}
+
+.settings-emby-accounts {
+  display: grid;
+  gap: var(--s-4);
+}
+
+.settings-emby-account {
+  display: grid;
+  gap: var(--s-4);
+  padding: var(--s-5);
+  border: 1px solid var(--stroke-default);
+  border-radius: var(--r-lg);
+  background: var(--surface-1);
+}
+
+.settings-emby-account.is-active {
+  border-color: var(--accent-border);
+}
+
+.settings-emby-account > header > div {
+  display: grid;
+  gap: var(--s-1);
+}
+
+.settings-emby-account textarea {
+  resize: vertical;
+}
+
+.settings-emby-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: var(--s-3);
+}
+
+.settings-empty,
+.settings-loading {
+  padding: var(--s-7);
+  border: 1px dashed var(--stroke-default);
+  border-radius: var(--r-md);
+  color: var(--text-tertiary);
+  text-align: center;
+}
+
+@media (max-width: 660px) {
+  .settings-dialog {
+    width: 100%;
+    height: 100dvh;
+    max-width: none;
+    max-height: none;
+    border-radius: var(--radius-6e8fe175b0);
+  }
+
+  .settings-layout {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  .settings-nav {
+    grid-auto-flow: column;
+    grid-auto-columns: max-content;
+    overflow-x: auto;
+    border-right: 0;
+    border-bottom: 1px solid var(--stroke-default);
+  }
+
+  .setting-row {
+    grid-template-columns: 1fr;
+  }
+
+  .settings-emby-login {
+    grid-template-columns: 1fr;
+  }
+
+  .settings-emby-login > * {
+    grid-column: 1;
+  }
+}

@@ -1,0 +1,95 @@
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --dur-instant: 80ms;
+    --dur-micro: 100ms;
+    --dur-control: 120ms;
+    --dur-panel: 140ms;
+    --dur-view: 140ms;
+    --dur-immersive: 140ms;
+    --dur-ambient: 140ms;
+    --dur-celebration: 140ms;
+    --dur-1: 80ms;
+    --dur-2: 100ms;
+    --dur-3: 120ms;
+    --dur-4: 140ms;
+    --dur-5: 140ms;
+    --dur-6: 140ms;
+  }
+
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-iteration-count: 1 !important;
+  }
+
+  .skeleton::after,
+  .source-skeleton span::after,
+  .source-skeleton i::after,
+  .emby-item-skeleton span::after,
+  .emby-item-skeleton i::after,
+  #star-canvas,
+  .ambient-light-field,
+  .lobby-light-field,
+  [data-decorative-motion] {
+    display: none !important;
+  }
+}
+
+:root[data-motion="reduced"] *,
+:root[data-motion="reduced"] *::before,
+:root[data-motion="reduced"] *::after {
+  scroll-behavior: auto !important;
+  animation-iteration-count: 1 !important;
+}
+
+:root[data-motion="reduced"] #star-canvas,
+:root[data-motion="reduced"] .source-skeleton span::after,
+:root[data-motion="reduced"] .source-skeleton i::after,
+:root[data-motion="reduced"] .emby-item-skeleton span::after,
+:root[data-motion="reduced"] .emby-item-skeleton i::after,
+:root[data-motion="reduced"] .ambient-light-field,
+:root[data-motion="reduced"] .lobby-light-field,
+:root[data-motion="reduced"] [data-decorative-motion] {
+  display: none !important;
+}
+
+@media (prefers-contrast: more) {
+  :root {
+    --stroke-subtle: var(--palette-8d2af7fbfd);
+    --stroke-default: var(--palette-9783dee77b);
+    --stroke-strong: var(--palette-86dda9c04f);
+    --text-secondary: var(--n-100);
+    --text-tertiary: var(--n-150);
+  }
+}
+
+@media (forced-colors: active) {
+  * {
+    forced-color-adjust: auto;
+  }
+
+  :focus-visible {
+    outline: 3px solid Highlight;
+  }
+
+  .material-card,
+  .material-regular,
+  .material-clear {
+    border: 1px solid CanvasText;
+    background: Canvas;
+    color: CanvasText;
+    backdrop-filter: none;
+  }
+}
+
+@media (max-width: 600px) {
+  body {
+    font-size: 16px;
+    line-height: 1.55;
+  }
+
+  :root {
+    --blur-regular: var(--blur-regular-mobile);
+  }
+}

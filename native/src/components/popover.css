@@ -1,0 +1,19 @@
+.ui-popover,
+[data-floating-surface],
+.voice-device-panel,
+.chat-emoji-panel,
+.profile-popover,
+.recent-menu,
+.dock-more-menu {
+  z-index: var(--z-floating);
+  width: min(340px, calc(100vw - 24px));
+  padding: var(--s-5);
+  border: 1px solid var(--stroke-glass);
+  border-radius: var(--r-lg);
+  box-shadow: var(--e-3);
+  transform-origin: var(--floating-transform-origin, center top);
+}
+
+[data-floating-surface][data-presence="leaving"] {
+  pointer-events: none;
+}

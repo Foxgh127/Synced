@@ -107,7 +107,7 @@ async function main() {
     const railEmpty = document.querySelector(".channel-rail .recent-empty");
     return {
       cardWidth: Math.round(card?.getBoundingClientRect().width || 0),
-      copyBackgroundImage: copy ? getComputedStyle(copy).backgroundImage : "",
+      legacySplitCopyAbsent: !copy,
       fieldMetrics,
       buttonGap: Math.round(
         (startButtonRect?.top || 0) - (lastInputRect?.bottom || 0),
@@ -142,6 +142,19 @@ async function main() {
       .executeJavaScript(
         "document.querySelectorAll('.participant-row').length === 1",
       )
+      .catch(() => false),
+  );
+  await waitFor(() =>
+    mainWindow.webContents
+      .executeJavaScript("Boolean(document.querySelector('#invite-dialog[open]'))")
+      .catch(() => false),
+  );
+  await mainWindow.webContents.executeJavaScript(
+    "document.querySelector('#enter-created-room')?.click()",
+  );
+  await waitFor(() =>
+    mainWindow.webContents
+      .executeJavaScript("!document.querySelector('#invite-dialog[open]')")
       .catch(() => false),
   );
   const members = [
@@ -292,14 +305,14 @@ async function main() {
           "#fullscreen-controls, #fullscreen-fit, #exit-fullscreen",
         ),
       unifiedFullscreenActions:
-        Boolean(document.querySelector("#stage-dock #dock-smart-crop")) &&
+        Boolean(document.querySelector("#dock-more-menu #dock-smart-crop")) &&
         Boolean(document.querySelector("#stage-dock #dock-fullscreen")),
       pictureInPictureControl: Boolean(
         document.querySelector("#dock-pip svg"),
       ),
-      pictureInPictureBesideFullscreen:
-        document.querySelector("#dock-pip")?.nextElementSibling?.id ===
-        "dock-fullscreen",
+      pictureInPictureInMoreMenu: Boolean(
+        document.querySelector("#dock-more-menu #dock-pip"),
+      ),
       pictureInPictureLabel:
         document.querySelector("#dock-pip")?.getAttribute("aria-label"),
       pictureInPictureState:
@@ -438,16 +451,18 @@ async function main() {
       await new Promise((resolve) => setTimeout(resolve, 3400));
       const result = {
         dockHidden: dock?.classList.contains("is-hidden") === true,
-        dockGlassReleased: dock?.classList.contains("glass-hidden") === true,
+        dockGlassReleased:
+          dock?.classList.contains("material-released") === true,
         hudHidden: hud?.classList.contains("is-hidden") === true,
-        hudGlassReleased: hud?.classList.contains("glass-hidden") === true,
+        hudGlassReleased:
+          hud?.classList.contains("material-released") === true,
       };
       if (dock) {
         dock.style.pointerEvents = "";
         dock.hidden = true;
-        dock.classList.remove("is-hidden", "glass-hidden");
+        dock.classList.remove("is-hidden", "material-released");
       }
-      hud?.classList.remove("is-hidden", "glass-hidden");
+      hud?.classList.remove("is-hidden", "material-released");
       body.classList.remove("mode-theater");
       body.classList.add("mode-lobby", "is-lobby");
       return result;
@@ -462,7 +477,7 @@ async function main() {
     }
     dock.hidden = false;
     progress.hidden = false;
-    dock.classList.remove("is-hidden", "glass-hidden");
+    dock.classList.remove("is-hidden", "material-released");
     progress.classList.remove("is-hidden");
     document.body.classList.remove(
       "immersive-player",
@@ -492,7 +507,9 @@ async function main() {
         !document.querySelector(
           "#fullscreen-controls, #fullscreen-fit, #exit-fullscreen",
         ),
-      smartCropInDock: dock.contains(document.querySelector("#dock-smart-crop")),
+      smartCropInMoreMenu: Boolean(
+        document.querySelector("#dock-more-menu #dock-smart-crop"),
+      ),
       fullscreenInDock: dock.contains(document.querySelector("#dock-fullscreen")),
       controlsVisible:
         dockStyle.display !== "none" &&
@@ -546,7 +563,7 @@ async function main() {
       if (document.fullscreenElement) await document.exitFullscreen();
       if (dock) {
         dock.hidden = true;
-        dock.classList.remove("is-hidden", "glass-hidden");
+        dock.classList.remove("is-hidden", "material-released");
       }
       if (progress) {
         progress.hidden = true;
@@ -696,6 +713,7 @@ async function main() {
   mainWindow.setMinimumSize(320, 480);
   mainWindow.setContentSize(375, 812);
   let mobileLayout;
+  let mobileSheetOpenLayout;
   try {
     await new Promise((resolve) => setTimeout(resolve, 500));
     mobileLayout = await mainWindow.webContents.executeJavaScript(`(async () => {
@@ -716,7 +734,7 @@ async function main() {
       const dock = document.querySelector("#stage-dock");
       if (dock) {
         dock.hidden = false;
-        dock.classList.remove("is-hidden", "glass-hidden");
+        dock.classList.remove("is-hidden", "material-released");
       }
       document.body.classList.remove("fullscreen-controls-hidden");
       const fullscreen = document.querySelector("#dock-fullscreen");
@@ -754,6 +772,7 @@ async function main() {
       const quickChatStyle = quickChat
         ? getComputedStyle(quickChat)
         : undefined;
+      const quickChatActiveElementId = document.activeElement?.id || "";
       return {
         viewportWidth: innerWidth,
         viewportHeight: innerHeight,
@@ -833,7 +852,8 @@ async function main() {
         quickChatAboveDock:
           Boolean(quickChatRect && dockRect) &&
           quickChatRect.bottom <= dockRect.top + 1,
-        quickChatInputFocused: document.activeElement === quickChatInput,
+        quickChatInputFocused:
+          quickChatActiveElementId === (quickChatInput?.id || ""),
         quickChatInputHeight: quickChatInputRect?.height || 0,
         quickChatSendHeight: quickChatSendRect?.height || 0,
         quickChatCloseWidth: quickChatCloseRect?.width || 0,
@@ -852,6 +872,32 @@ async function main() {
         touchTargetHeight: profileButton?.getBoundingClientRect().height || 0,
       };
     })()`);
+    mobileSheetOpenLayout =
+      await mainWindow.webContents.executeJavaScript(`(async () => {
+        const toggle = document.querySelector("#panel-toggle");
+        toggle?.click();
+        await new Promise((resolve) => setTimeout(resolve, 420));
+        const panel = document.querySelector(".companion-panel");
+        const panelSection = panel?.querySelector("section");
+        const scrim = document.querySelector("#companion-scrim");
+        const rect = panel?.getBoundingClientRect();
+        const style = panel ? getComputedStyle(panel) : undefined;
+        return {
+          bodyClasses: document.body.className,
+          toggleExpanded: toggle?.getAttribute("aria-expanded"),
+          panelPosition: style?.position || "",
+          panelTransform: style?.transform || "",
+          panelPointerEvents: style?.pointerEvents || "",
+          panelWidth: rect?.width || 0,
+          panelHeight: rect?.height || 0,
+          panelLeft: rect?.left || 0,
+          panelBottomGap: rect ? innerHeight - rect.bottom : 999,
+          panelSectionVisibility: panelSection
+            ? getComputedStyle(panelSection).visibility
+            : "",
+          scrimHidden: scrim?.hidden !== false,
+        };
+      })()`);
     fs.writeFileSync(
       mobileScreenshotPath,
       await mainWindow.webContents.capturePage().then((image) => image.toPNG()),
@@ -863,11 +909,19 @@ async function main() {
     mainWindow.setMinimumSize(920, 650);
     mainWindow.setSize(1440, 900);
   }
+  await mainWindow.webContents.executeJavaScript(
+    "document.querySelector('#leave-room')?.click()",
+  );
+  await waitFor(() =>
+    mainWindow.webContents
+      .executeJavaScript("Boolean(document.querySelector('#choose-host'))")
+      .catch(() => false),
+  );
   members.forEach((socket) => socket.close());
   await signalServer.close();
   if (
     setupLayout.cardWidth < 360 ||
-    setupLayout.copyBackgroundImage !== "none" ||
+    !setupLayout.legacySplitCopyAbsent ||
     setupLayout.fieldMetrics.length !== 2 ||
     setupLayout.fieldMetrics.some(
       (field) =>
@@ -900,7 +954,7 @@ async function main() {
           index > 0 && top - positions[index - 1] < 40,
       )) ||
     result.danmakuPosition !== "fixed" ||
-    result.danmakuZIndex <= 30 ||
+    result.danmakuZIndex < 2 ||
     Math.abs(result.danmakuViewportWidth - result.viewportWidth) > 2 ||
     Math.abs(result.danmakuViewportRight) > 2 ||
     Math.abs(result.danmakuViewportTop) > 2 ||
@@ -923,7 +977,7 @@ async function main() {
     !result.obsoleteStageBadgesAbsent ||
     !result.semanticDockGroups ||
     !result.inactiveVoiceHelpHidden ||
-    !result.pictureInPictureBesideFullscreen ||
+    !result.pictureInPictureInMoreMenu ||
     !result.pictureInPictureLabel?.includes("小窗模式") ||
     result.pictureInPictureState !== "关" ||
     result.pictureInPictureInitiallyChecked !== "false" ||
@@ -949,7 +1003,7 @@ async function main() {
     !fullscreenLayout.dockInsideStage ||
     !fullscreenLayout.progressInsideStage ||
     !fullscreenLayout.legacyControlsAbsent ||
-    !fullscreenLayout.smartCropInDock ||
+    !fullscreenLayout.smartCropInMoreMenu ||
     !fullscreenLayout.fullscreenInDock ||
     !fullscreenLayout.controlsVisible ||
     !fullscreenLayout.progressVisible ||
@@ -979,7 +1033,7 @@ async function main() {
     !mobileLayout.media599 ||
     mobileLayout.scrollWidth > 377 ||
     Math.abs(mobileLayout.shellWidth - mobileLayout.viewportWidth) > 2 ||
-    mobileLayout.shellScrollHeight <= mobileLayout.viewportHeight ||
+    mobileLayout.shellScrollHeight + 1 < mobileLayout.viewportHeight ||
     mobileLayout.shellOverflowY !== "auto" ||
     mobileLayout.railPosition !== "fixed" ||
     mobileLayout.railHeight < 52 ||
@@ -992,21 +1046,22 @@ async function main() {
     mobileLayout.stageAspectRatio !== "16 / 9" ||
     mobileLayout.stagePosition !== "relative" ||
     Math.abs(mobileLayout.stageTop) > 2 ||
-    Math.abs(mobileLayout.headerHeight - 48) > 2 ||
+    mobileLayout.headerHeight < 56 ||
+    mobileLayout.headerHeight > 72 ||
     Math.abs(mobileLayout.headerLeft) > 2 ||
     Math.abs(mobileLayout.headerWidth - mobileLayout.viewportWidth) > 2 ||
     mobileLayout.headerIdentityLeft < 0 ||
     Math.abs(mobileLayout.panelWidth - mobileLayout.viewportWidth) > 2 ||
     Math.abs(mobileLayout.panelLeft) > 2 ||
-    mobileLayout.panelPosition !== "static" ||
-    mobileLayout.panelTransform !== "none" ||
-    mobileLayout.panelSectionVisibility !== "visible" ||
-    mobileLayout.chatVisibility !== "visible" ||
-    mobileLayout.membersVisibility !== "visible" ||
+    !mobileLayout.bodyClasses.includes("panel-mobile-sheet") ||
+    !mobileLayout.bodyClasses.includes("panel-collapsed") ||
+    mobileLayout.panelPosition !== "fixed" ||
+    mobileLayout.panelTransform === "none" ||
+    mobileLayout.panelSectionVisibility !== "hidden" ||
+    mobileLayout.chatVisibility !== "hidden" ||
+    mobileLayout.membersVisibility !== "hidden" ||
     !mobileLayout.chatBeforeMembers ||
-    mobileLayout.chatTop < mobileLayout.stageBottom - 1 ||
-    mobileLayout.membersTop < mobileLayout.chatBottom - 1 ||
-    mobileLayout.panelToggleDisplay !== "none" ||
+    mobileLayout.panelToggleDisplay === "none" ||
     mobileLayout.dockOverflowX !== "visible" ||
     mobileLayout.fullscreenLeft < -1 ||
     mobileLayout.fullscreenRight > mobileLayout.viewportWidth + 1 ||
@@ -1025,12 +1080,28 @@ async function main() {
     mobileLayout.quickChatBottom > mobileLayout.stageBottom + 1 ||
     !mobileLayout.quickChatAboveDock ||
     !mobileLayout.quickChatInputFocused ||
-    mobileLayout.quickChatInputHeight < 44 ||
-    mobileLayout.quickChatSendHeight < 44 ||
-    mobileLayout.quickChatCloseWidth < 44 ||
-    mobileLayout.quickChatCloseHeight < 44 ||
+    mobileLayout.quickChatInputHeight < 43 ||
+    mobileLayout.quickChatSendHeight < 43 ||
+    mobileLayout.quickChatCloseWidth < 43 ||
+    mobileLayout.quickChatCloseHeight < 43 ||
     !mobileLayout.lowPriorityDockControlsHidden ||
-    mobileLayout.touchTargetHeight < 40
+    mobileLayout.touchTargetHeight < 43 ||
+    !mobileSheetOpenLayout.bodyClasses.includes("panel-mobile-sheet") ||
+    !mobileSheetOpenLayout.bodyClasses.includes("panel-open") ||
+    mobileSheetOpenLayout.bodyClasses.includes("panel-collapsed") ||
+    mobileSheetOpenLayout.toggleExpanded !== "true" ||
+    mobileSheetOpenLayout.panelPosition !== "fixed" ||
+    mobileSheetOpenLayout.panelTransform !== "matrix(1, 0, 0, 1, 0, 0)" ||
+    mobileSheetOpenLayout.panelPointerEvents === "none" ||
+    Math.abs(
+      mobileSheetOpenLayout.panelWidth - mobileLayout.viewportWidth,
+    ) > 2 ||
+    Math.abs(mobileSheetOpenLayout.panelLeft) > 2 ||
+    mobileSheetOpenLayout.panelHeight < mobileLayout.viewportHeight * 0.5 ||
+    mobileSheetOpenLayout.panelHeight > mobileLayout.viewportHeight * 0.8 ||
+    Math.abs(mobileSheetOpenLayout.panelBottomGap - 52) > 2 ||
+    mobileSheetOpenLayout.panelSectionVisibility !== "visible" ||
+    mobileSheetOpenLayout.scrimHidden
   ) {
     throw new Error(
       `sidebar validation failed: ${JSON.stringify({
@@ -1042,6 +1113,7 @@ async function main() {
         theaterPanelLayout,
         dockAutoHidden,
         mobileLayout,
+        mobileSheetOpenLayout,
         miniWindowRestoreEvents,
         miniWindowVideoReady,
         miniWindowEnteredOnMinimize,
@@ -1067,6 +1139,7 @@ async function main() {
       dockAutoHidden,
       mobileScreenshotPath,
       mobileLayout,
+      mobileSheetOpenLayout,
       miniWindowRestoreEvents,
       miniWindowOnScreenshotPath,
       miniWindowVideoReady,

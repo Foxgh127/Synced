@@ -68,7 +68,7 @@ async function main() {
     await withTimeout(reloaded, "renderer reload");
 
     const result = await withTimeout(
-      window.webContents.executeJavaScript(`(() => {
+      window.webContents.executeJavaScript(`(async () => {
       const button = document.querySelector("[data-recent-room='TEST2345']");
       const openMenu = () => button?.dispatchEvent(new MouseEvent("contextmenu", {
         bubbles: true,
@@ -84,6 +84,13 @@ async function main() {
       );
       const unchangedBeforeChoice = count() === 1;
       document.querySelector("[data-cancel-recent-delete]")?.click();
+      const closeDeadline = performance.now() + 2_000;
+      while (
+        document.querySelector("[data-recent-delete-dialog]") &&
+        performance.now() < closeDeadline
+      ) {
+        await new Promise((resolve) => requestAnimationFrame(resolve));
+      }
       const cancelKeptHistory =
         count() === 1 &&
         !document.querySelector("[data-recent-delete-dialog]");

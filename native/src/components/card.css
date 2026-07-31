@@ -1,0 +1,66 @@
+.spatial-card,
+.home-action-card,
+.recent-channel-card,
+.setup-card,
+.join-card,
+.channel-empty,
+.settings-section {
+  position: relative;
+  overflow: hidden;
+  border: 1px solid var(--stroke-default);
+  border-radius: var(--r-xl);
+  background: var(--material-l2);
+  box-shadow: var(--e-card);
+}
+
+.interactive-card {
+  --pointer-opacity: 0;
+  --pointer-x: 50%;
+  --pointer-y: 50%;
+  transition: border-color var(--dur-control) var(--ease-out), background-color var(--dur-control) var(--ease-out), transform var(--dur-control) var(--ease-out);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .interactive-card::before {
+    position: absolute;
+    z-index: var(--z-7bd5bf990b);
+    inset: 0;
+    background: radial-gradient(
+      320px circle at var(--pointer-x) var(--pointer-y),
+      var(--accent-bg-hover),
+      transparent 68%
+    );
+    content: "";
+    opacity: var(--pointer-opacity);
+    pointer-events: none;
+    transition: opacity 300ms var(--ease-out);
+  }
+
+  .interactive-card:hover {
+    border-color: var(--stroke-strong);
+    box-shadow: var(--e-2);
+    transform: translateY(-2px);
+  }
+}
+
+.interactive-card:active {
+  transform: translateY(0) scale(0.992);
+}
+
+.interactive-card[data-selected="true"],
+.source-card[data-selected="true"],
+.source-card[aria-selected="true"] {
+  border-color: var(--accent);
+  box-shadow: var(--e-accent);
+  transform: translateY(-2px);
+}
+
+.selection-check {
+  display: grid;
+  width: 24px;
+  height: 24px;
+  place-items: center;
+  border-radius: var(--radius-8ec82c689f);
+  background: var(--accent);
+  color: var(--accent-ink);
+}

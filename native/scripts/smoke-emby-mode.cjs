@@ -19,6 +19,8 @@ const browserBundle = buildSync({
   stdin: {
     contents: `
       import {
+        EMBY_CONTROL_CHANNEL_LABEL,
+        EMBY_DATA_CHANNEL_LABEL,
         EmbyPeerSender,
       } from "./src/emby-transport.ts";
       import { EmbyMsePlayer } from "./src/emby-player.ts";
@@ -60,6 +62,7 @@ const browserBundle = buildSync({
           decodedFrame: false,
           mediaReadyAcks: 0,
           fragments: 0,
+          lastFragmentSeq: -1,
           initRequests: 0,
           retransmits: 0,
           bufferAhead: 0,
@@ -71,6 +74,7 @@ const browserBundle = buildSync({
           player: undefined,
           pc: undefined,
           channel: undefined,
+          controlChannel: undefined,
           playbackTimer: undefined,
         };
         const roomId = "emby-smoke";
@@ -193,6 +197,14 @@ const browserBundle = buildSync({
             }).catch((error) => state.errors.push(String(error)));
           });
           player.attachChannel(channel);
+          if (state.controlChannel) {
+            player.attachControlChannel(state.controlChannel);
+          }
+        };
+
+        const attachViewerControlChannel = (channel) => {
+          state.controlChannel = channel;
+          state.player?.attachControlChannel(channel);
         };
 
         window.embySmoke = {
@@ -202,18 +214,27 @@ const browserBundle = buildSync({
             pc.addEventListener("connectionstatechange", () => {
               state.connected = pc.connectionState === "connected";
             });
-            const channel = pc.createDataChannel("synced-emby-v1", {
+            const channel = pc.createDataChannel(EMBY_DATA_CHANNEL_LABEL, {
               ordered: false,
+              maxRetransmits: 1,
             });
+            const controlChannel = pc.createDataChannel(
+              EMBY_CONTROL_CHANNEL_LABEL,
+              { ordered: true },
+            );
             state.channel = channel;
+            state.controlChannel = controlChannel;
             state.sender = new EmbyPeerSender(
               channel,
               handleHostControl,
+              undefined,
+              controlChannel,
             );
             channel.addEventListener("open", () => {
               state.connected = true;
               sendSession();
             });
+            controlChannel.addEventListener("open", sendSession);
             await pc.setLocalDescription(await pc.createOffer());
             await waitForIce(pc);
             return JSON.parse(JSON.stringify(pc.localDescription));
@@ -226,11 +247,15 @@ const browserBundle = buildSync({
               state.connected = pc.connectionState === "connected";
             });
             pc.addEventListener("datachannel", (event) => {
-              if (event.channel.label !== "synced-emby-v1") {
-                event.channel.close();
+              if (event.channel.label === EMBY_DATA_CHANNEL_LABEL) {
+                attachViewerChannel(event.channel);
                 return;
               }
-              attachViewerChannel(event.channel);
+              if (event.channel.label === EMBY_CONTROL_CHANNEL_LABEL) {
+                attachViewerControlChannel(event.channel);
+                return;
+              }
+              event.channel.close();
             });
             await pc.setRemoteDescription(offer);
             await pc.setLocalDescription(await pc.createAnswer());
@@ -277,6 +302,10 @@ const browserBundle = buildSync({
               };
               state.cache.set(event.sequence, fragment);
               state.fragments += 1;
+              state.lastFragmentSeq = Math.max(
+                state.lastFragmentSeq,
+                event.sequence,
+              );
               state.sender?.sendFragment(fragment);
               return;
             }
@@ -285,6 +314,9 @@ const browserBundle = buildSync({
                 type: "stream-ended",
                 sessionId,
                 mediaVersion,
+                transportEpoch: 0,
+                finalFragmentSeq: state.lastFragmentSeq,
+                finalTrackType: "muxed",
               });
             }
             if (event.type === "error") {

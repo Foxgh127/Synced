@@ -8,6 +8,7 @@ const fs = require("fs");
 const fsp = fs.promises;
 const net = require("net");
 const path = require("path");
+const { version: APP_VERSION } = require("../package.json");
 
 const EMBY_CLIENT = "Synced";
 const EMBY_DEVICE = "Synced Desktop";
@@ -4262,7 +4263,7 @@ class CmafRelayCoordinator {
 
 class EmbyService {
   constructor(options = {}) {
-    this.version = cleanText(options.version || "2.9.2", 32);
+    this.version = cleanText(options.version || APP_VERSION, 32);
     this.deviceId = cleanText(options.deviceId || randomUUID(), 128);
     this.ffmpegPath = resolveFfmpegPath(options);
     this.spawnProcess =
@@ -4862,7 +4863,11 @@ class EmbyService {
     const filters = Array.isArray(input.filters)
       ? input.filters
           .map((value) => cleanText(value, 32))
-          .filter((value) => ["IsResumable", "IsUnplayed", "IsPlayed"].includes(value))
+          .filter((value) =>
+            ["IsResumable", "IsUnplayed", "IsPlayed", "IsFavorite"].includes(
+              value,
+            ),
+          )
       : [];
     if (filters.length) query.set("Filters", filters.join(","));
     const allowedSort = new Set([

@@ -32,10 +32,11 @@ test("music source UI paints first and reuses a short-lived source list", () => 
   const openEnd = musicSource.indexOf("private closePopover", openStart);
   const openPopover = musicSource.slice(openStart, openEnd);
   assert.ok(openStart >= 0);
-  assert.ok(openPopover.indexOf("await waitForPopoverPaint()") >= 0);
-  assert.ok(
-    openPopover.indexOf("await this.refreshSources()") >
-      openPopover.indexOf("await waitForPopoverPaint()"),
+  assert.match(openPopover, /const opening = this\.surface\.open\(\)/);
+  assert.match(openPopover, /const refreshing = this\.refreshSources\(\)/);
+  assert.match(
+    openPopover,
+    /Promise\.allSettled\(\[opening, refreshing\]\)/,
   );
   assert.match(musicSource, /const MUSIC_SOURCE_CACHE_MS = 5_000/);
   assert.match(musicSource, /sourceRefreshInFlight/);

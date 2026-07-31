@@ -137,6 +137,10 @@ async function main() {
     throw new Error(`desktop danmaku validation failed: ${JSON.stringify(result)}`);
   }
   process.stdout.write(`${JSON.stringify({ ok: true, ...result })}\n`);
+  await mainWindow.webContents.executeJavaScript(
+    "document.querySelector('#leave-room')?.click()",
+  );
+  await waitFor(() => signalServer.clients.size === 0);
   await signalServer.close();
 }
 

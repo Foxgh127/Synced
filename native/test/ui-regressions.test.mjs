@@ -2,13 +2,29 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import { test } from "node:test";
 
+function readStyles() {
+  const entryUrl = new URL("../src/styles.css", import.meta.url);
+  const entry = fs.readFileSync(entryUrl, "utf8");
+  const imports = [...entry.matchAll(/@import\s+"([^"]+)"/g)].map(
+    ([, path]) => fs.readFileSync(new URL(path, entryUrl), "utf8"),
+  );
+  return [entry, ...imports].join("\n");
+}
+
 test("form primitives do not size label.field containers", () => {
   const primitives = fs.readFileSync(
     new URL("../src/design/primitives.css", import.meta.url),
     "utf8",
   );
-  assert.doesNotMatch(primitives, /(?:^|\n)\.field\s*\{/);
-  assert.match(primitives, /:is\(input, textarea, select\)\.field\s*\{/);
+  const fieldGroup = primitives.slice(
+    primitives.indexOf(".field,"),
+    primitives.indexOf("}", primitives.indexOf(".field,")),
+  );
+  assert.doesNotMatch(
+    fieldGroup,
+    /^\s*(?:width|min-height|height)\s*:/m,
+  );
+  assert.match(primitives, /:is\(input, select, textarea\)\.field\s*,/);
 });
 
 test("trusted app invites auto-join while unknown signal hosts still ask", () => {
@@ -22,7 +38,9 @@ test("trusted app invites auto-join while unknown signal hosts still ask", () =>
   const trustedReturn = confirmInvite.indexOf(
     "if (!untrusted) return { room: parsed.room, signalUrl };",
   );
-  const confirmation = confirmInvite.indexOf("window.confirm(message)");
+  const confirmation = confirmInvite.indexOf(
+    "await requestSignalTrust(signalUrl, parsed.room)",
+  );
   assert.ok(trustedReturn >= 0);
   assert.ok(confirmation > trustedReturn);
   assert.match(confirmInvite, /requiresSignalTrust\(signalUrl\)/);
@@ -41,7 +59,10 @@ test("Android consumes duplicate cold-start invite events only once", () => {
   const openInvite = source.slice(start, end);
   assert.match(openInvite, /parseJoinLink\(url\)/);
   assert.match(openInvite, /now - recentInviteAt < 10_000/);
-  assert.match(openInvite, /return recentInviteHandled/);
+  assert.match(
+    openInvite,
+    /return recentInvitePromise \|\| recentInviteHandled/,
+  );
   assert.match(openInvite, /recentInviteHandled = Boolean\(invite\)/);
   assert.equal(
     (openInvite.match(/void renderViewer\(/g) || []).length,
@@ -79,21 +100,31 @@ test("the source chooser closes before capture startup can block", () => {
   const sourceListStart = source.indexOf(
     '.querySelectorAll<HTMLButtonElement>("[data-session-source]")',
   );
-  const sourceClickIndex = source.indexOf(
-    'button.addEventListener("click", async () => {',
+  const sourceListEnd = source.indexOf(
+    "updateSelectedSourceSummary();",
     sourceListStart,
   );
-  const immediateCloseIndex = source.indexOf(
-    "closeBroadcastDialog()",
-    sourceClickIndex,
+  const sourceSelection = source.slice(sourceListStart, sourceListEnd);
+  assert.match(
+    sourceSelection,
+    /selectedBroadcastSourceId = button\.dataset\.sessionSource \|\| ""/,
   );
-  const prepareCallIndex = source.indexOf(
-    "await prepareLocalBroadcast(button.dataset.sessionSource!)",
-    sourceClickIndex,
+  assert.doesNotMatch(sourceSelection, /prepareLocalBroadcast|closeBroadcastDialog/);
+
+  const explicitStartIndex = source.indexOf(
+    '.querySelector("#start-screen-broadcast")',
   );
-  assert.ok(sourceClickIndex >= 0);
-  assert.ok(immediateCloseIndex > sourceClickIndex);
-  assert.ok(prepareCallIndex > immediateCloseIndex);
+  const explicitStart = source.slice(
+    explicitStartIndex,
+    source.indexOf(
+      '.querySelectorAll<HTMLButtonElement>("[data-broadcast-mode]")',
+      explicitStartIndex,
+    ),
+  );
+  assert.ok(
+    explicitStart.indexOf("closeBroadcastDialog()") <
+      explicitStart.indexOf("await prepareLocalBroadcast(source.id)"),
+  );
 });
 
 test("late screen and Emby startup results cannot revive a cancelled broadcast", () => {
@@ -187,10 +218,7 @@ test("closed dialogs cannot remain visible and broadcast grant closes the choose
     new URL("../src/channel-session.ts", import.meta.url),
     "utf8",
   );
-  const styles = fs.readFileSync(
-    new URL("../src/styles.css", import.meta.url),
-    "utf8",
-  );
+  const styles = readStyles();
   assert.match(
     styles,
     /dialog:not\(\[open\]\)\s*\{[\s\S]*?display:\s*none/,
@@ -213,11 +241,14 @@ test("desktop viewers leave a channel for the home screen", () => {
     new URL("../src/main.ts", import.meta.url),
     "utf8",
   );
-  const viewerSessionStart = source.indexOf("await openChannelSession({", source.indexOf("async function joinRoom"));
+  const viewerSessionStart = source.indexOf(
+    "await openSession({",
+    source.indexOf("async function joinRoom"),
+  );
   const viewerSessionEnd = source.indexOf("});", viewerSessionStart);
   assert.match(
     source.slice(viewerSessionStart, viewerSessionEnd),
-    /onLeave:\s*desktop\s*\?\s*renderDesktopHome/,
+    /onLeave:[\s\S]*?if \(desktop\) renderDesktopHome\(\)/,
   );
 });
 
@@ -262,10 +293,7 @@ test("lobby panel collapse is quiet, releases its column, and keeps only useful 
     new URL("../src/channel-session.ts", import.meta.url),
     "utf8",
   );
-  const styles = fs.readFileSync(
-    new URL("../src/styles.css", import.meta.url),
-    "utf8",
-  );
+  const styles = readStyles();
   const toggleStart = source.indexOf(
     'panelToggle?.addEventListener("click"',
   );
@@ -287,10 +315,7 @@ test("requested visual cues remain explicit after the UI refactor", () => {
     new URL("../src/room-companion.ts", import.meta.url),
     "utf8",
   );
-  const styles = fs.readFileSync(
-    new URL("../src/styles.css", import.meta.url),
-    "utf8",
-  );
+  const styles = readStyles();
   assert.match(
     source,
     /id="session-invite" class="btn btn-secondary"/,
@@ -313,7 +338,7 @@ test("the emoji picker respects the chat maxlength during scripted insertion", (
     'emojiPanel?.addEventListener("click"',
   );
   const handlerEnd = companion.indexOf(
-    "// Close emoji panel when clicking outside",
+    "const deviceButton",
     handlerStart,
   );
   const handler = companion.slice(handlerStart, handlerEnd);
@@ -333,58 +358,27 @@ test("the emoji picker respects the chat maxlength during scripted insertion", (
   assert.match(handler, /chatInput\.value = candidate/);
 });
 
-test("desktop companion is voice-first while mobile stays a visible chat-first document flow", () => {
+test("companion uses tabs, a fixed voice bar, and responsive drawer modes", () => {
   const companion = fs.readFileSync(
     new URL("../src/room-companion.ts", import.meta.url),
     "utf8",
   );
-  const styles = fs.readFileSync(
-    new URL("../src/styles.css", import.meta.url),
-    "utf8",
-  );
-  const chatIndex = companion.indexOf(
-    '<section class="chat-card" id="chat-panel"',
-  );
-  const membersIndex = companion.indexOf(
-    '<section class="voice-card" id="member-panel"',
-  );
-  assert.ok(chatIndex >= 0);
-  assert.ok(membersIndex > chatIndex);
+  const styles = readStyles();
+  assert.match(companion, /role="tablist" aria-label="频道陪伴内容"/);
+  assert.match(companion, /data-companion-tab="chat"/);
+  assert.match(companion, /data-companion-tab="members"/);
+  assert.match(companion, /class="voice-control-bar"/);
   assert.match(
     styles,
-    /\.room-sidebar\s*>\s*\.voice-card\s*\{[\s\S]*?grid-row:\s*1;/,
+    /\.room-sidebar\.companion-panel\s*\{[\s\S]*?grid-template-rows:\s*auto minmax\(0,\s*1fr\) auto/,
   );
   assert.match(
     styles,
-    /\.room-sidebar\s*>\s*\.chat-card\s*\{[\s\S]*?grid-row:\s*2;/,
-  );
-
-  const mobileStart = styles.indexOf(
-    "/* Handsets use one vertical document flow",
-  );
-  const mobileEnd = styles.indexOf(
-    "@media (prefers-reduced-motion: reduce)",
-    mobileStart,
-  );
-  const mobile = styles.slice(mobileStart, mobileEnd);
-  assert.ok(mobileStart >= 0);
-  assert.ok(mobileEnd > mobileStart);
-  assert.match(mobile, /\.session-shell\s*\{[\s\S]*?overflow-y:\s*auto/);
-  assert.match(
-    mobile,
-    /body:not\(\.mode-immersive\) \.room-sidebar\.companion-panel\s*\{[\s\S]*?position:\s*static;[\s\S]*?flex-direction:\s*column;[\s\S]*?transform:\s*none;/,
+    /@media \(max-width:\s*1199px\)[\s\S]*?\.room-sidebar\.companion-panel,[\s\S]*?position:\s*fixed;[\s\S]*?transform:\s*translateX\(100%\)/,
   );
   assert.match(
-    mobile,
-    /\.room-sidebar\.companion-panel > \.panel-toggle\s*\{[\s\S]*?display:\s*none !important;/,
-  );
-  assert.match(
-    mobile,
-    /\.room-sidebar\.companion-panel > \.chat-card\s*\{[\s\S]*?order:\s*1;[\s\S]*?min-height:\s*340px;/,
-  );
-  assert.match(
-    mobile,
-    /\.room-sidebar\.companion-panel > \.voice-card\s*\{[\s\S]*?order:\s*2;[\s\S]*?min-height:\s*300px;/,
+    styles,
+    /@media \(max-width:\s*599px\)[\s\S]*?height:\s*min\(78dvh,\s*720px\);[\s\S]*?transform:\s*translateY\(105%\)/,
   );
 });
 
@@ -393,10 +387,7 @@ test("the desktop playback HUD yields space to the stop action without overlappi
     new URL("../src/channel-session.ts", import.meta.url),
     "utf8",
   );
-  const styles = fs.readFileSync(
-    new URL("../src/styles.css", import.meta.url),
-    "utf8",
-  );
+  const styles = readStyles();
   assert.match(
     styles,
     /\.channel-header-actions\s*\{[\s\S]*?flex:\s*1 1 auto;[\s\S]*?overflow:\s*hidden;/,
@@ -449,13 +440,10 @@ test("the idle playback HUD is content-sized while active playback remains flexi
     new URL("../src/channel-session.ts", import.meta.url),
     "utf8",
   );
-  const styles = fs.readFileSync(
-    new URL("../src/styles.css", import.meta.url),
-    "utf8",
-  );
+  const styles = readStyles();
   assert.match(
     source,
-    /class="hud-bar glass-a is-idle"[\s\S]*?data-playback-state="idle"[\s\S]*?aria-label="连接与播放状态，当前无放映"/,
+    /class="hud-bar session-status-line is-idle"[\s\S]*?data-playback-state="idle"[\s\S]*?aria-label="连接与播放状态，当前无放映"/,
   );
   assert.match(
     source,
@@ -472,10 +460,7 @@ test("the idle playback HUD is content-sized while active playback remains flexi
 });
 
 test("mobile dock keeps fullscreen visible and reserves a safe quick-chat card", () => {
-  const styles = fs.readFileSync(
-    new URL("../src/styles.css", import.meta.url),
-    "utf8",
-  );
+  const styles = readStyles();
   const mobileStart = styles.indexOf(
     "/* Keep the essential five actions visible",
   );
@@ -552,11 +537,18 @@ test("Emby UI exposes saved accounts, switching, and unified search", () => {
     new URL("../src/channel-session.ts", import.meta.url),
     "utf8",
   );
-  assert.match(source, /id="emby-saved-account-list"/);
+  const settings = fs.readFileSync(
+    new URL("../src/ui/settings-controller.ts", import.meta.url),
+    "utf8",
+  );
+  assert.match(source, /class="emby-library-nav"/);
+  assert.match(source, /data-emby-nav-mode="favorite"/);
   assert.match(source, /id="emby-account-switch"/);
-  assert.match(source, /id="emby-add-account"/);
+  assert.match(source, /id="emby-open-settings"/);
   assert.match(source, /\.embySearchAll\(commonQuery\)/);
-  assert.match(source, /Windows 系统加密后保留在本机/);
+  assert.match(settings, /id="settings-emby-accounts"/);
+  assert.match(settings, /Windows 安全存储/);
+  assert.match(settings, /data-emby-action="remove"/);
 });
 
 test("Emby account recovery is bounded, race-safe, and always restores its start action", () => {
@@ -858,14 +850,8 @@ test("nested Emby and network headers keep their component layout", () => {
     new URL("../src/channel-session.ts", import.meta.url),
     "utf8",
   );
-  const styles = fs.readFileSync(
-    new URL("../src/styles.css", import.meta.url),
-    "utf8",
-  );
-  const enhancements = fs.readFileSync(
-    new URL("../src/styles-visual-enhancements.css", import.meta.url),
-    "utf8",
-  );
+  const styles = readStyles();
+  const enhancements = styles;
   assert.match(
     source,
     /data-add-emby-endpoint class="ghost-button emby-endpoint-add"/,
@@ -887,10 +873,7 @@ test("nested Emby and network headers keep their component layout", () => {
 });
 
 test("Emby detail controls and danmaku input stay inside their surfaces", () => {
-  const styles = fs.readFileSync(
-    new URL("../src/styles.css", import.meta.url),
-    "utf8",
-  );
+  const styles = readStyles();
   assert.match(
     styles,
     /\.emby-item-popup-dialog\s*\{[\s\S]*?overflow-x:\s*hidden;/,
@@ -905,11 +888,11 @@ test("Emby detail controls and danmaku input stay inside their surfaces", () => 
   );
   assert.match(
     styles,
-    /\.chat-form input\s*\{[\s\S]*?border:\s*1px solid rgba\(154,\s*173,\s*197,\s*0\.24\)/,
+    /\.room-sidebar\.companion-panel \.chat-form\s*\{[\s\S]*?border:\s*1px solid var\(--stroke-default\)/,
   );
   assert.match(
     styles,
-    /\.chat-form input:focus\s*\{[\s\S]*?border-color:\s*rgba\(129,\s*140,\s*248,\s*0\.72\)/,
+    /\.room-sidebar\.companion-panel \.chat-form:focus-within\s*\{[\s\S]*?border-color:\s*var\(--accent-border\)/,
   );
 });
 
@@ -918,10 +901,7 @@ test("playback chrome stays centered on the video and removes redundant badges",
     new URL("../src/channel-session.ts", import.meta.url),
     "utf8",
   );
-  const styles = fs.readFileSync(
-    new URL("../src/styles.css", import.meta.url),
-    "utf8",
-  );
+  const styles = readStyles();
   assert.doesNotMatch(source, /id="local-stage-badge"/);
   assert.doesNotMatch(source, /id="audio-route-badge"/);
   assert.doesNotMatch(source, /LIVE · 你的本地预览/);
@@ -948,10 +928,7 @@ test("broadcast mode transition is interruptible and obsolete source guidance is
     new URL("../src/channel-session.ts", import.meta.url),
     "utf8",
   );
-  const styles = fs.readFileSync(
-    new URL("../src/styles.css", import.meta.url),
-    "utf8",
-  );
+  const styles = readStyles();
   assert.match(source, /class="broadcast-mode-glider"/);
   assert.match(source, /data-active-mode="screen"/);
   assert.doesNotMatch(source, /id="hdr-display-summary"/);
@@ -960,12 +937,13 @@ test("broadcast mode transition is interruptible and obsolete source guidance is
     source,
     /选择正在播放影片的窗口；已最小化的窗口可能不会被 Windows 提供/,
   );
-  assert.match(source, /for \(const animation of broadcastModeAnimations\) animation\.cancel\(\)/);
-  assert.match(source, /prefers-reduced-motion:\s*reduce/);
-  assert.match(source, /incoming\.animate\(/);
+  assert.match(source, /broadcastModeAbort\?\.abort\(\)/);
+  assert.match(source, /animateElement\(\s*incoming,/);
+  assert.match(source, /signal:\s*broadcastModeAbort\.signal/);
+  assert.doesNotMatch(source, /\{\s*height:\s*`\$\{previousHeight\}px`/);
   assert.match(
     styles,
-    /\.broadcast-mode-glider\s*\{[\s\S]*?transition:[\s\S]*?transform 440ms/,
+    /\.broadcast-mode-glider[\s\S]*?transition:\s*transform var\(--dur-control\)/,
   );
   assert.match(
     styles,
@@ -974,10 +952,7 @@ test("broadcast mode transition is interruptible and obsolete source guidance is
 });
 
 test("danmaku composer reserves a readable field and 44px touch targets", () => {
-  const styles = fs.readFileSync(
-    new URL("../src/styles.css", import.meta.url),
-    "utf8",
-  );
+  const styles = readStyles();
   assert.match(
     styles,
     /\.chat-form\s*\{[\s\S]*?grid-template-columns:\s*minmax\(0,\s*1fr\)\s*auto;/,
@@ -996,23 +971,16 @@ test("danmaku composer reserves a readable field and 44px touch targets", () => 
   );
 });
 
-test("the cursor glow remains a compact local accent", () => {
+test("the global cursor glow is removed in favor of card-local pointer state", () => {
   const main = fs.readFileSync(
     new URL("../src/main.ts", import.meta.url),
     "utf8",
   );
-  const enhancements = fs.readFileSync(
-    new URL("../src/styles-visual-enhancements.css", import.meta.url),
-    "utf8",
-  );
-  assert.match(
-    enhancements,
-    /#cursor-glow\s*\{[\s\S]*?width:\s*220px;[\s\S]*?height:\s*220px;/,
-  );
-  assert.match(
-    main,
-    /translate\(\$\{cx - 110\}px,\s*\$\{cy - 110\}px\)/,
-  );
+  const styles = readStyles();
+  assert.doesNotMatch(styles, /#cursor-glow/);
+  assert.doesNotMatch(main, /startCursorGlow|cursor-glow/);
+  assert.match(main, /bindLocalPointerLight/);
+  assert.match(styles, /--pointer-x/);
 });
 
 test("server-provided Emby labels are escaped and strict CSP has no inline styles", () => {
@@ -1024,10 +992,7 @@ test("server-provided Emby labels are escaped and strict CSP has no inline style
     new URL("../src/channel-music.ts", import.meta.url),
     "utf8",
   );
-  const styles = fs.readFileSync(
-    new URL("../src/styles.css", import.meta.url),
-    "utf8",
-  );
+  const styles = readStyles();
   const activeAudioStart = session.indexOf("liveAudio.innerHTML");
   const activeSubtitleStart = session.indexOf(
     "liveSub.innerHTML",
@@ -1046,8 +1011,11 @@ test("server-provided Emby labels are escaped and strict CSP has no inline style
     /escapeHtml\([\s\S]*?s\.title/,
   );
   assert.doesNotMatch(`${session}\n${music}`, /\sstyle=(?:"|')/);
-  assert.match(session, /data-emby-progress="\$\{progress\}"/);
-  assert.match(styles, /width:\s*var\(--emby-progress,\s*0%\)/);
+  assert.match(
+    session,
+    /<progress class="emby-progress" max="100" value="\$\{progress\}"/,
+  );
+  assert.match(styles, /progress\.emby-progress::-webkit-progress-value/);
   assert.match(music, /music-app-mark-\$\{preset\.key\}/);
 });
 
@@ -1058,7 +1026,7 @@ test("every bottom-right notification leaves after five seconds", () => {
   );
   assert.match(
     source,
-    /window\.setTimeout\(\(\)\s*=>\s*removeToast\(element\),\s*5_000\)/,
+    /window\.setTimeout\(\s*\(\) => void removeToast\(key, element\),\s*5_000/,
   );
   assert.doesNotMatch(source, /tone === "danger"\s*\?\s*0/);
 });
@@ -1080,8 +1048,11 @@ test("the rail identity is static, the room moves to the top, and the profile re
     session,
     /id="session-profile"[\s\S]*?class="profile-orb profile-action"/,
   );
-  assert.match(session, /type:\s*"participant:rename",\s*nickname/);
-  assert.match(session, /saveNickname\(requested\)/);
+  assert.match(
+    session,
+    /safeSignalSend\(\{ type: "participant:rename", nickname \}\)/,
+  );
+  assert.match(session, /const nextNickname = saveNickname\(/);
 });
 
 test("Bluff opens from the channel-only game center in a sandboxed application view", () => {
@@ -1114,7 +1085,7 @@ test("Bluff opens from the channel-only game center in a sandboxed application v
     game.indexOf("export function embeddedGameRailButtonMarkup"),
     game.indexOf("function setGameStatus"),
   );
-  assert.match(railMarkup, /<svg viewBox="0 0 24 24"/);
+  assert.match(railMarkup, /data-lucide="gamepad-2"/);
   assert.doesNotMatch(railMarkup, /bluffCardMark/);
   assert.doesNotMatch(main, /embeddedGameRailButtonMarkup/);
   assert.match(session, /embeddedGameRailButtonMarkup\(\)/);
@@ -1142,10 +1113,7 @@ test("channel music captures an app, mixes stereo audio, and auto-connects liste
     new URL("../src/channel-session.ts", import.meta.url),
     "utf8",
   );
-  const styles = fs.readFileSync(
-    new URL("../src/styles.css", import.meta.url),
-    "utf8",
-  );
+  const styles = readStyles();
   assert.match(music, /new ProcessAudioCapture\(\)/);
   assert.match(music, /setAccompanimentTrack/);
   assert.match(music, /data-music-more/);
@@ -1159,11 +1127,13 @@ test("channel music captures an app, mixes stereo audio, and auto-connects liste
   );
   assert.match(
     styles,
-    /\.music-source-popover\s*\{[\s\S]*?width:\s*min\(304px,[\s\S]*?backdrop-filter:\s*blur\(30px\)/,
+    /\.music-source-popover\s*\{[\s\S]*?width:\s*min\(340px,/,
   );
+  assert.match(music, /new FloatingSurface\(this\.button, popover/);
+  assert.match(music, /music-source-popover material-regular/);
   assert.match(
     styles,
-    /\.music-help\s*\{[\s\S]*?flex:\s*0 0 19px[\s\S]*?border-radius:\s*50%/,
+    /\.music-help,[\s\S]*?width:\s*var\(--control-min\);[\s\S]*?height:\s*var\(--control-min\)/,
   );
   assert.match(voice, /listenForSharedAudio/);
   assert.match(voice, /direction:\s*"recvonly"/);

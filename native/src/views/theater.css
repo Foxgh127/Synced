@@ -1,0 +1,296 @@
+.session-header {
+  min-height: var(--topbar-h);
+  padding-inline: var(--s-5);
+}
+
+.session-header #session-invite,
+.session-header #leave-room {
+  gap: var(--s-2);
+}
+
+.session-header #session-invite svg,
+.session-header #leave-room svg {
+  width: 18px;
+  height: 18px;
+}
+
+.session-status-line {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: var(--s-3);
+  color: var(--text-tertiary);
+  font-size: var(--t-small);
+}
+
+.session-status-line .hud-track {
+  display: inline-flex;
+  min-height: 36px;
+  align-items: center;
+  gap: var(--s-3);
+  padding-inline: var(--s-3);
+  border-radius: var(--r-full);
+}
+
+.session-status-line #hud-media {
+  min-width: 0;
+  max-width: min(36vw, 460px);
+}
+
+.session-status-line #hud-media-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-status-line .hud-voice-compact {
+  opacity: 0.72;
+}
+
+.session-status-line [data-reconnectable="true"],
+.session-status-line .error {
+  background: var(--warn-bg);
+  color: var(--warn-text);
+}
+
+.session-status-copy {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-secondary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-route-status {
+  display: inline-flex;
+  min-height: 36px;
+  align-items: center;
+  gap: var(--s-3);
+  padding-inline: var(--s-4);
+  border-radius: var(--r-full);
+  color: var(--text-tertiary);
+}
+
+.session-route-status[data-tone="warning"],
+.session-route-status[data-tone="danger"] {
+  border: 1px solid var(--warn);
+  background: var(--warn-bg);
+  color: var(--warn-text);
+}
+
+.viewer-stage {
+  container: theater / size;
+  overflow: hidden;
+  background: var(--video-well);
+}
+
+@media (max-width: 599px) {
+  .session-header {
+    gap: var(--s-2);
+    padding-inline: var(--s-3);
+  }
+
+  .session-header > div:first-child {
+    max-width: min(132px, 34vw);
+  }
+
+  .session-header #hud-signal {
+    width: var(--control-min);
+    min-width: var(--control-min);
+    padding: 0;
+    justify-content: center;
+  }
+
+  .session-header #hud-signal-text,
+  .session-header #session-invite > span,
+  .session-header #leave-room > span {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
+  .session-header #session-invite,
+  .session-header #leave-room {
+    width: var(--control-min);
+    min-width: var(--control-min);
+    height: var(--control-min);
+    padding: 0;
+  }
+}
+
+.ambient-light-field {
+  position: absolute;
+  z-index: var(--z-canvas);
+  inset: -5%;
+  background:
+    radial-gradient(circle at 16% 50%, var(--ambient-left, transparent), transparent 34%),
+    radial-gradient(circle at 84% 50%, var(--ambient-right, transparent), transparent 34%);
+  opacity: var(--ambient-opacity, 0);
+  filter: blur(var(--blur-2fab72a242));
+  pointer-events: none;
+  transition: opacity var(--dur-ambient) var(--ease-out);
+}
+
+.viewer-stage > video,
+.viewer-stage > canvas:not(.ambient-light-field) {
+  position: relative;
+  z-index: var(--z-bbf0bd5a18);
+}
+
+.viewer-stage > .channel-lobby,
+.viewer-stage > .channel-buffering,
+.viewer-stage > .dock,
+.viewer-stage > .progress-rail,
+.viewer-stage > .dock-chat-composer,
+.viewer-stage > .danmaku-layer,
+.viewer-stage > .receiver-stream-badge {
+  z-index: var(--z-6f537aa1fa);
+}
+
+.viewer-stage:fullscreen,
+.viewer-stage.native-android-player {
+  transition: background-color var(--dur-immersive) var(--ease-out);
+}
+
+.dock-chat-composer {
+  transition: none;
+}
+
+.viewer-stage:fullscreen {
+  padding:
+    env(safe-area-inset-top)
+    env(safe-area-inset-right)
+    env(safe-area-inset-bottom)
+    env(safe-area-inset-left);
+}
+
+.diagnostics-drawer {
+  width: min(520px, calc(100vw - 24px));
+  padding: var(--s-7);
+}
+
+.playback-diagnostics-dialog {
+  width: min(580px, calc(100vw - 24px));
+}
+
+.playback-stats-output {
+  display: block;
+  min-height: 74px;
+  padding: var(--s-5);
+  border: 1px solid var(--stroke-subtle);
+  border-radius: var(--r-md);
+  background: var(--surface-1);
+  color: var(--text-secondary);
+  font: var(--t-small) / var(--lh-small) var(--font-mono);
+  white-space: pre-wrap;
+}
+
+.playback-route-details {
+  display: grid;
+  gap: var(--s-3);
+  margin: var(--s-5) 0 0;
+}
+
+.playback-route-details div {
+  display: grid;
+  grid-template-columns: 112px minmax(0, 1fr);
+  gap: var(--s-4);
+  padding-block: var(--s-3);
+  border-bottom: 1px solid var(--stroke-subtle);
+}
+
+.playback-route-details dt {
+  color: var(--text-tertiary);
+}
+
+.playback-route-details dd {
+  margin: 0;
+  color: var(--text-secondary);
+}
+
+.session-connection-progress {
+  position: fixed;
+  z-index: var(--z-smoke);
+  top: 50%;
+  left: 50%;
+  display: grid;
+  width: min(420px, calc(100vw - 32px));
+  justify-items: center;
+  padding: var(--s-9);
+  border-radius: var(--r-xl);
+  box-shadow: var(--e-3);
+  transform: translate(-50%, -50%);
+}
+
+.session-connection-progress::before {
+  position: fixed;
+  z-index: var(--z-7bd5bf990b);
+  background: var(--material-smoke);
+  content: "";
+  inset: -100vh -100vw;
+}
+
+.connection-orbit {
+  width: 42px;
+  height: 42px;
+  margin-bottom: var(--s-5);
+  border: 2px solid var(--stroke-default);
+  border-top-color: var(--accent);
+  border-radius: var(--radius-8ec82c689f);
+  animation: connection-orbit 900ms linear infinite;
+}
+
+.connection-steps {
+  display: grid;
+  width: 100%;
+  gap: var(--s-3);
+  margin: var(--s-6) 0;
+  padding: 0;
+  list-style: none;
+}
+
+.connection-steps li {
+  display: grid;
+  min-height: 36px;
+  grid-template-columns: 24px minmax(0, 1fr);
+  align-items: center;
+  gap: var(--s-4);
+  color: var(--text-tertiary);
+}
+
+.connection-steps li[data-state="active"] {
+  color: var(--text-primary);
+}
+
+.connection-steps li[data-state="complete"] {
+  color: var(--live-text);
+}
+
+.connection-steps svg {
+  width: 18px;
+  height: 18px;
+}
+
+@keyframes connection-orbit {
+  to {
+    transform: rotate(1turn);
+  }
+}
+
+@container theater (max-width: 620px) {
+  .dock-time,
+  .dock-sep,
+  .dock-volume input {
+    display: none;
+  }
+
+  .session-status-line #hud-media {
+    display: none;
+  }
+}

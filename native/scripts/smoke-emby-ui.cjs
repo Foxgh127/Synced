@@ -347,6 +347,7 @@ async function main() {
       const metrics = card?.querySelector(".network-metric-grid");
       const tabs = document.querySelector(".broadcast-mode-tabs");
       const glider = document.querySelector(".broadcast-mode-glider");
+      const advanced = document.querySelector("#broadcast-advanced");
       const cardRect = card?.getBoundingClientRect();
       const panelRect = panel?.getBoundingClientRect();
       const headerRect = header?.getBoundingClientRect();
@@ -362,6 +363,8 @@ async function main() {
         metricCount: metrics?.children.length || 0,
         metricTop: Math.round(metrics?.getBoundingClientRect().top || 0),
         headerBottom: Math.round(headerRect?.bottom || 0),
+        cardInsidePanel: panel?.contains(card) === true,
+        advancedOpen: advanced?.open === true,
         obsoleteGuidanceAbsent:
           !document.querySelector(".hdr-guidance") &&
           !document.querySelector("#hdr-display-summary") &&
@@ -374,8 +377,8 @@ async function main() {
       };
     })()`);
     if (
-      networkLayout.cardTop < networkLayout.panelTop ||
-      networkLayout.cardBottom > networkLayout.panelBottom + 1 ||
+      !networkLayout.cardInsidePanel ||
+      networkLayout.advancedOpen ||
       networkLayout.headerHeight > 64 ||
       networkLayout.headerPaddingTop !== "0px" ||
       networkLayout.metricDisplay !== "grid" ||
@@ -398,6 +401,7 @@ async function main() {
         const panel = document.querySelector("#screen-broadcast-panel");
         const card = document.querySelector("#broadcast-network-card");
         const tabs = document.querySelector(".broadcast-mode-tabs");
+        const advanced = document.querySelector("#broadcast-advanced");
         const dialogRect = dialog?.getBoundingClientRect();
         const panelRect = panel?.getBoundingClientRect();
         const cardRect = card?.getBoundingClientRect();
@@ -414,6 +418,8 @@ async function main() {
           panelTop: panelRect?.top || 0,
           panelBottom: panelRect?.bottom || 0,
           tabsHeight: tabs?.getBoundingClientRect().height || 0,
+          cardInsidePanel: panel?.contains(card) === true,
+          advancedOpen: advanced?.open === true,
         };
       })()`);
     if (
@@ -424,10 +430,9 @@ async function main() {
         compactBroadcastLayout.viewportHeight - 8 ||
       compactBroadcastLayout.panelScrollWidth >
         compactBroadcastLayout.panelClientWidth + 1 ||
-      compactBroadcastLayout.cardTop < compactBroadcastLayout.panelTop ||
-      compactBroadcastLayout.cardBottom >
-        compactBroadcastLayout.panelBottom + 1 ||
-      compactBroadcastLayout.tabsHeight < 66
+      !compactBroadcastLayout.cardInsidePanel ||
+      compactBroadcastLayout.advancedOpen ||
+      compactBroadcastLayout.tabsHeight < 56
     ) {
       throw new Error(
         `compact broadcast dialog overflowed: ${JSON.stringify(compactBroadcastLayout)}`,
@@ -473,7 +478,8 @@ async function main() {
     if (
       endpointLayout.width < 80 ||
       endpointLayout.width > 180 ||
-      endpointLayout.height > 40 ||
+      endpointLayout.height < 43 ||
+      endpointLayout.height > 52 ||
       endpointLayout.scrollWidth > endpointLayout.clientWidth ||
       endpointLayout.whiteSpace !== "nowrap" ||
       endpointLayout.headerPaddingTop !== "0px" ||
@@ -518,7 +524,8 @@ async function main() {
       window,
       `(() => {
         const popup = document.querySelector("#emby-item-popup");
-        return popup?.open === true &&
+        return popup?.hidden === false &&
+          popup?.dataset.presence === "present" &&
           !document.querySelector("#emby-selection-panel") &&
           Boolean(document.querySelector("#emby-selection-panel-popup")) &&
           Boolean(document.querySelector("#emby-start-from-popup")) &&

@@ -1,5 +1,10 @@
 import { SignalClient, type RoomParticipant, type SignalEnvelope } from "./rtc";
 import { isNativeAndroid } from "./immersive";
+import protocolPolicy from "../server/protocol-policy.json";
+import { dialogController } from "./ui/dialog-controller";
+import { FloatingSurface } from "./ui/floating-surface";
+import { hydrateIcons } from "./ui/icons";
+import { animateElement } from "./ui/motion-controller";
 import {
   VoiceMesh,
   type VoiceDevices,
@@ -10,6 +15,8 @@ import {
 } from "./voice";
 
 const CHAT_MAX_LENGTH = 120;
+const MAX_ROOM_PARTICIPANTS = protocolPolicy.maxParticipantsPerRoom;
+const RECENT_EMOJI_KEY = "synced:recent-emojis";
 
 const EMOJI_GROUPS = [
   {
@@ -31,7 +38,12 @@ const EMOJI_GROUPS = [
 ] as const;
 
 function emojiPickerMarkup(): string {
-  return EMOJI_GROUPS.map(
+  return `
+    <section class="emoji-group emoji-recent-group" id="emoji-recent-group" aria-label="最近使用" hidden>
+      <h3>最近</h3>
+      <div class="emoji-grid" id="emoji-recent-grid"></div>
+    </section>
+    ${EMOJI_GROUPS.map(
     ({ label, emojis }) => `
       <section class="emoji-group" aria-label="${label}">
         <h3>${label}</h3>
@@ -44,92 +56,87 @@ function emojiPickerMarkup(): string {
             .join("")}
         </div>
       </section>`,
-  ).join("");
+  ).join("")}`;
 }
 
 export function roomSidebarMarkup(): string {
   return `
-    <aside class="room-sidebar companion-panel glass-b" aria-label="频道成员与聊天">
-      <button class="btn btn-ghost btn-icon panel-toggle" id="panel-toggle"
-              type="button" aria-label="收起成员与弹幕面板" aria-expanded="true"
-              title="收起成员与弹幕面板" data-tooltip="收起成员与弹幕面板">
-        <svg viewBox="0 0 24 24" aria-hidden="true">
-          <path d="m14 7-5 5 5 5"></path>
-        </svg>
-      </button>
-      <section class="chat-card" id="chat-panel" tabindex="-1">
-        <div class="panel-heading compact-heading">
-          <div>
-            <span class="panel-kicker">实时弹幕</span>
-            <h2>弹幕聊天</h2>
-          </div>
-          <span id="danmaku-surface-state" class="danmaku-surface-state" hidden>光影交织，共此时光</span>
+    <button id="companion-scrim" class="companion-scrim" type="button"
+            tabindex="-1" aria-label="关闭频道陪伴面板" hidden></button>
+    <aside class="room-sidebar companion-panel material-regular" aria-label="频道陪伴面板">
+      <header class="companion-header">
+        <div id="companion-sheet-handle" class="companion-sheet-handle" aria-hidden="true">
+          <span></span>
         </div>
+        <div class="companion-tabs" role="tablist" aria-label="频道陪伴内容">
+          <button id="companion-chat-tab" class="companion-tab is-active" type="button"
+                  role="tab" aria-selected="true" aria-controls="chat-panel"
+                  data-selected="true" data-companion-tab="chat">
+            聊天
+          </button>
+          <button id="companion-members-tab" class="companion-tab" type="button"
+                  role="tab" aria-selected="false" aria-controls="member-panel"
+                  data-selected="false" data-companion-tab="members">
+            成员 <span id="member-count" class="member-count-badge tnum">1 / ${MAX_ROOM_PARTICIPANTS}</span>
+          </button>
+        </div>
+        <button class="btn btn-ghost btn-icon panel-toggle" id="panel-toggle"
+                type="button" aria-label="收起频道陪伴面板" aria-expanded="true"
+                title="收起频道陪伴面板" data-tooltip="收起频道陪伴面板">
+          <i data-lucide="x"></i>
+        </button>
+      </header>
+      <div class="companion-content">
+      <section class="chat-card companion-tab-panel" id="chat-panel" role="tabpanel"
+               aria-labelledby="companion-chat-tab" tabindex="-1">
+        <span id="danmaku-surface-state" class="danmaku-surface-state" hidden>光影交织，共此时光</span>
         <div class="chat-log-shell">
           <div id="chat-log" class="chat-log" role="log" aria-live="polite"></div>
           <button id="chat-jump-latest" class="chat-jump-latest chat-unread-badge" type="button" hidden>
-            ↓ 回到最新 <span id="chat-unread-count"></span>
+            <i data-lucide="arrow-down"></i>回到最新 <span id="chat-unread-count"></span>
           </button>
         </div>
         <form id="chat-form" class="chat-form">
-          <div id="chat-emoji-panel" class="chat-emoji-panel" hidden role="dialog" aria-label="表情选择">
+          <div id="chat-emoji-panel" class="chat-emoji-panel material-regular" hidden role="dialog" aria-label="表情选择">
             <header class="emoji-panel-header">
               <strong>选一个心情</strong>
-              <span>光影里的小小回应</span>
+              <span>最近使用会留在最前面</span>
             </header>
             <div class="emoji-groups">${emojiPickerMarkup()}</div>
           </div>
           <input id="chat-input" maxlength="${CHAT_MAX_LENGTH}" autocomplete="off" placeholder="发送弹幕…" aria-label="弹幕内容" />
           <button id="chat-emoji-toggle" class="chat-emoji-btn" type="button" aria-label="打开表情菜单" aria-controls="chat-emoji-panel" aria-expanded="false">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
-              <circle cx="12" cy="12" r="9"/>
-              <path d="M8.5 14.5s1 2 3.5 2 3.5-2 3.5-2"/>
-              <circle cx="9.5" cy="10.5" r="0.8" fill="currentColor"/>
-              <circle cx="14.5" cy="10.5" r="0.8" fill="currentColor"/>
-            </svg>
+            <i data-lucide="smile"></i>
           </button>
-          <button type="submit" class="chat-send-btn" aria-label="发送弹幕">发送</button>
+          <button type="submit" class="chat-send-btn" aria-label="发送弹幕"><i data-lucide="send"></i><span>发送</span></button>
         </form>
       </section>
-      <section class="voice-card" id="member-panel" tabindex="-1">
-        <div class="voice-card-header">
-          <div class="voice-card-title">
-            <span class="voice-status-dot" id="voice-status-dot"></span>
-            <h2>连麦频道</h2>
-          </div>
-          <div class="voice-card-meta">
-            <span id="member-count" class="member-count-badge tnum">1 / 5</span>
-            <button id="voice-settings-toggle" class="voice-settings-btn" type="button"
-                    aria-label="连麦设置" aria-expanded="false" title="连麦设置">
-              <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
-                <circle cx="10" cy="10" r="3" stroke="currentColor" stroke-width="1.5"/>
-                <path d="M10 2v2M10 16v2M2 10h2M16 10h2M4.1 4.1l1.4 1.4M14.5 14.5l1.4 1.4M14.5 4.1l-1.4 1.4M4.1 14.5l1.4 1.4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-              </svg>
-            </button>
-          </div>
-        </div>
+      <section class="voice-card companion-tab-panel" id="member-panel" role="tabpanel"
+               aria-labelledby="companion-members-tab" tabindex="-1" hidden>
         <div id="participant-list" class="participant-list"></div>
+      </section>
+      </div>
+      <footer class="voice-control-bar" aria-label="连麦控制">
+        <span class="voice-status-dot" id="voice-status-dot" aria-hidden="true"></span>
         <div class="voice-join-area">
           <button id="voice-button" class="voice-join-btn" type="button">
             <span class="voice-join-icon">
-              <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                <rect x="8" y="3" width="8" height="12" rx="4" stroke="currentColor" stroke-width="2"/>
-                <path d="M5 11a7 7 0 0 0 14 0M12 18v3M8.5 21h7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-              </svg>
+              <i data-lucide="mic"></i>
             </span>
             <span class="voice-join-label">加入连麦</span>
           </button>
           <button id="mute-button" class="mute-btn" type="button" disabled aria-label="静音">
-            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
-              <rect x="9" y="2" width="6" height="11" rx="3" stroke="currentColor" stroke-width="1.8"/>
-              <path d="M5 10a7 7 0 0 0 14 0" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
-              <line x1="12" y1="17" x2="12" y2="21" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
-              <line x1="9" y1="21" x2="15" y2="21" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
-              <line x1="4" y1="4" x2="20" y2="20" stroke="currentColor" stroke-width="2" stroke-linecap="round" class="mute-slash"/>
-            </svg>
+            <i data-lucide="mic-off"></i>
+          </button>
+          <button id="voice-settings-toggle" class="voice-settings-btn" type="button"
+                  aria-label="打开连麦设备设置" aria-expanded="false"
+                  aria-controls="voice-device-panel" title="设备">
+            <i data-lucide="settings"></i><span>设备</span>
           </button>
         </div>
-        <div id="voice-device-panel" class="voice-device-panel">
+        <div id="voice-device-panel" class="voice-device-panel material-regular" hidden
+             role="dialog" aria-label="连麦设备设置">
+          <header><strong>连麦设备</strong><small>更改只影响本次连麦</small></header>
           <label>
             <span>麦克风</span>
             <select id="voice-input-device" aria-label="选择麦克风">
@@ -154,9 +161,14 @@ export function roomSidebarMarkup(): string {
             <span>连麦音量 <b id="voice-volume-value">100%</b></span>
             <input id="voice-volume" type="range" min="0" max="200" value="100" aria-label="连麦总播放音量" />
           </label>
-          <button id="refresh-voice-devices" class="device-refresh-button" type="button">↻ 刷新设备</button>
+          <div class="voice-device-actions">
+            <button id="test-voice-input" class="ghost-button" type="button">测试麦克风</button>
+            <button id="refresh-voice-devices" class="device-refresh-button" type="button">
+              <i data-lucide="refresh-cw"></i>刷新设备
+            </button>
+          </div>
         </div>
-      </section>
+      </footer>
       <div id="voice-audio" hidden></div>
       <!-- #voice-quality is read by smoke tests to verify noise-suppression state; keep hidden -->
       <p id="voice-quality" class="voice-quality" hidden aria-hidden="true"></p>
@@ -167,10 +179,14 @@ export function roomSidebarMarkup(): string {
 export class RoomCompanion {
   private readonly participants = new Map<string, RoomParticipant>();
   private readonly speakingParticipants = new Set<string>();
+  private readonly speakingLevels = new Map<string, number>();
   private readonly sharedAudioSenders = new Set<string>();
   private expandedParticipantId?: string;
   private readonly voice: VoiceMesh;
   private readonly uiAbortController = new AbortController();
+  private emojiSurface?: FloatingSurface;
+  private deviceSurface?: FloatingSurface;
+  private microphoneTestAbort?: AbortController;
   private destroyed = false;
   private deviceRefreshSequence = 0;
   private chatUnreadCount = 0;
@@ -212,13 +228,17 @@ export class RoomCompanion {
       !participant?.microphoneDisabled;
     if (speaking) {
       this.speakingParticipants.add(detail.participantId);
+      this.speakingLevels.set(detail.participantId, detail.level);
     } else {
       this.speakingParticipants.delete(detail.participantId);
+      this.speakingLevels.delete(detail.participantId);
     }
     this.applyParticipantSpeaking(
       detail.participantId,
       speaking,
+      detail.level,
     );
+    this.reportParticipantVisualState();
   };
 
   constructor(
@@ -235,6 +255,10 @@ export class RoomCompanion {
     private readonly onVoiceActiveChange?: (
       active: boolean,
       count: number,
+    ) => void,
+    private readonly onParticipantVisualStateChange?: (
+      participants: RoomParticipant[],
+      speakingLevels: ReadonlyMap<string, number>,
     ) => void,
   ) {
     for (const participant of initialParticipants) {
@@ -285,6 +309,7 @@ export class RoomCompanion {
         await this.voice.stopSharedAudioListener();
       }
       this.speakingParticipants.delete(message.participantId);
+      this.speakingLevels.delete(message.participantId);
       if (this.expandedParticipantId === message.participantId) {
         this.expandedParticipantId = undefined;
       }
@@ -327,6 +352,7 @@ export class RoomCompanion {
         message.participant.microphoneDisabled
       ) {
         this.speakingParticipants.delete(message.participant.id);
+        this.speakingLevels.delete(message.participant.id);
       }
       if (message.participant.id === this.selfId) {
         this.voice.setMicrophoneDisabled(
@@ -355,6 +381,7 @@ export class RoomCompanion {
     }
     if (message.type === "voice:left" && message.participantId) {
       this.speakingParticipants.delete(message.participantId);
+      this.speakingLevels.delete(message.participantId);
       const participant = this.participants.get(message.participantId);
       if (participant) {
         participant.voiceActive = false;
@@ -391,6 +418,7 @@ export class RoomCompanion {
     for (const participantId of [...this.speakingParticipants]) {
       if (!this.participants.has(participantId)) {
         this.speakingParticipants.delete(participantId);
+        this.speakingLevels.delete(participantId);
       }
     }
     const self = this.participants.get(this.selfId);
@@ -423,6 +451,9 @@ export class RoomCompanion {
     }
     this.destroyed = true;
     this.uiAbortController.abort();
+    this.emojiSurface?.destroy();
+    this.deviceSurface?.destroy();
+    this.microphoneTestAbort?.abort();
     this.voice.removeEventListener(
       "statechange",
       this.handleVoiceStateChange,
@@ -524,25 +555,86 @@ export class RoomCompanion {
         },
         listenerOptions,
       );
-    // Emoji panel toggle
-    const emojiToggle = document.querySelector<HTMLButtonElement>("#chat-emoji-toggle");
-    const emojiPanel = document.querySelector<HTMLDivElement>("#chat-emoji-panel");
-    const chatInput = document.querySelector<HTMLInputElement>("#chat-input");
-    const setEmojiPanelOpen = (open: boolean): void => {
-      if (!emojiPanel) return;
-      emojiPanel.hidden = !open;
-      emojiToggle?.setAttribute("aria-expanded", String(open));
-      emojiToggle?.setAttribute(
-        "aria-label",
-        open ? "关闭表情菜单" : "打开表情菜单",
-      );
+    const tabButtons = [
+      ...document.querySelectorAll<HTMLButtonElement>("[data-companion-tab]"),
+    ];
+    const setCompanionTab = (tab: "chat" | "members"): void => {
+      for (const button of tabButtons) {
+        const selected = button.dataset.companionTab === tab;
+        button.classList.toggle("is-active", selected);
+        button.setAttribute("aria-selected", String(selected));
+        button.dataset.selected = String(selected);
+        button.tabIndex = selected ? 0 : -1;
+      }
+      const chatPanel = document.querySelector<HTMLElement>("#chat-panel");
+      const memberPanel =
+        document.querySelector<HTMLElement>("#member-panel");
+      if (chatPanel) chatPanel.hidden = tab !== "chat";
+      if (memberPanel) memberPanel.hidden = tab !== "members";
+      if (tab === "chat") {
+        queueMicrotask(() => {
+          if (chatLog && this.isChatNearBottom(chatLog)) {
+            chatLog.scrollTop = chatLog.scrollHeight;
+            this.clearChatUnread();
+          }
+        });
+      }
     };
-    emojiToggle?.addEventListener("click", (event) => {
-      event.stopPropagation();
-      setEmojiPanelOpen(Boolean(emojiPanel?.hidden));
-    }, listenerOptions);
+    for (const button of tabButtons) {
+      button.addEventListener(
+        "click",
+        () =>
+          setCompanionTab(
+            button.dataset.companionTab === "members"
+              ? "members"
+              : "chat",
+          ),
+        listenerOptions,
+      );
+      button.addEventListener(
+        "keydown",
+        (event) => {
+          if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
+            return;
+          }
+          event.preventDefault();
+          const next =
+            event.key === "ArrowRight" || event.key === "End"
+              ? tabButtons.at(-1)
+              : tabButtons[0];
+          next?.click();
+          next?.focus();
+        },
+        listenerOptions,
+      );
+    }
+    document.addEventListener(
+      "synced:companion-tab",
+      (event) => {
+        const tab = (event as CustomEvent<"chat" | "members">).detail;
+        setCompanionTab(tab === "members" ? "members" : "chat");
+      },
+      listenerOptions,
+    );
+
+    const emojiToggle =
+      document.querySelector<HTMLButtonElement>("#chat-emoji-toggle");
+    const emojiPanel =
+      document.querySelector<HTMLDivElement>("#chat-emoji-panel");
+    const chatInput = document.querySelector<HTMLInputElement>("#chat-input");
+    this.renderRecentEmojis();
+    if (emojiToggle && emojiPanel) {
+      this.emojiSurface = new FloatingSurface(emojiToggle, emojiPanel, {
+        placement: "top-end",
+        closeOnOutside: true,
+      });
+      emojiToggle.addEventListener(
+        "click",
+        () => void this.emojiSurface?.toggle(),
+        listenerOptions,
+      );
+    }
     emojiPanel?.addEventListener("click", (event) => {
-      event.stopPropagation();
       const btn = (event.target as HTMLElement).closest<HTMLButtonElement>(".emoji-item");
       if (!btn || !chatInput) return;
       const emoji = btn.dataset.emoji ?? "";
@@ -562,33 +654,24 @@ export class RoomCompanion {
       const nextPosition = selectionStart + emoji.length;
       chatInput.setSelectionRange(nextPosition, nextPosition);
       chatInput.focus();
-      setEmojiPanelOpen(false);
+      this.rememberEmoji(emoji);
+      void this.emojiSurface?.close();
     }, listenerOptions);
-    // Close emoji panel when clicking outside
-    document.addEventListener("click", (event) => {
-      if (!emojiPanel || emojiPanel.hidden) return;
-      const target = event.target as Node;
-      if (!emojiPanel.contains(target) && !emojiToggle?.contains(target)) {
-        setEmojiPanelOpen(false);
-      }
-    }, listenerOptions);
-    document.addEventListener("keydown", (event) => {
-      if (event.key === "Escape" && emojiPanel && !emojiPanel.hidden) {
-        setEmojiPanelOpen(false);
-        emojiToggle?.focus();
-      }
-    }, listenerOptions);
-    document
-      .querySelector("#voice-settings-toggle")
-      ?.addEventListener("click", () => {
-        const panel = document.querySelector<HTMLElement>("#voice-device-panel");
-        const btn = document.querySelector<HTMLButtonElement>("#voice-settings-toggle");
-        if (!panel || !btn) return;
-        const open = panel.classList.contains("voice-settings-visible");
-        panel.classList.toggle("voice-settings-visible", !open);
-        btn.setAttribute("aria-expanded", String(!open));
-        btn.classList.toggle("active", !open);
-      }, listenerOptions);
+    const deviceButton =
+      document.querySelector<HTMLButtonElement>("#voice-settings-toggle");
+    const devicePanel =
+      document.querySelector<HTMLElement>("#voice-device-panel");
+    if (deviceButton && devicePanel) {
+      this.deviceSurface = new FloatingSurface(deviceButton, devicePanel, {
+        placement: "top-end",
+        closeOnOutside: true,
+      });
+      deviceButton.addEventListener(
+        "click",
+        () => void this.deviceSurface?.toggle(),
+        listenerOptions,
+      );
+    }
     document
       .querySelector("#voice-button")
       ?.addEventListener(
@@ -720,7 +803,7 @@ export class RoomCompanion {
       .querySelector("#participant-list")
       ?.addEventListener(
         "click",
-        (event) => this.handleParticipantClick(event),
+        (event) => void this.handleParticipantClick(event),
         listenerOptions,
       );
     document
@@ -751,6 +834,13 @@ export class RoomCompanion {
       ?.addEventListener(
         "click",
         () => void this.refreshVoiceDevices(true),
+        listenerOptions,
+      );
+    document
+      .querySelector("#test-voice-input")
+      ?.addEventListener(
+        "click",
+        () => void this.testMicrophone(),
         listenerOptions,
       );
     document
@@ -796,6 +886,7 @@ export class RoomCompanion {
       this.participants.get(this.selfId)?.role === "host";
     for (const participant of sorted) {
       const speaking = this.speakingParticipants.has(participant.id);
+      const speakingLevel = this.speakingLevels.get(participant.id) || 0;
       const canAdjustVolume =
         participant.id !== this.selfId && participant.voiceActive;
       const canModerate =
@@ -848,7 +939,7 @@ export class RoomCompanion {
         if (canExpand) {
           const chevron = document.createElement("span");
           chevron.className = "participant-chevron";
-          chevron.textContent = "⌄";
+          chevron.innerHTML = '<i data-lucide="chevron-down"></i>';
           chevron.setAttribute("aria-hidden", "true");
           summary.append(chevron);
         }
@@ -904,21 +995,34 @@ export class RoomCompanion {
           }
           row.append(controls);
         }
+        hydrateIcons(row);
         if (previousRow) {
           if (insertionPoint === previousRow) {
             insertionPoint = row;
           }
           previousRow.replaceWith(row);
         } else {
-          row.classList.add("is-entering");
-          row.addEventListener(
-            "animationend",
-            () => row?.classList.remove("is-entering"),
-            { once: true },
+          void animateElement(
+            row,
+            [
+              { opacity: 0, transform: "translateY(6px)" },
+              { opacity: 1, transform: "none" },
+            ],
+            {
+              kind: "control",
+              id: `participant-${participant.id}`,
+              signal: this.uiAbortController.signal,
+            },
           );
         }
       }
-      this.updateParticipantRowState(row, participant, speaking, expanded);
+      this.updateParticipantRowState(
+        row,
+        participant,
+        speaking,
+        expanded,
+        speakingLevel,
+      );
       if (row !== insertionPoint) {
         list.insertBefore(row, insertionPoint);
       }
@@ -930,8 +1034,9 @@ export class RoomCompanion {
     }
     const count = document.querySelector<HTMLElement>("#member-count");
     if (count) {
-      count.textContent = `${sorted.length} / 5`;
+      count.textContent = `${sorted.length} / ${MAX_ROOM_PARTICIPANTS}`;
     }
+    this.reportParticipantVisualState();
   }
 
   private participantMicMarkup(
@@ -941,15 +1046,32 @@ export class RoomCompanion {
     active: boolean,
   ): string {
     if (speaking) {
-      return `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="1" width="6" height="9" rx="3"/><path d="M2.5 7a5.5 5.5 0 0 0 11 0M8 12.5v2M5.5 14.5h5"/></svg>`;
+      return `<i data-lucide="mic"></i>`;
     }
     if (disabled || muted) {
-      return `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="1" width="6" height="9" rx="3"/><path d="M2.5 7a5.5 5.5 0 0 0 11 0M8 12.5v2M5.5 14.5h5"/><line x1="2.5" y1="2.5" x2="13.5" y2="13.5"/></svg>`;
+      return `<i data-lucide="mic-off"></i>`;
     }
     if (active) {
-      return `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" opacity="0.45"><rect x="5" y="1" width="6" height="9" rx="3"/><path d="M2.5 7a5.5 5.5 0 0 0 11 0M8 12.5v2M5.5 14.5h5"/></svg>`;
+      return `<i data-lucide="mic"></i>`;
     }
     return "";
+  }
+
+  private speakingLevelName(
+    speaking: boolean,
+    level: number,
+  ): "off" | "low" | "medium" | "high" {
+    if (!speaking) return "off";
+    if (level >= 0.16) return "high";
+    if (level >= 0.07) return "medium";
+    return "low";
+  }
+
+  private reportParticipantVisualState(): void {
+    this.onParticipantVisualStateChange?.(
+      [...this.participants.values()],
+      new Map(this.speakingLevels),
+    );
   }
 
   private updateParticipantRowState(
@@ -957,9 +1079,14 @@ export class RoomCompanion {
     participant: RoomParticipant,
     speaking: boolean,
     expanded: boolean,
+    speakingLevel = 0,
   ): void {
     row.classList.toggle("is-speaking", speaking);
     row.classList.toggle("is-expanded", expanded);
+    row.dataset.speakingLevel = this.speakingLevelName(
+      speaking,
+      speakingLevel,
+    );
     const avatar = row.querySelector<HTMLElement>(".participant-avatar");
     if (avatar) {
       avatar.classList.toggle("voice-ready", participant.voiceActive);
@@ -997,7 +1124,18 @@ export class RoomCompanion {
         Boolean(participant.microphoneMuted),
         participant.voiceActive,
       );
-      if (mic.innerHTML !== markup) mic.innerHTML = markup;
+      const iconState = speaking
+        ? "speaking"
+        : muted
+          ? "muted"
+          : participant.voiceActive
+            ? "active"
+            : "off";
+      if (mic.dataset.iconState !== iconState) {
+        mic.dataset.iconState = iconState;
+        mic.innerHTML = markup;
+        hydrateIcons(mic);
+      }
       mic.title = speaking
         ? `${participant.nickname} 正在说话`
         : participant.microphoneDisabled
@@ -1031,7 +1169,7 @@ export class RoomCompanion {
     }
   }
 
-  private handleParticipantClick(event: Event): void {
+  private async handleParticipantClick(event: Event): Promise<void> {
     const target = event.target;
     if (!(target instanceof Element)) return;
     const moderation = target.closest<HTMLButtonElement>(
@@ -1044,7 +1182,7 @@ export class RoomCompanion {
       const action = moderation.dataset.moderationAction;
       if (
         action === "kick" &&
-        !window.confirm(`确定将“${participant.nickname}”移出频道吗？`)
+        !(await this.confirmKick(participant))
       ) {
         return;
       }
@@ -1088,6 +1226,85 @@ export class RoomCompanion {
     this.renderParticipants();
   }
 
+  private async confirmKick(
+    participant: RoomParticipant,
+  ): Promise<boolean> {
+    const dialog = document.createElement("dialog");
+    dialog.className = "dialog dialog-confirm moderation-confirm-dialog";
+    dialog.innerHTML = `
+      <div class="dialog-header">
+        <div>
+          <span class="eyebrow">成员管理</span>
+          <h2>移出 ${this.escapeHtml(participant.nickname)}？</h2>
+        </div>
+        <button class="btn btn-ghost btn-icon" type="button"
+                data-moderation-cancel aria-label="关闭">
+          <i data-lucide="x"></i>
+        </button>
+      </div>
+      <p>对方会立即离开频道；之后仍可使用邀请再次加入。</p>
+      <div class="dialog-actions">
+        <button class="btn btn-secondary" type="button"
+                data-moderation-cancel>取消</button>
+        <button class="btn btn-danger" type="button"
+                data-moderation-confirm>移出频道</button>
+      </div>
+    `;
+    hydrateIcons(dialog);
+    document.body.append(dialog);
+    let accepted = false;
+    const result = new Promise<boolean>((resolve) => {
+      dialog.addEventListener(
+        "close",
+        () => {
+          resolve(accepted);
+          queueMicrotask(() => dialog.remove());
+        },
+        { once: true },
+      );
+      dialog
+        .querySelectorAll<HTMLButtonElement>("[data-moderation-cancel]")
+        .forEach((button) => {
+          button.addEventListener(
+            "click",
+            () => void dialogController.close(dialog),
+            { once: true },
+          );
+        });
+      dialog
+        .querySelector<HTMLButtonElement>("[data-moderation-confirm]")
+        ?.addEventListener(
+          "click",
+          () => {
+            accepted = true;
+            void dialogController.close(dialog);
+          },
+          { once: true },
+        );
+    });
+    await dialogController.open(
+      dialog,
+      document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : undefined,
+    );
+    return result;
+  }
+
+  private escapeHtml(value: string): string {
+    return value.replace(
+      /[&<>"']/g,
+      (char) =>
+        ({
+          "&": "&amp;",
+          "<": "&lt;",
+          ">": "&gt;",
+          '"': "&quot;",
+          "'": "&#039;",
+        })[char] || char,
+    );
+  }
+
   private participantSubtitle(
     participant: RoomParticipant,
     speaking: boolean,
@@ -1118,6 +1335,7 @@ export class RoomCompanion {
   private applyParticipantSpeaking(
     participantId: string,
     speaking: boolean,
+    speakingLevel = 0,
   ): void {
     const participant = this.participants.get(participantId);
     const row = document.querySelector<HTMLElement>(
@@ -1128,6 +1346,10 @@ export class RoomCompanion {
       return;
     }
     row.classList.toggle("is-speaking", speaking);
+    row.dataset.speakingLevel = this.speakingLevelName(
+      speaking,
+      speakingLevel,
+    );
     row
       .querySelector(".participant-avatar")
       ?.classList.toggle("is-speaking", speaking);
@@ -1140,14 +1362,22 @@ export class RoomCompanion {
       mic.classList.toggle("is-speaking", speaking);
       const isMuted = Boolean(participant.microphoneDisabled || participant.microphoneMuted);
       mic.classList.toggle("muted", isMuted);
-      if (speaking) {
-        mic.innerHTML = `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="1" width="6" height="9" rx="3"/><path d="M2.5 7a5.5 5.5 0 0 0 11 0M8 12.5v2M5.5 14.5h5"/></svg>`;
-      } else if (isMuted) {
-        mic.innerHTML = `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="1" width="6" height="9" rx="3"/><path d="M2.5 7a5.5 5.5 0 0 0 11 0M8 12.5v2M5.5 14.5h5"/><line x1="2.5" y1="2.5" x2="13.5" y2="13.5"/></svg>`;
-      } else if (participant.voiceActive) {
-        mic.innerHTML = `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" opacity="0.45"><rect x="5" y="1" width="6" height="9" rx="3"/><path d="M2.5 7a5.5 5.5 0 0 0 11 0M8 12.5v2M5.5 14.5h5"/></svg>`;
-      } else {
-        mic.innerHTML = "";
+      const iconState = speaking
+        ? "speaking"
+        : isMuted
+          ? "muted"
+          : participant.voiceActive
+            ? "active"
+            : "off";
+      if (mic.dataset.iconState !== iconState) {
+        mic.dataset.iconState = iconState;
+        mic.innerHTML = this.participantMicMarkup(
+          speaking,
+          Boolean(participant.microphoneDisabled),
+          Boolean(participant.microphoneMuted),
+          participant.voiceActive,
+        );
+        hydrateIcons(mic);
       }
       mic.title = speaking
         ? `${participant.nickname} 正在说话`
@@ -1389,6 +1619,133 @@ export class RoomCompanion {
     }
   }
 
+  private recentEmojis(): string[] {
+    try {
+      const stored = JSON.parse(
+        localStorage.getItem(RECENT_EMOJI_KEY) || "[]",
+      );
+      return Array.isArray(stored)
+        ? stored
+            .map((value) => String(value))
+            .filter(Boolean)
+            .slice(0, 12)
+        : [];
+    } catch {
+      return [];
+    }
+  }
+
+  private rememberEmoji(emoji: string): void {
+    if (!emoji) return;
+    const recent = [
+      emoji,
+      ...this.recentEmojis().filter((value) => value !== emoji),
+    ].slice(0, 12);
+    localStorage.setItem(RECENT_EMOJI_KEY, JSON.stringify(recent));
+    this.renderRecentEmojis();
+  }
+
+  private renderRecentEmojis(): void {
+    const group =
+      document.querySelector<HTMLElement>("#emoji-recent-group");
+    const grid = document.querySelector<HTMLElement>("#emoji-recent-grid");
+    if (!group || !grid) return;
+    const recent = this.recentEmojis();
+    group.hidden = recent.length === 0;
+    grid.replaceChildren(
+      ...recent.map((emoji) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "emoji-item";
+        button.dataset.emoji = emoji;
+        button.setAttribute("aria-label", emoji);
+        button.textContent = emoji;
+        return button;
+      }),
+    );
+  }
+
+  private async testMicrophone(): Promise<void> {
+    this.microphoneTestAbort?.abort();
+    const controller = new AbortController();
+    this.microphoneTestAbort = controller;
+    const button =
+      document.querySelector<HTMLButtonElement>("#test-voice-input");
+    const selectedDevice =
+      document.querySelector<HTMLSelectElement>("#voice-input-device")
+        ?.value || "default";
+    if (button) {
+      button.disabled = true;
+      button.setAttribute("aria-busy", "true");
+      button.textContent = "正在监听…";
+    }
+    let stream: MediaStream | undefined;
+    let context: AudioContext | undefined;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+          ...(selectedDevice !== "default"
+            ? { deviceId: { exact: selectedDevice } }
+            : {}),
+        },
+        video: false,
+      });
+      if (controller.signal.aborted) return;
+      context = new AudioContext();
+      const source = context.createMediaStreamSource(stream);
+      const analyser = context.createAnalyser();
+      analyser.fftSize = 512;
+      source.connect(analyser);
+      const samples = new Float32Array(analyser.fftSize);
+      const startedAt = performance.now();
+      await new Promise<void>((resolve) => {
+        const finish = (): void => resolve();
+        controller.signal.addEventListener("abort", finish, { once: true });
+        const sample = (): void => {
+          if (
+            controller.signal.aborted ||
+            performance.now() - startedAt >= 4_000
+          ) {
+            finish();
+            return;
+          }
+          analyser.getFloatTimeDomainData(samples);
+          let sum = 0;
+          for (const value of samples) sum += value * value;
+          const level = Math.min(1, Math.sqrt(sum / samples.length) * 8);
+          button?.style.setProperty("--mic-test-level", String(level));
+          requestAnimationFrame(sample);
+        };
+        requestAnimationFrame(sample);
+      });
+      if (!controller.signal.aborted) {
+        this.notify("麦克风测试完成");
+      }
+    } catch (error) {
+      if (!controller.signal.aborted) {
+        this.notify(
+          error instanceof Error ? error.message : "无法测试麦克风",
+          true,
+        );
+      }
+    } finally {
+      stream?.getTracks().forEach((track) => track.stop());
+      await context?.close().catch(() => undefined);
+      if (button?.isConnected) {
+        button.disabled = false;
+        button.removeAttribute("aria-busy");
+        button.style.removeProperty("--mic-test-level");
+        button.textContent = "测试麦克风";
+      }
+      if (this.microphoneTestAbort === controller) {
+        this.microphoneTestAbort = undefined;
+      }
+    }
+  }
+
   private appendChat(
     nickname: string,
     text: string,
@@ -1401,17 +1758,31 @@ export class RoomCompanion {
     }
     const shouldFollowLatest = this.isChatNearBottom(log);
     log.querySelector(".chat-placeholder")?.remove();
-    const row = document.createElement("div");
-    row.className = `chat-message ${mine ? "mine" : ""}`;
-    const author = document.createElement("strong");
-    author.textContent = mine ? "我" : nickname;
-    const content = document.createElement("span");
-    content.textContent = text;
-    const timestamp = document.createElement("time");
     const timestampValue =
       Number.isFinite(sentAt) && Number(sentAt) > 0
         ? Number(sentAt)
         : Date.now();
+    const previous =
+      log.lastElementChild instanceof HTMLElement
+        ? log.lastElementChild
+        : undefined;
+    const grouped = Boolean(
+      previous?.matches(".chat-message") &&
+        previous.dataset.author === nickname &&
+        previous.classList.contains("mine") === mine &&
+        timestampValue - Number(previous.dataset.sentAt || 0) <= 5 * 60_000,
+    );
+    const row = document.createElement("div");
+    row.className =
+      `chat-message ${mine ? "mine" : ""}${grouped ? " is-grouped" : ""}`;
+    row.dataset.author = nickname;
+    row.dataset.sentAt = String(timestampValue);
+    const author = document.createElement("strong");
+    author.textContent = mine ? "我" : nickname;
+    if (grouped) author.classList.add("sr-only");
+    const content = document.createElement("span");
+    content.textContent = text;
+    const timestamp = document.createElement("time");
     const date = new Date(timestampValue);
     timestamp.className = "chat-timestamp";
     timestamp.dateTime = date.toISOString();
@@ -1423,6 +1794,18 @@ export class RoomCompanion {
     timestamp.title = date.toLocaleString("zh-CN", { hour12: false });
     row.append(author, content, timestamp);
     log.append(row);
+    void animateElement(
+      row,
+      [
+        { opacity: 0, transform: "translateY(5px)" },
+        { opacity: 1, transform: "none" },
+      ],
+      {
+        kind: "control",
+        id: "chat-message",
+        signal: this.uiAbortController.signal,
+      },
+    );
     while (log.querySelectorAll(".chat-message").length > 500) {
       log.firstElementChild?.remove();
     }

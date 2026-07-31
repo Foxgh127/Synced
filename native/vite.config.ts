@@ -14,6 +14,11 @@ function readProjectFile(relativePath: string): string {
   );
 }
 
+const APP_VERSION = String(
+  (JSON.parse(readProjectFile("./package.json")) as { version?: unknown })
+    .version || "0.0.0",
+);
+
 function bundledAudioWorklets(): Plugin {
   const deepFilterModule = readProjectFile(
     "./node_modules/deepfilternet3-noise-filter/dist/index.esm.js",
@@ -144,6 +149,9 @@ function bundledAudioWorklets(): Plugin {
 
 export default defineConfig({
   base: "./",
+  define: {
+    __APP_VERSION__: JSON.stringify(APP_VERSION),
+  },
   plugins: [bundledAudioWorklets()],
   optimizeDeps: {
     // The transform above replaces the dependency's blob: AudioWorklet loader
@@ -160,6 +168,24 @@ export default defineConfig({
     outDir: "dist-renderer",
     emptyOutDir: true,
     target: "chrome120",
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          const normalized = id.replaceAll("\\", "/");
+          if (normalized.includes("/node_modules/livekit-client/")) {
+            return "vendor-livekit";
+          }
+          if (
+            normalized.includes(
+              "/node_modules/deepfilternet3-noise-filter/",
+            )
+          ) {
+            return "vendor-deepfilter";
+          }
+          return undefined;
+        },
+      },
+    },
   },
   server: {
     host: "127.0.0.1",

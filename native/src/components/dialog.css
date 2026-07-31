@@ -1,0 +1,66 @@
+dialog {
+  max-width: calc(100vw - 32px);
+  max-height: calc(100dvh - 32px);
+  padding: 0;
+  border: 1px solid var(--stroke-glass);
+  border-radius: var(--r-xl);
+  background:
+    var(--glass-shine),
+    var(--palette-38c1733332);
+  color: var(--text-primary);
+  box-shadow: var(--e-3);
+  opacity: 0;
+  transform: translateY(10px) scale(0.985);
+}
+
+dialog::backdrop {
+  background: var(--material-smoke);
+  opacity: 0;
+}
+
+dialog[open] {
+  opacity: 1;
+  transform: none;
+}
+
+dialog[data-presence="entering"]::backdrop {
+  animation: smoke-enter var(--dur-control) var(--ease-out) both;
+}
+
+dialog[data-presence="leaving"] {
+  display: block;
+  pointer-events: none;
+}
+
+dialog[data-presence="leaving"]::backdrop {
+  animation: smoke-exit calc(var(--dur-control) * 0.7) var(--ease-in) both;
+}
+
+.dialog-shell,
+dialog > :is(header, section, form, footer) {
+  position: relative;
+}
+
+.dialog-header,
+dialog > header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--s-6);
+}
+
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--s-4);
+}
+
+@keyframes smoke-enter {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes smoke-exit {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}

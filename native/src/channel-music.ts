@@ -1,5 +1,7 @@
 import { ProcessAudioCapture } from "./process-audio";
 import type { RoomCompanion } from "./room-companion";
+import { FloatingSurface } from "./ui/floating-surface";
+import { hydrateIcons } from "./ui/icons";
 
 type Notify = (
   message: string,
@@ -48,23 +50,6 @@ const MUSIC_PRESETS: MusicPreset[] = [
 ];
 
 const MUSIC_SOURCE_CACHE_MS = 5_000;
-
-function waitForPopoverPaint(): Promise<void> {
-  return new Promise((resolve) => {
-    let settled = false;
-    let fallbackTimer = 0;
-    const finish = () => {
-      if (settled) return;
-      settled = true;
-      window.clearTimeout(fallbackTimer);
-      resolve();
-    };
-    fallbackTimer = window.setTimeout(finish, 80);
-    window.requestAnimationFrame(() => {
-      window.setTimeout(finish, 0);
-    });
-  });
-}
 
 function escapeHtml(value: string): string {
   return value
@@ -119,11 +104,7 @@ export function channelMusicRailButtonMarkup(): string {
       aria-haspopup="dialog"
       aria-expanded="false"
     >
-      <svg viewBox="0 0 24 24" aria-hidden="true">
-        <path d="M9 18V5l10-2v13"></path>
-        <circle cx="6" cy="18" r="3"></circle>
-        <circle cx="16" cy="16" r="3"></circle>
-      </svg>
+      <i data-lucide="music-2"></i>
       <span class="rail-tooltip">音乐<small>共享应用伴奏</small></span>
     </button>
   `;
@@ -132,6 +113,7 @@ export function channelMusicRailButtonMarkup(): string {
 export class ChannelMusicController {
   private button?: HTMLButtonElement;
   private popover?: HTMLElement;
+  private surface?: FloatingSurface;
   private sources: CaptureSource[] = [];
   private capture?: ProcessAudioCapture;
   private activeSource?: CaptureSource;
@@ -157,30 +139,8 @@ export class ChannelMusicController {
       "click",
       (event) => {
         event.stopPropagation();
-        if (this.popover) this.closePopover();
+        if (this.popover) void this.surface?.close();
         else void this.openPopover();
-      },
-      { signal: this.abortController.signal },
-    );
-    document.addEventListener(
-      "pointerdown",
-      (event) => {
-        const target = event.target;
-        if (
-          this.popover &&
-          target instanceof Node &&
-          !this.popover.contains(target) &&
-          !this.button?.contains(target)
-        ) {
-          this.closePopover();
-        }
-      },
-      { signal: this.abortController.signal },
-    );
-    document.addEventListener(
-      "keydown",
-      (event) => {
-        if (event.key === "Escape" && this.popover) this.closePopover();
       },
       { signal: this.abortController.signal },
     );
@@ -214,31 +174,36 @@ export class ChannelMusicController {
     if (this.destroyed || !this.button) return;
     this.view = "presets";
     const popover = document.createElement("section");
-    popover.className = "music-source-popover";
+    popover.className = "music-source-popover material-regular";
+    popover.hidden = true;
     popover.setAttribute("role", "dialog");
     popover.setAttribute("aria-label", "共享伴奏来源");
-    document.body.append(popover);
     this.popover = popover;
-    this.positionPopover();
+    this.surface = new FloatingSurface(this.button, popover, {
+      placement: "right-start",
+      closeOnOutside: true,
+      onOpenChange: (open) => {
+        if (!open && this.popover === popover) {
+          this.closePopover();
+        }
+      },
+    });
     this.updateButton();
     this.renderPopover(this.sourcesLoadedAt === 0);
-    await waitForPopoverPaint();
+    const opening = this.surface.open();
+    const refreshing = this.refreshSources();
+    await Promise.allSettled([opening, refreshing]);
     if (this.destroyed || this.popover !== popover) return;
-    await this.refreshSources();
   }
 
   private closePopover(): void {
-    this.popover?.remove();
+    const popover = this.popover;
     this.popover = undefined;
+    const surface = this.surface;
+    this.surface = undefined;
+    surface?.destroy();
+    popover?.remove();
     this.updateButton();
-  }
-
-  private positionPopover(): void {
-    if (!this.popover || !this.button) return;
-    const rect = this.button.getBoundingClientRect();
-    const maxTop = Math.max(12, window.innerHeight - 460);
-    this.popover.style.left = `${Math.round(rect.right + 12)}px`;
-    this.popover.style.top = `${Math.round(Math.min(maxTop, Math.max(12, rect.top - 12)))}px`;
   }
 
   private loadSources(): Promise<CaptureSource[]> {
@@ -290,6 +255,7 @@ export class ChannelMusicController {
         </div>
       `;
       this.bindPopoverActions();
+      hydrateIcons(this.popover);
     }
   }
 
@@ -323,20 +289,20 @@ export class ChannelMusicController {
       <div class="music-popover-heading">
         <div>
           <span>伴奏来源</span>
-          <button class="music-help" type="button" aria-label="伴奏说明" title="采集所选应用的声音并混入频道音频；其他成员会以免麦克风权限的收听模式自动接入。关闭自己的麦克风不会停止伴奏。">?</button>
+          <button class="music-help" type="button" aria-label="伴奏说明" title="采集所选应用的声音并混入频道音频；其他成员会以免麦克风权限的收听模式自动接入。关闭自己的麦克风不会停止伴奏。"><i data-lucide="circle-help"></i></button>
         </div>
-        <button class="music-close" type="button" data-music-close aria-label="关闭伴奏菜单">×</button>
+        <button class="music-close" type="button" data-music-close aria-label="关闭伴奏菜单"><i data-lucide="x"></i></button>
       </div>
       <div class="music-source-list">
         ${presetRows}
       </div>
       <button class="music-more-sources" type="button" data-music-more>
-        <span>更多音源</span><i aria-hidden="true">›</i>
+        <span>更多音源</span><i data-lucide="chevron-right"></i>
       </button>
       <div class="music-volume-control">
         <span><b>伴奏音量</b><output>${Math.round(this.volume * 100)}%</output></span>
         <div>
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 5 6.5 9H3v6h3.5l4.5 4V5ZM15.5 8.5a5 5 0 0 1 0 7M18.5 5.5a9 9 0 0 1 0 13"></path></svg>
+          <i data-lucide="volume-2"></i>
           <input data-music-volume type="range" min="0" max="100" value="${Math.round(this.volume * 100)}" aria-label="伴奏发送音量" />
         </div>
       </div>
@@ -352,6 +318,7 @@ export class ChannelMusicController {
       }
     `;
     this.bindPopoverActions();
+    hydrateIcons(popover);
   }
 
   private renderAllSources(popover: HTMLElement, loading: boolean): void {
@@ -362,7 +329,7 @@ export class ChannelMusicController {
             ${
               source.appIcon
                 ? `<img src="${source.appIcon}" alt="" />`
-                : `<span>${escapeHtml(Array.from(source.name)[0] || "♪")}</span>`
+                : `<span><i data-lucide="music-2"></i></span>`
             }
             <b>${escapeHtml(source.name)}</b>
             <i aria-hidden="true"></i>
@@ -372,9 +339,9 @@ export class ChannelMusicController {
       .join("");
     popover.innerHTML = `
       <div class="music-popover-heading music-all-heading">
-        <button type="button" data-music-back aria-label="返回常用音源">‹</button>
+        <button type="button" data-music-back aria-label="返回常用音源"><i data-lucide="arrow-left"></i></button>
         <div><span>全部应用窗口</span><small>选择正在出声的播放器</small></div>
-        <button type="button" data-music-refresh aria-label="刷新窗口">↻</button>
+        <button type="button" data-music-refresh aria-label="刷新窗口"><i data-lucide="refresh-cw"></i></button>
       </div>
       <div class="music-all-source-list">
         ${
@@ -386,6 +353,7 @@ export class ChannelMusicController {
       </div>
     `;
     this.bindPopoverActions();
+    hydrateIcons(popover);
   }
 
   private bindPopoverActions(): void {
@@ -393,7 +361,7 @@ export class ChannelMusicController {
     if (!popover) return;
     popover
       .querySelector<HTMLButtonElement>("[data-music-close]")
-      ?.addEventListener("click", () => this.closePopover());
+      ?.addEventListener("click", () => void this.surface?.close());
     popover
       .querySelector<HTMLButtonElement>("[data-music-more]")
       ?.addEventListener("click", () => {

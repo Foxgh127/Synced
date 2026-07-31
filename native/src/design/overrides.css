@@ -1,0 +1,33 @@
+html[data-input="touch"] button,
+html[data-input="touch"] [role="button"],
+html[data-input="touch"] summary {
+  min-width: var(--control-min);
+  min-height: var(--control-min);
+}
+
+body[data-modal-open="true"] {
+  overflow: hidden;
+}
+
+[data-state="loading"] {
+  cursor: progress;
+}
+
+[data-state="loading"] > [data-loading-label]::before {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  margin-right: var(--s-3);
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: var(--radius-8ec82c689f);
+  content: "";
+  vertical-align: -2px;
+  animation: ui-spin 680ms linear infinite;
+}
+
+@keyframes ui-spin {
+  to {
+    transform: rotate(1turn);
+  }
+}

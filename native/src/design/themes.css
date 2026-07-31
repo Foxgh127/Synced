@@ -1,0 +1,31 @@
+:root[data-effects-quality="balanced"] {
+  --blur-regular: 16px;
+  --blur-clear: 10px;
+  --saturation-glass: 1.12;
+}
+
+:root[data-effects-quality="minimal"],
+:root[data-reduce-transparency="true"] {
+  --material-l3: var(--palette-979eb6c932);
+  --material-l4: var(--palette-565df49686);
+  --blur-regular: 0px;
+  --blur-clear: 0px;
+  --saturation-glass: 1;
+}
+
+:root[data-window-active="false"] {
+  --beam-ambient: radial-gradient(ellipse 80% 56% at 50% -8%, var(--palette-3c50d42a3e), transparent 72%);
+  --accent-glow: var(--palette-bb05a48e15);
+}
+
+:root[data-window-active="false"] [data-decorative-motion] {
+  animation-play-state: paused !important;
+}
+
+:root[data-high-contrast="true"] {
+  --stroke-subtle: var(--palette-8d2af7fbfd);
+  --stroke-default: var(--palette-9783dee77b);
+  --stroke-strong: var(--palette-86dda9c04f);
+  --text-secondary: var(--n-100);
+  --text-tertiary: var(--n-150);
+}

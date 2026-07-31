@@ -251,6 +251,10 @@ async function main() {
     },
   };
   console.log(JSON.stringify(result));
+  await mainWindow.webContents.executeJavaScript(
+    "document.querySelector('#leave-room')?.click()",
+  );
+  await waitFor(() => signalServer.clients.size === 0, 10_000);
   await signalServer.close();
   app.exit(result.ok ? 0 : 1);
 }
